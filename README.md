@@ -58,7 +58,7 @@ Each finding includes:
 Replace `<USER>` and `<REPO>` after you publish:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/<REPO>/main/bt-quickcheck.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MaxAKAGluck/bt-quickcheck/main/bt-quickcheck.sh)
 ```
 
 ### Local usage (before publishing)
