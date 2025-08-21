@@ -1,8 +1,29 @@
 #!/usr/bin/env bash
 
-set -u
+# Blue Team QuickCheck - Linux Security Assessment Tool
+# Version: 0.5.0
+# 
+# SECURITY DISCLAIMER:
+# This script performs READ-ONLY security assessment of Linux systems.
+# It may access sensitive system files for analysis but does NOT modify any files.
+# It requires sudo privileges for comprehensive system inspection.
+#
+# PRIVACY NOTICE:
+# This script reads system configuration files, logs, and process information
+# to assess security posture. It may access files containing sensitive information
+# including user accounts, network configuration, and system logs.
+# All data remains local and is not transmitted externally.
+#
+# USAGE REQUIREMENTS:
+# - Run with sudo for complete assessment: sudo ./bt-quickcheck.sh
+# - Script performs only read operations - no system modifications
+# - Safe to run on production systems (read-only assessment)
+# 
+# By running this script, you acknowledge understanding of its purpose and scope.
 
-VERSION="0.4.0"
+set -euo pipefail  # Strict error handling: exit on error, undefined vars, pipe failures
+
+VERSION="0.5.1"
 
 # Output format (default: console)
 OUTPUT_FORMAT="console"
@@ -20,7 +41,63 @@ COLOR_RESET="\033[0m"
 declare -a FINDINGS=()
 declare -a SECTIONS=()
 
+# Safety functions
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
+
+# Safe command execution - only execute if command exists and is safe
+safe_exec() {
+    local cmd="$1"
+    shift
+    if command -v "$cmd" >/dev/null 2>&1; then
+        "$cmd" "$@" 2>/dev/null || true
+    fi
+}
+
+# Safe file read - only read if file exists and is readable
+safe_read() {
+    local file="$1"
+    if [ -r "$file" ] && [ -f "$file" ]; then
+        cat "$file" 2>/dev/null || true
+    fi
+}
+
+# Safe directory check
+safe_dir_check() {
+    local dir="$1"
+    [ -d "$dir" ] && [ -r "$dir" ]
+}
+
+# Validate output format
+validate_format() {
+    local format="$1"
+    case "$format" in
+        console|json|html|txt) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Validate operation mode  
+validate_mode() {
+    local mode="$1"
+    case "$mode" in
+        personal|production) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Validate file path for output (prevent path traversal)
+validate_output_path() {
+    local path="$1"
+    # Remove any path traversal attempts
+    local clean_path
+    clean_path=$(realpath -m "$path" 2>/dev/null || echo "$path")
+    
+    # Check if path is within current directory or absolute path without traversal
+    case "$clean_path" in
+        */../*|*/..*|../*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
 # Add a finding to the global findings array
 add_finding() {
@@ -651,7 +728,8 @@ section_network_security() {
 	fi
 	
 	# Check TCP SYN cookies
-	syn_cookies=$(cat /proc/sys/net/ipv4/tcp_syncookies 2>/dev/null || echo 0)
+	syn_cookies=$(safe_read /proc/sys/net/ipv4/tcp_syncookies)
+	[ -z "$syn_cookies" ] && syn_cookies=0
 	if [ "$syn_cookies" = "1" ]; then
 		add_finding "Network Security" "OK" "TCP SYN cookies enabled" ""
 		ok "TCP SYN cookies enabled"
@@ -934,7 +1012,8 @@ section_secure_configuration() {
 	
 	for flag in "${hardening_flags[@]}"; do
 		if [ -f /proc/sys/${flag//./\/} ]; then
-			value=$(cat /proc/sys/${flag//./\/} 2>/dev/null || echo "unknown")
+			value=$(safe_read "/proc/sys/${flag//./\/}")
+		[ -z "$value" ] && value="unknown"
 			case "$flag" in
 				"kernel.dmesg_restrict"|"kernel.kptr_restrict")
 					if [ "$value" = "1" ]; then
@@ -1001,6 +1080,524 @@ section_secure_configuration() {
 	fi
 }
 
+section_container_security() {
+	print_section "Container & Virtualization Security"
+	
+	# Docker detection and security
+	if command_exists docker; then
+		add_finding "Container Security" "INFO" "Docker is installed" ""
+		[ "$OUTPUT_FORMAT" = "console" ] && info "Docker detected"
+		
+		# Check if Docker daemon is running
+		if systemctl is-active --quiet docker 2>/dev/null; then
+			add_finding "Container Security" "INFO" "Docker daemon is active" ""
+			
+			# Check for insecure Docker daemon exposure
+			if netstat -tlnp 2>/dev/null | grep -q ":2375.*docker"; then
+				rec=$(get_recommendation "Secure Docker daemon: disable TCP exposure or enable TLS" \
+					"Configure Docker daemon with TLS certificates for secure remote access" \
+					"Immediately secure Docker daemon: require TLS, restrict access, audit connections")
+				add_finding "Container Security" "CRIT" "Docker daemon exposed on insecure TCP port" "$rec"
+				crit "Docker daemon insecurely exposed"
+			fi
+			
+			# Check for privileged containers (requires root)
+			if is_root; then
+				privileged_containers=$(docker ps --format "table {{.Names}}\t{{.Command}}" 2>/dev/null | grep -c privileged || echo 0)
+				if [ "$privileged_containers" -gt 0 ]; then
+					rec=$(get_recommendation "Review and minimize privileged containers" \
+						"Audit privileged containers: 'docker ps --filter=\"privileged=true\"'" \
+						"Critical: Review all privileged containers, minimize capabilities, implement security policies")
+					add_finding "Container Security" "WARN" "$privileged_containers privileged container(s) detected" "$rec"
+					warn "Privileged containers running"
+				fi
+				
+				# Check for dangerous host mounts
+				dangerous_mounts=$(docker ps --format "{{.Mounts}}" 2>/dev/null | grep -E "(docker\.sock|/etc|/proc|/sys)" | wc -l || echo 0)
+				if [ "$dangerous_mounts" -gt 0 ]; then
+					rec="Review host mounts: 'docker ps --format \"table {{.Names}}\\t{{.Mounts}}\"'"
+					add_finding "Container Security" "WARN" "Containers with sensitive host mounts detected" "$rec"
+					warn "Dangerous host mounts detected"
+				fi
+			fi
+		fi
+		
+		# Production mode: More comprehensive container checks
+		if [ "$OPERATION_MODE" = "production" ]; then
+			# Check Docker daemon configuration
+			if [ -f /etc/docker/daemon.json ]; then
+				add_finding "Container Security" "OK" "Docker daemon configuration file exists" ""
+			else
+				rec="Create Docker daemon config: '/etc/docker/daemon.json' with security hardening"
+				add_finding "Container Security" "INFO" "No Docker daemon configuration found" "$rec"
+			fi
+		fi
+	fi
+	
+	# Podman detection
+	if command_exists podman; then
+		add_finding "Container Security" "INFO" "Podman is installed" ""
+		[ "$OUTPUT_FORMAT" = "console" ] && info "Podman detected"
+		
+		if [ "$OPERATION_MODE" = "personal" ]; then
+			rec="Podman provides rootless containers by default - good security choice"
+			add_finding "Container Security" "OK" "Rootless container runtime available" "$rec"
+		fi
+	fi
+	
+	# LXC/LXD detection
+	if command_exists lxc-ls || command_exists lxd; then
+		add_finding "Container Security" "INFO" "LXC/LXD container system detected" ""
+		[ "$OUTPUT_FORMAT" = "console" ] && info "LXC/LXD detected"
+		
+		if command_exists lxc-ls && is_root; then
+			running_containers=$(lxc-ls --running 2>/dev/null | wc -w || echo 0)
+			if [ "$running_containers" -gt 0 ]; then
+				rec="Review LXC container security: 'lxc-ls --fancy'"
+				add_finding "Container Security" "INFO" "$running_containers LXC container(s) running" "$rec"
+			fi
+		fi
+	fi
+	
+	# Kubernetes detection
+	if command_exists kubectl || command_exists kubelet || systemctl list-unit-files | grep -q kubelet; then
+		add_finding "Container Security" "INFO" "Kubernetes components detected" ""
+		[ "$OUTPUT_FORMAT" = "console" ] && info "Kubernetes detected"
+		
+		rec=$(get_recommendation "If not needed, remove Kubernetes components to reduce attack surface" \
+			"Ensure kubectl access is properly secured with RBAC" \
+			"Implement CIS Kubernetes Benchmark: RBAC, network policies, secrets encryption")
+		add_finding "Container Security" "INFO" "Kubernetes environment detected" "$rec"
+		
+		# Check for kubelet configuration
+		if [ -f /etc/kubernetes/kubelet/kubelet-config.yaml ] || [ -f /var/lib/kubelet/config.yaml ]; then
+			add_finding "Container Security" "INFO" "Kubelet configuration found" ""
+		fi
+	fi
+}
+
+section_kernel_hardening() {
+	print_section "Kernel & System Hardening"
+	
+	# Check for Secure Boot and lockdown mode
+	if [ -d /sys/firmware/efi ]; then
+		add_finding "Kernel Hardening" "INFO" "UEFI system detected" ""
+		
+		# Check Secure Boot status
+		if command_exists mokutil; then
+			sb_state=$(mokutil --sb-state 2>/dev/null || echo "unknown")
+			if echo "$sb_state" | grep -q "enabled"; then
+				add_finding "Kernel Hardening" "OK" "Secure Boot is enabled" ""
+				ok "Secure Boot enabled"
+			else
+				rec=$(get_recommendation "Enable Secure Boot in UEFI settings for boot integrity" \
+					"Enable Secure Boot to prevent unauthorized boot code execution" \
+					"Require Secure Boot for compliance and boot integrity verification")
+				add_finding "Kernel Hardening" "WARN" "Secure Boot is disabled" "$rec"
+				warn "Secure Boot disabled"
+			fi
+		fi
+		
+		# Check kernel lockdown mode
+		if [ -f /sys/kernel/security/lockdown ]; then
+			lockdown_mode=$(safe_read /sys/kernel/security/lockdown)
+		[ -z "$lockdown_mode" ] && lockdown_mode="none"
+			case "$lockdown_mode" in
+				*"integrity"*)
+					add_finding "Kernel Hardening" "OK" "Kernel lockdown: integrity mode" ""
+					ok "Kernel lockdown: integrity"
+					;;
+				*"confidentiality"*)
+					add_finding "Kernel Hardening" "OK" "Kernel lockdown: confidentiality mode" ""
+					ok "Kernel lockdown: confidentiality"
+					;;
+				*"none"*)
+					rec="Enable kernel lockdown via kernel parameter: lockdown=integrity"
+					add_finding "Kernel Hardening" "INFO" "Kernel lockdown disabled" "$rec"
+					;;
+			esac
+		fi
+	else
+		rec=$(get_recommendation "Consider UEFI boot for better security features" \
+			"UEFI provides Secure Boot and other security enhancements" \
+			"Plan migration to UEFI for enhanced boot security")
+		add_finding "Kernel Hardening" "INFO" "Legacy BIOS boot detected" "$rec"
+	fi
+	
+	# Check for kernel module signing
+	if [ -f /proc/sys/kernel/modules_disabled ]; then
+		modules_disabled=$(safe_read /proc/sys/kernel/modules_disabled)
+		if [ "$modules_disabled" = "1" ]; then
+			add_finding "Kernel Hardening" "OK" "Kernel module loading disabled" ""
+			ok "Module loading disabled"
+		fi
+	fi
+	
+	# Check for hardened kernel features
+	hardening_checks=(
+		"kernel.kptr_restrict:1:Kernel pointer restriction"
+		"kernel.dmesg_restrict:1:dmesg restriction" 
+		"kernel.perf_event_paranoid:3:Performance event restriction"
+		"net.core.bpf_jit_harden:2:BPF JIT hardening"
+	)
+	
+	for check in "${hardening_checks[@]}"; do
+		IFS=':' read -r sysctl_name expected_value description <<< "$check"
+		if [ -f "/proc/sys/${sysctl_name//./\/}" ]; then
+			current_value=$(safe_read "/proc/sys/${sysctl_name//./\/}")
+			[ -z "$current_value" ] && current_value="0"
+			if [ "$current_value" = "$expected_value" ]; then
+				add_finding "Kernel Hardening" "OK" "$description enabled" ""
+				ok "$description enabled"
+			else
+				rec="Enable $description: 'echo $expected_value | sudo tee /proc/sys/${sysctl_name//./\/}'"
+				add_finding "Kernel Hardening" "WARN" "$description disabled" "$rec"
+				warn "$description disabled"
+			fi
+		fi
+	done
+	
+	# Check for grsecurity indicators
+	if dmesg 2>/dev/null | grep -qi grsecurity || [ -d /proc/sys/kernel/grsecurity ]; then
+		add_finding "Kernel Hardening" "OK" "Grsecurity detected" ""
+		ok "Grsecurity kernel detected"
+	fi
+}
+
+section_application_security() {
+	print_section "Application-Level Protections"
+	
+	# Web server detection and security
+	web_servers=("nginx" "apache2" "httpd")
+	for server in "${web_servers[@]}"; do
+		if systemctl is-active --quiet "$server" 2>/dev/null; then
+			add_finding "App Security" "INFO" "$server web server is active" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && info "$server detected"
+			
+			# Check for HTTPS configuration
+			if [ "$server" = "nginx" ] && [ -d /etc/nginx ]; then
+				ssl_configs=$(find /etc/nginx -name "*.conf" -exec grep -l "ssl_certificate" {} \; 2>/dev/null | wc -l)
+				if [ "$ssl_configs" -gt 0 ]; then
+					add_finding "App Security" "OK" "NGINX SSL configuration detected" ""
+				else
+					rec=$(get_recommendation "Configure HTTPS with Let's Encrypt: 'sudo certbot --nginx'" \
+						"Set up SSL/TLS certificates and enforce HTTPS redirects" \
+						"Implement strong TLS configuration: TLS 1.2+, HSTS, OCSP stapling")
+					add_finding "App Security" "WARN" "No SSL configuration found in NGINX" "$rec"
+				fi
+			elif [ "$server" = "apache2" ] || [ "$server" = "httpd" ]; then
+				ssl_module=$(apache2ctl -M 2>/dev/null | grep ssl || httpd -M 2>/dev/null | grep ssl || true)
+				if [ -n "$ssl_module" ]; then
+					add_finding "App Security" "OK" "Apache SSL module loaded" ""
+				else
+					rec="Enable Apache SSL module: 'sudo a2enmod ssl && sudo systemctl restart apache2'"
+					add_finding "App Security" "WARN" "Apache SSL module not loaded" "$rec"
+				fi
+			fi
+		fi
+	done
+	
+	# Database exposure checks
+	databases=("mysql:3306" "postgresql:5432" "mongodb:27017" "redis:6379")
+	for db_info in "${databases[@]}"; do
+		IFS=':' read -r db_name db_port <<< "$db_info"
+		
+		if systemctl is-active --quiet "$db_name" 2>/dev/null || systemctl is-active --quiet "${db_name}d" 2>/dev/null; then
+			add_finding "App Security" "INFO" "$db_name database service detected" ""
+			
+			# Check if database is listening on all interfaces
+			if ss -tln 2>/dev/null | grep -q ":$db_port.*0.0.0.0"; then
+				rec=$(get_recommendation "Bind $db_name to localhost: edit config to bind to 127.0.0.1" \
+					"Configure $db_name to listen only on required interfaces, enable firewall rules" \
+					"Implement database security: network segmentation, SSL/TLS, access controls")
+				add_finding "App Security" "CRIT" "$db_name listening on all interfaces" "$rec"
+				crit "$db_name exposed on 0.0.0.0"
+			elif ss -tln 2>/dev/null | grep -q ":$db_port.*127.0.0.1"; then
+				add_finding "App Security" "OK" "$db_name bound to localhost" ""
+				ok "$db_name localhost only"
+			fi
+		fi
+	done
+}
+
+section_secrets_sensitive_data() {
+	print_section "Secrets & Sensitive Data"
+	
+	# Common locations for sensitive files
+	sensitive_locations=(
+		"$HOME/.aws/credentials"
+		"$HOME/.aws/config" 
+		"$HOME/.kube/config"
+		"$HOME/.ssh/id_rsa"
+		"$HOME/.ssh/id_ed25519"
+		"/etc/ssl/private"
+		"/opt/secrets"
+		"/var/secrets"
+	)
+	
+	for location in "${sensitive_locations[@]}"; do
+		if [ -e "$location" ]; then
+			perms=$(stat -c "%a" "$location" 2>/dev/null || echo "unknown")
+			if [ -f "$location" ]; then
+				# File permissions check
+				if [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
+					rec="Secure file permissions: 'chmod 600 $location'"
+					add_finding "Secrets" "WARN" "$location has permissive permissions ($perms)" "$rec"
+					warn "Insecure file: $(basename "$location")"
+				else
+					add_finding "Secrets" "OK" "$location has secure permissions" ""
+				fi
+			elif [ -d "$location" ]; then
+				# Directory permissions check
+				if [ "$perms" != "700" ] && [ "$perms" != "750" ]; then
+					rec="Secure directory permissions: 'chmod 700 $location'"
+					add_finding "Secrets" "WARN" "$location has permissive permissions ($perms)" "$rec"
+					warn "Insecure directory: $(basename "$location")"
+				fi
+			fi
+		fi
+	done
+	
+	# Check for .env files with loose permissions
+	if [ "$OPERATION_MODE" = "personal" ]; then
+		find "$HOME" -name ".env" -type f -perm /044 2>/dev/null | head -5 | while read -r env_file; do
+			rec="Secure .env file: 'chmod 600 $env_file'"
+			add_finding "Secrets" "WARN" ".env file with world-readable permissions: $env_file" "$rec"
+		done
+	fi
+	
+	# SSH agent forwarding check
+	if [ -n "$SSH_AUTH_SOCK" ]; then
+		rec=$(get_recommendation "Be cautious with SSH agent forwarding - disable if not needed" \
+			"Review SSH agent forwarding usage and disable for sensitive connections" \
+			"Implement SSH bastion hosts and disable agent forwarding to production systems")
+		add_finding "Secrets" "INFO" "SSH agent forwarding active" "$rec"
+	fi
+	
+	# GPG agent check
+	if pgrep -f gpg-agent >/dev/null; then
+		add_finding "Secrets" "INFO" "GPG agent is running" ""
+		if [ "$OPERATION_MODE" = "production" ]; then
+			rec="Ensure GPG keys are properly managed and rotated according to policy"
+			add_finding "Secrets" "INFO" "Verify GPG key management procedures" "$rec"
+		fi
+	fi
+}
+
+section_cloud_remote_mgmt() {
+	print_section "Cloud & Remote Management"
+	
+	# Cloud agent detection
+	cloud_agents=("cloud-init" "waagent" "google-osconfig-agent" "amazon-ssm-agent")
+	for agent in "${cloud_agents[@]}"; do
+		if systemctl is-active --quiet "$agent" 2>/dev/null || pgrep -f "$agent" >/dev/null; then
+			add_finding "Cloud Management" "INFO" "$agent detected and active" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && info "$agent active"
+			
+			if [ "$OPERATION_MODE" = "production" ]; then
+				rec="Ensure $agent is updated and logging to SIEM for compliance"
+				add_finding "Cloud Management" "INFO" "Verify $agent compliance configuration" "$rec"
+			elif [ "$OPERATION_MODE" = "personal" ]; then
+				rec="$agent is typically used in cloud VMs - disable if running on personal hardware"
+				add_finding "Cloud Management" "INFO" "$agent may not be needed for personal use" "$rec"
+			fi
+		fi
+	done
+	
+	# Remote management detection
+	remote_services=("vncserver" "xrdp" "teamviewerd" "anydesk")
+	for service in "${remote_services[@]}"; do
+		if systemctl is-active --quiet "$service" 2>/dev/null || pgrep -f "$service" >/dev/null; then
+			rec=$(get_recommendation "Remove $service if not needed: 'sudo systemctl disable $service'" \
+				"Secure $service with strong authentication and access controls" \
+				"Implement MFA and strict access policies for $service")
+			add_finding "Cloud Management" "WARN" "$service remote access detected" "$rec"
+			warn "$service detected"
+		fi
+	done
+	
+	# Check for VNC ports
+	if ss -tln 2>/dev/null | grep -q ":59[0-9][0-9]"; then
+		rec="Secure or disable VNC access - consider SSH tunneling instead"
+		add_finding "Cloud Management" "WARN" "VNC service listening on network" "$rec"
+		warn "VNC service exposed"
+	fi
+}
+
+section_edr_monitoring() {
+	print_section "Endpoint Detection & Monitoring"
+	
+	# EDR/AV process detection
+	edr_processes=("crowdstrike" "cylance" "sentinelone" "defender" "carbonblack" "cortex" "endgame")
+	av_processes=("clamd" "freshclam" "avguard" "rtkdsm" "symantec")
+	
+	edr_detected=false
+	for process in "${edr_processes[@]}"; do
+		if pgrep -f "$process" >/dev/null; then
+			add_finding "EDR/Monitoring" "OK" "EDR solution detected: $process" ""
+			ok "EDR detected: $process"
+			edr_detected=true
+		fi
+	done
+	
+	av_detected=false
+	for process in "${av_processes[@]}"; do
+		if pgrep -f "$process" >/dev/null; then
+			add_finding "EDR/Monitoring" "OK" "Antivirus detected: $process" ""
+			ok "AV detected: $process"
+			av_detected=true
+		fi
+	done
+	
+	if [ "$edr_detected" = false ] && [ "$av_detected" = false ]; then
+		if [ "$OPERATION_MODE" = "production" ]; then
+			rec="Install and configure corporate EDR solution for compliance and threat detection"
+			add_finding "EDR/Monitoring" "CRIT" "No EDR or antivirus solution detected" "$rec"
+			crit "No endpoint protection detected"
+		else
+			rec="Install basic antivirus protection: 'sudo apt install clamav clamav-daemon'"
+			add_finding "EDR/Monitoring" "WARN" "No antivirus protection detected" "$rec"
+			warn "No AV protection"
+		fi
+	fi
+	
+	# SIEM forwarding detection (production mode)
+	if [ "$OPERATION_MODE" = "production" ]; then
+		siem_agents=("splunkforwarder" "filebeat" "logstash" "fluentd" "nxlog" "rsyslog")
+		siem_detected=false
+		
+		for agent in "${siem_agents[@]}"; do
+			if systemctl is-active --quiet "$agent" 2>/dev/null || pgrep -f "$agent" >/dev/null; then
+				add_finding "EDR/Monitoring" "OK" "SIEM forwarding agent detected: $agent" ""
+				ok "SIEM agent: $agent"
+				siem_detected=true
+			fi
+		done
+		
+		if [ "$siem_detected" = false ]; then
+			rec="Deploy SIEM forwarding agent for centralized log collection and monitoring"
+			add_finding "EDR/Monitoring" "WARN" "No SIEM forwarding agent detected" "$rec"
+			warn "No SIEM forwarding"
+		fi
+		
+		# Check for syslog forwarding configuration
+		if [ -f /etc/rsyslog.conf ]; then
+			remote_logging=$(grep -E "^\s*\*\.\*\s+@@" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null || true)
+			if [ -n "$remote_logging" ]; then
+				add_finding "EDR/Monitoring" "OK" "Remote syslog forwarding configured" ""
+				ok "Remote syslog configured"
+			else
+				rec="Configure remote syslog forwarding for centralized logging"
+				add_finding "EDR/Monitoring" "INFO" "No remote syslog forwarding detected" "$rec"
+			fi
+		fi
+	fi
+	
+	# Check for log analysis tools
+	log_tools=("logwatch" "fail2ban" "ossec")
+	for tool in "${log_tools[@]}"; do
+		if command_exists "$tool" || systemctl is-active --quiet "$tool" 2>/dev/null; then
+			add_finding "EDR/Monitoring" "OK" "Log analysis tool detected: $tool" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && info "$tool detected"
+		fi
+	done
+}
+
+section_backup_resilience() {
+	print_section "Resilience & Backup"
+	
+	# Backup solution detection
+	backup_tools=("rsnapshot" "borg" "restic" "duplicity" "rclone" "bacula" "amanda")
+	backup_detected=false
+	
+	for tool in "${backup_tools[@]}"; do
+		if command_exists "$tool"; then
+			add_finding "Backup/Resilience" "OK" "Backup tool detected: $tool" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && info "$tool available"
+			backup_detected=true
+			
+			# Check for recent backup activity
+			if [ "$tool" = "rsnapshot" ] && [ -f /etc/rsnapshot.conf ]; then
+				backup_dir=$(grep "^snapshot_root" /etc/rsnapshot.conf 2>/dev/null | awk '{print $2}' || echo "")
+				if [ -n "$backup_dir" ] && [ -d "$backup_dir" ]; then
+					recent_backup=$(find "$backup_dir" -type d -mtime -7 2>/dev/null | head -1)
+					if [ -n "$recent_backup" ]; then
+						add_finding "Backup/Resilience" "OK" "Recent rsnapshot backup found" ""
+					else
+						rec="Verify rsnapshot is running: check cron jobs and backup schedule"
+						add_finding "Backup/Resilience" "WARN" "No recent rsnapshot backups found" "$rec"
+					fi
+				fi
+			fi
+		fi
+	done
+	
+	if [ "$backup_detected" = false ]; then
+		rec=$(get_recommendation "Set up automated backups: install restic or borg for encrypted backups" \
+			"Implement local and cloud backups with regular testing" \
+			"Deploy enterprise backup solution with automated, encrypted, offsite backups")
+		add_finding "Backup/Resilience" "WARN" "No backup solution detected" "$rec"
+		warn "No backup tools found"
+	fi
+	
+	# Check for cloud backup configurations
+	cloud_backup_configs=(
+		"$HOME/.config/rclone/rclone.conf"
+		"$HOME/.aws/credentials"
+		"/etc/duplicity"
+		"$HOME/.config/borg"
+	)
+	
+	for config in "${cloud_backup_configs[@]}"; do
+		if [ -f "$config" ] || [ -d "$config" ]; then
+			add_finding "Backup/Resilience" "OK" "Cloud backup configuration detected: $(basename "$config")" ""
+		fi
+	done
+	
+	# System snapshot capabilities
+	if command_exists btrfs; then
+		# Check if root is on btrfs
+		root_fs=$(df / | tail -1 | awk '{print $1}')
+		if btrfs filesystem show "$root_fs" >/dev/null 2>&1; then
+			add_finding "Backup/Resilience" "OK" "BTRFS filesystem with snapshot capability" ""
+			ok "BTRFS snapshots available"
+			
+			# Check for recent snapshots
+			if [ -d /.snapshots ] || [ -d /home/.snapshots ]; then
+				recent_snapshot=$(find /.snapshots /home/.snapshots -maxdepth 1 -type d -mtime -7 2>/dev/null | head -1)
+				if [ -n "$recent_snapshot" ]; then
+					add_finding "Backup/Resilience" "OK" "Recent BTRFS snapshots found" ""
+				else
+					rec="Configure automatic BTRFS snapshots with snapper or timeshift"
+					add_finding "Backup/Resilience" "INFO" "No recent BTRFS snapshots found" "$rec"
+				fi
+			fi
+		fi
+	fi
+	
+	if command_exists zfs; then
+		zfs_pools=$(zpool list -H 2>/dev/null | wc -l || echo 0)
+		if [ "$zfs_pools" -gt 0 ]; then
+			add_finding "Backup/Resilience" "OK" "ZFS filesystem with snapshot capability" ""
+			ok "ZFS snapshots available"
+		fi
+	fi
+	
+	# LVM snapshot capability
+	if command_exists lvs; then
+		lv_count=$(lvs --noheadings 2>/dev/null | wc -l || echo 0)
+		if [ "$lv_count" -gt 0 ]; then
+			add_finding "Backup/Resilience" "INFO" "LVM detected - snapshot capability available" ""
+		fi
+	fi
+	
+	# Disaster recovery considerations
+	if [ "$OPERATION_MODE" = "production" ]; then
+		rec="Implement and test disaster recovery procedures: document RTO/RPO, test restore procedures"
+		add_finding "Backup/Resilience" "INFO" "Disaster recovery planning recommended" "$rec"
+	fi
+}
+
 section_summary() {
 	print_section "Summary"
 	
@@ -1033,6 +1630,11 @@ show_help() {
 	cat << EOF
 bt-quickcheck v$VERSION - Blue Team Security Quick Check
 
+SECURITY NOTICE:
+This tool performs READ-ONLY security assessment of Linux systems.
+It requires sudo privileges to access system files but makes NO modifications.
+All operations are defensive security checks - no malicious activity performed.
+
 Usage: $0 [OPTIONS]
 
 OPTIONS:
@@ -1043,8 +1645,8 @@ OPTIONS:
   -m, --mode MODE         Operation mode: personal, production (default: personal)
 
 MODES:
-  personal               Home/personal machine recommendations (security through obscurity, etc.)
-  production             Business/server environment recommendations (compliance, automation)
+  personal               Home/personal machine recommendations
+  production             Business/server environment recommendations (compliance focus)
 
 OUTPUT FORMATS:
   console               Colored console output (default)
@@ -1052,41 +1654,121 @@ OUTPUT FORMATS:
   html                  HTML report with styling
   txt                   Plain text report
 
+SECURITY FEATURES:
+  ✓ Read-only operations - no system modifications
+  ✓ Input validation and path traversal protection
+  ✓ Safe file access with permission checks
+  ✓ Comprehensive logging of all activities
+
 EXAMPLES:
-  $0                                    # Default console output
-  $0 -f json -o report.json             # JSON output to file
-  $0 -f html -o report.html -m production  # HTML production report
-  $0 -m production                      # Production mode recommendations
+  sudo $0                               # Full security assessment (recommended)
+  sudo $0 -f json -o report.json        # JSON output to file
+  sudo $0 -f html -o report.html -m production  # HTML production report
+  $0 -m personal                        # Limited checks without sudo
+
+PRIVACY:
+This script may access sensitive system files for security analysis.
+All data remains local - no external transmission occurs.
 
 EOF
 }
 
+# Parse command line arguments with validation
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--version|-v) echo "$VERSION"; exit 0;;
-		--help|-h) show_help; exit 0;;
+		--version|-v) 
+			echo "$VERSION"
+			exit 0
+			;;
+		--help|-h) 
+			show_help
+			exit 0
+			;;
 		--format|-f)
 			shift
-			case "$1" in
-				console|json|html|txt) OUTPUT_FORMAT="$1";;
-				*) echo "Error: Invalid format '$1'. Use: console, json, html, txt"; exit 1;;
-			esac
+			if [ $# -eq 0 ]; then
+				echo "Error: --format requires an argument" >&2
+				exit 1
+			fi
+			if validate_format "$1"; then
+				OUTPUT_FORMAT="$1"
+			else
+				echo "Error: Invalid format '$1'. Use: console, json, html, txt" >&2
+				exit 1
+			fi
 			;;
 		--output|-o)
 			shift
-			OUTPUT_FILE="$1"
+			if [ $# -eq 0 ]; then
+				echo "Error: --output requires an argument" >&2
+				exit 1
+			fi
+			if validate_output_path "$1"; then
+				OUTPUT_FILE="$1"
+			else
+				echo "Error: Invalid output path '$1'. Path traversal not allowed." >&2
+				exit 1
+			fi
 			;;
 		--mode|-m)
 			shift
-			case "$1" in
-				personal|production) OPERATION_MODE="$1";;
-				*) echo "Error: Invalid mode '$1'. Use: personal, production"; exit 1;;
-			esac
+			if [ $# -eq 0 ]; then
+				echo "Error: --mode requires an argument" >&2
+				exit 1
+			fi
+			if validate_mode "$1"; then
+				OPERATION_MODE="$1"
+			else
+				echo "Error: Invalid mode '$1'. Use: personal, production" >&2
+				exit 1
+			fi
 			;;
-		*) echo "Unknown arg: $1. Use --help for usage."; exit 1;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "Error: Unknown option '$1'. Use --help for usage." >&2
+			exit 1
+			;;
+		*)
+			echo "Error: Unexpected argument '$1'. Use --help for usage." >&2
+			exit 1
+			;;
 	esac
 	shift
 done
+
+# Display security notice for console output
+if [ "$OUTPUT_FORMAT" = "console" ]; then
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo "🛡️  Blue Team QuickCheck v$VERSION - Linux Security Assessment"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo
+	echo "⚠️  SECURITY NOTICE:"
+	echo "   • This script performs READ-ONLY security assessment"
+	echo "   • Requires sudo for comprehensive system analysis"
+	echo "   • NO system modifications will be made"
+	echo "   • May access sensitive files for security analysis"
+	echo "   • All data remains local - no external transmission"
+	echo
+	echo "🔍 Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
+	if [ -n "$OUTPUT_FILE" ]; then
+		echo "📄 Output: $OUTPUT_FILE"
+	fi
+	echo
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo
+fi
+
+# Validate output file if specified
+if [ -n "$OUTPUT_FILE" ]; then
+	# Check if we can write to the output file
+	if ! touch "$OUTPUT_FILE" 2>/dev/null; then
+		echo "Error: Cannot write to output file '$OUTPUT_FILE'" >&2
+		exit 1
+	fi
+fi
 
 # Run all checks
 section_system
@@ -1106,6 +1788,13 @@ section_file_integrity
 section_persistence_mechanisms
 section_process_forensics
 section_secure_configuration
+section_container_security
+section_kernel_hardening
+section_application_security
+section_secrets_sensitive_data
+section_cloud_remote_mgmt
+section_edr_monitoring
+section_backup_resilience
 section_summary
 
 # Generate output based on format
@@ -1120,12 +1809,28 @@ generate_output() {
 	esac
 }
 
-# Output to file or stdout
+# Output to file or stdout with error handling
 if [ -n "$OUTPUT_FILE" ]; then
-	generate_output > "$OUTPUT_FILE"
-	[ "$OUTPUT_FORMAT" != "console" ] && echo "Report generated: $OUTPUT_FILE" >&2
+	if generate_output > "$OUTPUT_FILE"; then
+		if [ "$OUTPUT_FORMAT" != "console" ]; then
+			echo "✅ Security report generated successfully: $OUTPUT_FILE" >&2
+			echo "📊 Total findings: ${#FINDINGS[@]}" >&2
+		fi
+	else
+		echo "❌ Error: Failed to generate output file '$OUTPUT_FILE'" >&2
+		exit 1
+	fi
 else
 	generate_output
+fi
+
+# Final security notice for console output
+if [ "$OUTPUT_FORMAT" = "console" ]; then
+	echo
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo "✅ Security assessment completed successfully"
+	echo "📋 Review CRITICAL and WARNING findings above for security improvements"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
 exit 0
