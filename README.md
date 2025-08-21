@@ -1,13 +1,117 @@
-## Blue Team QuickCheck (bt-quickcheck)
+# Blue Team QuickCheck (bt-quickcheck)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash](https://img.shields.io/badge/bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
+[![Linux](https://img.shields.io/badge/platform-linux-blue.svg)](https://kernel.org/)
+[![Security](https://img.shields.io/badge/security-blue%20team-blue.svg)](https://github.com/MaxAKAgluck/bt-quickcheck)
 
 A fast, no-hassle Linux one-liner to baseline a host from a blue team perspective. Inspired by linPEAS' ease-of-use, but focused on defensive posture checks (configuration, hygiene, and quick wins) instead of privilege escalation.
 
-### Why
+## Table of Contents
 
-- Quickly assess a Linux system's defensive posture: firewall, SSH hardening, auditing, auth, updates, and risky permissions.
-- Run anywhere with a single command; readable, color-coded output with actionable items.
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Security Assessment Categories](#security-assessment-categories)
+- [Output Formats](#output-formats)
+- [Operation Modes](#operation-modes)
+- [Security & Safety](#security--safety)
+- [Examples](#examples)
+- [Implementation Progress](#implementation-progress)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [References](#references)
+- [License](#license)
 
-### What it checks
+## Features
+
+- 🛡️ **Comprehensive Security Assessment**: 24 security categories with 50+ specialized checks
+- ⚡ **Fast & Lightweight**: Single script, no installation required, minimal system impact  
+- 🎯 **Blue Team Focused**: Defensive security posture assessment, not penetration testing
+- 🔒 **Read-Only & Safe**: Zero system modifications, enterprise-safe operation
+- 📊 **Multiple Output Formats**: Console, JSON, HTML, and TXT reports
+- 🏠 **Dual Operation Modes**: Personal and Production environments with tailored recommendations
+- 🔍 **Actionable Results**: Clear severity levels with specific remediation guidance
+- 🚀 **One-Liner Deployment**: Instant remote execution via curl
+
+## Quick Start
+
+```bash
+# One-liner execution (recommended)
+bash <(curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-quickcheck.sh)
+
+# Or download and run locally
+curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-quickcheck.sh -o bt-quickcheck.sh
+chmod +x bt-quickcheck.sh
+sudo ./bt-quickcheck.sh
+```
+
+## Installation
+
+### Prerequisites
+
+- Linux system (any major distribution)
+- Bash 4.0+ (included in most modern Linux distributions)
+- `sudo` access for comprehensive assessment (optional for limited checks)
+
+### Method 1: Direct Execution (Recommended)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-quickcheck.sh)
+```
+
+### Method 2: Download and Execute
+
+```bash
+# Download the script
+curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-quickcheck.sh -o bt-quickcheck.sh
+
+# Make executable
+chmod +x bt-quickcheck.sh
+
+# Run with sudo for full assessment
+sudo ./bt-quickcheck.sh
+```
+
+### Method 3: Git Clone
+
+```bash
+git clone https://github.com/MaxAKAgluck/bt-quickcheck.git
+cd bt-quickcheck
+chmod +x bt-quickcheck.sh
+sudo ./bt-quickcheck.sh
+```
+
+## Usage
+
+### Basic Usage
+
+```bash
+# Default console output
+sudo ./bt-quickcheck.sh
+
+# Get help
+./bt-quickcheck.sh --help
+
+# Check version
+./bt-quickcheck.sh --version
+```
+
+### Command Line Options
+
+```bash
+Usage: ./bt-quickcheck.sh [OPTIONS]
+
+OPTIONS:
+  -h, --help              Show help message
+  -v, --version           Show version information
+  -f, --format FORMAT     Output format: console, json, html, txt (default: console)
+  -o, --output FILE       Output file (default: stdout)
+  -m, --mode MODE         Operation mode: personal, production (default: personal)
+```
+
+## Security Assessment Categories
 
 - **System basics**: distro, kernel, uptime, virtualization hints
 - **Patching**: pending updates (apt/dnf/yum/zypper) with mode-specific update recommendations
@@ -26,77 +130,72 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 - **Persistence mechanisms**: Cron jobs, systemd timers, startup scripts, shell configs, kernel modules
 - **Process forensics**: Process tree analysis, hidden process detection, temp directory execution
 - **Secure configuration**: Kernel hardening flags, umask settings, core dumps, 2FA indicators
+- **Container security**: Docker/Podman/LXC detection, privileged containers, dangerous host mounts, Kubernetes
+- **Kernel hardening**: Secure Boot, lockdown mode, module signing, grsecurity, advanced sysctl flags
+- **Application security**: Web server TLS config, database exposure, SSL/TLS enforcement
+- **Secrets management**: API keys, SSH keys, .env files permissions, agent forwarding detection
+- **Cloud/remote management**: Cloud agents, VNC/RDP detection, remote access security
+- **EDR/monitoring**: Antivirus/EDR detection, SIEM forwarding, log analysis tools
+- **Backup/resilience**: Backup tools, cloud configs, filesystem snapshots, disaster recovery
 
 Each finding includes:
 - ✅ **Severity level**: OK, WARN, CRIT, INFO
 - 💡 **Actionable recommendations** tailored to operation mode (personal vs production)
 - 📋 **Structured output** for automation and reporting
 
-### Implementation progress
+## Output Formats
 
-✅ **v0.4.0 - Advanced Security Hardening** 
-- File integrity monitoring with SHA256 baselines and AIDE/Tripwire integration
-- Persistence mechanism detection (cron, timers, startup scripts, kernel modules)
-- Process forensics and hidden process detection
-- Kernel hardening and secure configuration validation
-- Enhanced mode differentiation (17 security categories, 35+ checks)
-
-✅ **v0.3.0 - Comprehensive Security Assessment**
-- Multiple output formats (JSON, HTML, TXT) with structured data
-- Personal vs Production operation modes with tailored recommendations
-- Intrusion detection (fail2ban, auth logs, suspicious activity)
-- Time synchronization and logging infrastructure validation
-- Network security and package integrity verification
-
-✅ **v0.2.0 - Core Security Baseline**
-- Fast, read-only security posture assessment
-- SSH hardening, firewall status, user account analysis
-- Update management and basic permission auditing
-
-### One-liner
-
-Replace `<USER>` and `<REPO>` after you publish:
-
+### Console Output (Default)
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MaxAKAGluck/bt-quickcheck/main/bt-quickcheck.sh)
-```
-
-### Local usage (before publishing)
-
-```bash
-chmod +x ./bt-quickcheck.sh
 sudo ./bt-quickcheck.sh
 ```
+- Color-coded severity levels
+- Real-time progress indication
+- Human-readable formatting
 
-**New features in v0.4.0:**
-
-#### Multiple output formats
+### JSON Output
 ```bash
-# Console output (default, with colors)
-sudo ./bt-quickcheck.sh
-
-# JSON output for automation/SIEM
 sudo ./bt-quickcheck.sh -f json -o security-report.json
+```
+- Structured data for automation
+- SIEM integration ready
+- Machine-parseable format
 
-# HTML report with styling
+### HTML Report
+```bash
 sudo ./bt-quickcheck.sh -f html -o security-report.html
+```
+- Professional styled report
+- Executive summary ready
+- Easy sharing and archiving
 
-# Plain text report
+### Plain Text
+```bash
 sudo ./bt-quickcheck.sh -f txt -o security-report.txt
 ```
+- Simple text format
+- Email-friendly output
+- Legacy system compatible
 
-#### Operation modes
+## Operation Modes
+
+### Personal Mode (Default)
 ```bash
-# Personal mode (default) - home/personal machine recommendations
 sudo ./bt-quickcheck.sh -m personal
-
-# Production mode - business/server environment recommendations
-sudo ./bt-quickcheck.sh -m production -f html -o production-report.html
 ```
+- Home/personal machine recommendations
+- Security through obscurity suggestions
+- User-friendly guidance
 
-Running with `sudo` is recommended to get full visibility; it will still run without elevated privileges but may miss checks.
+### Production Mode
+```bash
+sudo ./bt-quickcheck.sh -m production
+```
+- Enterprise environment recommendations
+- Compliance-focused checks
+- Business continuity considerations
 
-#### Mode differences
+### Mode Comparison
 
 | Check Category | Personal Mode | Production Mode |
 |---|---|---|
@@ -110,23 +209,125 @@ Running with `sudo` is recommended to get full visibility; it will still run wit
 | **File Integrity** | Quick SHA256 hashes of critical files | AIDE/Tripwire integration + monitoring |
 | **Persistence** | Basic cron/startup script scanning | Full timer/module/service analysis |
 | **Forensics** | Simple process tree analysis | Advanced ELF capabilities + network process mapping |
+| **Containers** | Basic Docker security warnings | Comprehensive container hardening + K8s CIS benchmarks |
+| **Kernel** | Basic hardening flag suggestions | Full compliance checking + module signing enforcement |
+| **Applications** | Simple HTTPS recommendations | Enterprise TLS config + database security policies |
+| **EDR/AV** | Basic antivirus suggestions | Corporate EDR requirements + SIEM integration |
+| **Backups** | Personal backup tool recommendations | Enterprise DR procedures + offsite backup validation |
 
-### Design notes
+## Security & Safety
 
-- Minimize host impact: no changes, no package installs, avoid long-running scanning.
-- Prefer native tools available on most distros; degrade gracefully when missing.
-- Keep output concise; highlight actions the analyst can take immediately.
+### 🔒 Read-Only Operations
+- Zero system modifications - pure assessment tool
+- Safe file access with permission validation
+- Protected against accidental writes or changes
 
-### Roadmap
+### 🛡️ Input Validation & Protection
+- Path traversal attack prevention
+- Command line argument validation
+- Output file path sanitization
 
-- JSON output mode for SIEM ingestion
-- Module-aware distro detection with safer/faster update checks
-- CIS-aligned ruleset mapping with references
-- Container/K8s context awareness (host vs. container)
-- Pluggable check framework (enable/disable categories and thresholds)
-- Quiet mode and fail-only output
+### ⚡ Robust Error Handling
+- Strict shell mode (`set -euo pipefail`)
+- Graceful degradation when commands unavailable
+- Comprehensive error reporting and logging
 
-### Research and references
+### 🔍 Transparency & Compliance
+- Clear security disclaimers and privacy notices
+- Comprehensive operation logging
+- No external data transmission
+- Minimal privilege requirements with clear sudo justification
+
+## Examples
+
+### Basic Security Assessment
+```bash
+# Quick assessment with console output
+sudo ./bt-quickcheck.sh
+
+# Assessment without sudo (limited checks)
+./bt-quickcheck.sh -m personal
+```
+
+### Generate Reports
+```bash
+# JSON report for automation
+sudo ./bt-quickcheck.sh -f json -o security-$(date +%Y%m%d).json
+
+# HTML report for management
+sudo ./bt-quickcheck.sh -m production -f html -o production-security-report.html
+
+# Text report for documentation
+sudo ./bt-quickcheck.sh -f txt -o baseline-$(hostname).txt
+```
+
+### Enterprise Usage
+```bash
+# Production environment assessment
+sudo ./bt-quickcheck.sh -m production -f json -o /var/log/security-assessment.json
+
+# Multiple format generation
+sudo ./bt-quickcheck.sh -m production -f html -o security-report.html
+sudo ./bt-quickcheck.sh -m production -f json -o security-report.json
+```
+
+## Implementation Progress
+
+✅ **v0.5.1 - Security Hardened & Standards Compliant**
+- 🔒 **Enhanced Security**: Comprehensive disclaimers, read-only operations, safe file access
+- 🛡️ **Input Validation**: Path traversal protection, argument validation, error handling
+- ⚡ **Strict Mode**: `set -euo pipefail` for robust error handling
+- 🔍 **Safe Operations**: Protected file access functions, permission checks
+- 📋 **User Transparency**: Clear security notices, privacy statements, operation logging
+- ✅ **Cybersecurity Standards**: Aligned with defensive security best practices
+
+✅ **v0.5.0 - Enterprise Security Assessment**
+- Container security: Docker/Podman/LXC/Kubernetes detection and hardening
+- Advanced kernel hardening: Secure Boot, lockdown mode, grsecurity detection
+- Application-level security: Web servers, databases, TLS configuration
+- Secrets management: API keys, SSH keys, sensitive file permissions
+- Cloud and remote management security assessment
+- EDR/AV detection and SIEM forwarding validation
+- Backup and disaster recovery capability assessment
+- 24 security categories with 50+ specialized checks
+
+✅ **v0.4.0 - Advanced Security Hardening** 
+- File integrity monitoring with SHA256 baselines and AIDE/Tripwire integration
+- Persistence mechanism detection (cron, timers, startup scripts, kernel modules)
+- Process forensics and hidden process detection
+- Kernel hardening and secure configuration validation
+
+✅ **v0.3.0 - Comprehensive Security Assessment**
+- Multiple output formats (JSON, HTML, TXT) with structured data
+- Personal vs Production operation modes with tailored recommendations
+- Intrusion detection (fail2ban, auth logs, suspicious activity)
+- Time synchronization and logging infrastructure validation
+- Network security and package integrity verification
+
+✅ **v0.2.0 - Core Security Baseline**
+- Fast, read-only security posture assessment
+- SSH hardening, firewall status, user account analysis
+- Update management and basic permission auditing
+
+
+
+## Roadmap
+
+### Planned Features
+- 🔧 **CIS Benchmark Integration**: Map checks to CIS Linux Benchmark controls
+- 🐳 **Container Context Awareness**: Detect container vs host environment
+- 🔌 **Pluggable Framework**: Enable/disable specific check categories
+- 🔇 **Quiet Mode**: Fail-only output and minimal verbosity options
+- 📊 **Enhanced SIEM Integration**: Improved JSON schema and log forwarding
+- 🚀 **Performance Optimization**: Faster execution and reduced resource usage
+
+### Long-term Vision
+- Integration with popular security frameworks (NIST, ISO 27001)
+- Cloud-native security assessments (AWS, Azure, GCP)
+- Real-time monitoring mode with alert capabilities
+- Plugin system for custom organizational checks
+
+## References
 
 - Awesome lists and collections:
   - [Awesome Cybersecurity Blue Team](https://github.com/fabacab/awesome-cybersecurity-blueteam)
@@ -141,13 +342,61 @@ Running with `sudo` is recommended to get full visibility; it will still run wit
   - [Wazuh](https://github.com/wazuh/wazuh)
   - [Falco](https://github.com/falcosecurity/falco)
 
-### Contributing
+## Contributing
 
-- Propose new checks via issues first; include distro(s), command, expected output, severity, and benchmark references.
-- Keep checks read-only and efficient; avoid deep recursive scans by default.
+I welcome contributions to improve bt-quickcheck! Here's how you can help:
 
-### License
+### Reporting Issues
+- 🐛 **Bug Reports**: Use GitHub issues to report bugs with system details
+- 💡 **Feature Requests**: Suggest new security checks or improvements
+- 📚 **Documentation**: Help improve documentation and examples
 
-MIT — see `LICENSE`.
+### Contributing Code
+1. **Fork the repository** and create a feature branch
+2. **Propose new checks** via issues first with:
+   - Target Linux distributions
+   - Command syntax and expected output
+   - Severity justification
+   - Security benchmark references (CIS, NIST, etc.)
+3. **Follow coding standards**:
+   - Read-only operations only
+   - Efficient execution (avoid deep recursive scans)
+   - Graceful error handling
+   - Clear, actionable recommendations
+4. **Test thoroughly** across different distributions
+5. **Submit a pull request** with detailed description
+
+### Development Guidelines
+- Maintain backward compatibility
+- Add appropriate error handling
+- Include both personal and production mode recommendations
+- Document new features in README
+- Follow existing code style and patterns
+
+### Security Considerations
+- All new checks must be read-only
+- No external network connections
+- Validate all inputs and file paths
+- Include appropriate security disclaimers
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Contact & Support
+
+- 📧 **Issues**: [GitHub Issues](https://github.com/MaxAKAgluck/bt-quickcheck/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/MaxAKAgluck/bt-quickcheck/discussions)
+- 🔒 **Security Issues**: Please report security vulnerabilities via GitHub's private vulnerability reporting
+
+## Acknowledgments
+
+- Inspired by [LinPEAS](https://github.com/carlospolop/PEASS-ng) for its ease of use
+- Built for the blue team community and defensive security practitioners
+- Thanks to all contributors and security researchers who help improve this tool
+
+---
+
+**⚠️ Disclaimer**: This tool is provided as-is for defensive security assessment purposes. Always ensure you have proper authorization before running security assessments on any system.
 
 
