@@ -870,12 +870,15 @@ section_network_security() {
 section_package_integrity() {
 	print_section "Package Integrity"
 	
+	integrity_check_performed=false
+	
 	# RPM-based systems
 	if command_exists rpm; then
 		if is_root; then
 			# Check for modified files (limit output)
 			modified_files=$(rpm -Va 2>/dev/null | head -10 | wc -l || echo 0)
-			if [ "$modified_files" -gt 0 ]; then
+			modified_files=$(echo "$modified_files" | tr -d '\n' | awk '{print $1}')
+			if [ "${modified_files:-0}" -gt 0 ]; then
 				rec="Review package modifications: 'sudo rpm -Va | head -20'"
 				add_finding "Package Integrity" "WARN" "Modified package files detected" "$rec"
 				warn "Modified package files detected"
@@ -883,15 +886,18 @@ section_package_integrity() {
 				add_finding "Package Integrity" "OK" "Package integrity verified" ""
 				ok "Package integrity verified"
 			fi
+			integrity_check_performed=true
 		else
 			add_finding "Package Integrity" "INFO" "Package integrity check requires root" ""
+			integrity_check_performed=true
 		fi
 	# Debian-based systems
 	elif command_exists dpkg; then
 		if command_exists debsums && is_root; then
 			# Check for modified files
 			modified=$(debsums -c 2>/dev/null | head -5 | wc -l || echo 0)
-			if [ "$modified" -gt 0 ]; then
+			modified=$(echo "$modified" | tr -d '\n' | awk '{print $1}')
+			if [ "${modified:-0}" -gt 0 ]; then
 				rec="Review package modifications: 'sudo debsums -c | head -20'"
 				add_finding "Package Integrity" "WARN" "Modified package files detected" "$rec"
 				warn "Modified package files detected"
@@ -899,9 +905,22 @@ section_package_integrity() {
 				add_finding "Package Integrity" "OK" "Package integrity verified" ""
 				ok "Package integrity verified"
 			fi
-		else
+			integrity_check_performed=true
+		elif command_exists dpkg; then
 			rec="Install debsums for integrity checking: 'sudo apt install debsums'"
 			add_finding "Package Integrity" "INFO" "debsums not available for integrity check" "$rec"
+			if [ "$OUTPUT_FORMAT" = "console" ]; then
+				info "debsums not available for package integrity verification"
+			fi
+			integrity_check_performed=true
+		fi
+	fi
+	
+	# Add baseline finding if no package integrity check was performed
+	if [ "$integrity_check_performed" = false ]; then
+		add_finding "Package Integrity" "INFO" "No supported package manager for integrity checking" "Manual package verification recommended"
+		if [ "$OUTPUT_FORMAT" = "console" ]; then
+			info "No supported package manager for automated integrity checking"
 		fi
 	fi
 }
@@ -957,12 +976,16 @@ section_file_integrity() {
 		else
 			rec="Install AIDE for file integrity monitoring: 'sudo apt install aide && sudo aide --init'"
 			add_finding "File Integrity" "INFO" "AIDE not installed" "$rec"
+			[ "$OUTPUT_FORMAT" = "console" ] && info "AIDE not installed"
 		fi
 		
 		# Check for Tripwire
 		if command_exists tripwire; then
 			add_finding "File Integrity" "OK" "Tripwire detected" ""
 			ok "Tripwire detected"
+		else
+			add_finding "File Integrity" "INFO" "Tripwire not detected" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && info "Tripwire not detected"
 		fi
 		
 		# Still do basic hash checks for immediate verification
@@ -971,11 +994,13 @@ section_file_integrity() {
 			if [ -f "$binary" ]; then
 				hash=$(sha256sum "$binary" 2>/dev/null | cut -d' ' -f1)
 				add_finding "File Integrity" "INFO" "$(basename "$binary"): $hash" ""
+				[ "$OUTPUT_FORMAT" = "console" ] && echo "$(basename "$binary"): ${hash:0:16}..."
 			fi
 		done
 		
 		rec="Implement automated integrity monitoring with AIDE/Tripwire and baseline comparisons"
 		add_finding "File Integrity" "INFO" "File integrity monitoring recommended" "$rec"
+		[ "$OUTPUT_FORMAT" = "console" ] && info "File integrity monitoring recommended"
 	fi
 }
 
@@ -1266,9 +1291,11 @@ section_container_security() {
 			# Check Docker daemon configuration
 			if [ -f /etc/docker/daemon.json ]; then
 				add_finding "Container Security" "OK" "Docker daemon configuration file exists" ""
+				[ "$OUTPUT_FORMAT" = "console" ] && ok "Docker daemon configuration file found"
 			else
 				rec="Create Docker daemon config: '/etc/docker/daemon.json' with security hardening"
 				add_finding "Container Security" "INFO" "No Docker daemon configuration found" "$rec"
+				[ "$OUTPUT_FORMAT" = "console" ] && info "No Docker daemon configuration found"
 			fi
 		fi
 	fi
@@ -1522,11 +1549,14 @@ section_secrets_sensitive_data() {
 	
 	# Check for .env files with loose permissions
 	if [ "$OPERATION_MODE" = "personal" ]; then
-		find "$HOME" -name ".env" -type f -perm /044 2>/dev/null | head -5 | while read -r env_file; do
+		env_files=$(find "$HOME" -name ".env" -type f -perm /044 2>/dev/null | head -5)
+		if [ -n "$env_files" ]; then
 			secrets_findings_made=true
-			rec="Secure .env file: 'chmod 600 $env_file'"
-			add_finding "Secrets" "WARN" ".env file with world-readable permissions: $env_file" "$rec"
-		done
+			echo "$env_files" | while read -r env_file; do
+				rec="Secure .env file: 'chmod 600 $env_file'"
+				add_finding "Secrets" "WARN" ".env file with world-readable permissions: $env_file" "$rec"
+			done
+		fi
 	fi
 	
 	# SSH agent forwarding check
