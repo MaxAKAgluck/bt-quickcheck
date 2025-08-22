@@ -53,7 +53,7 @@ sudo ./bt-quickcheck.sh
 
 - Linux system (any major distribution)
 - Bash 4.0+ (included in most modern Linux distributions)
-- `sudo` access for comprehensive assessment (optional for limited checks)
+- `sudo` access for comprehensive assessment (see [Sudo Requirements](#sudo-requirements) below)
 
 ### Method 1: Direct Execution (Recommended)
 
@@ -88,8 +88,11 @@ sudo ./bt-quickcheck.sh
 ### Basic Usage
 
 ```bash
-# Default console output
+# Comprehensive security assessment (recommended)
 sudo ./bt-quickcheck.sh
+
+# Limited assessment without sudo (see limitations below)
+./bt-quickcheck.sh
 
 # Get help
 ./bt-quickcheck.sh --help
@@ -109,6 +112,79 @@ OPTIONS:
   -f, --format FORMAT     Output format: console, json, html, txt (default: console)
   -o, --output FILE       Output file (default: stdout)
   -m, --mode MODE         Operation mode: personal, production (default: personal)
+```
+
+## Sudo Requirements
+
+### Why Sudo is Recommended
+
+While bt-quickcheck can run without sudo, **comprehensive security assessment requires elevated privileges** to access system files, logs, and configurations that are critical for security analysis.
+
+### Running with Sudo (Recommended)
+
+```bash
+# Full security assessment
+sudo ./bt-quickcheck.sh
+```
+
+**With sudo, you get access to:**
+- ✅ **System log analysis** (auth.log, secure, system logs)
+- ✅ **Password policy audit** (/etc/shadow access)
+- ✅ **Sudo configuration review** (/etc/sudoers analysis)
+- ✅ **System service configurations** (detailed service status)
+- ✅ **Package integrity verification** (rpm -Va, debsums)
+- ✅ **Advanced file permissions** (system-wide SUID/SGID scans)
+- ✅ **Process forensics** (network connections, capabilities)
+- ✅ **Container security** (privileged containers, host mounts)
+- ✅ **Kernel module analysis** (loaded modules inspection)
+- ✅ **EDR/monitoring agents** (detailed configuration)
+
+### Running without Sudo (Limited)
+
+```bash
+# Limited security assessment
+./bt-quickcheck.sh
+```
+
+**Without sudo, you only get:**
+- ⚠️ **Basic system information** (kernel, distro, uptime)
+- ⚠️ **Public network services** (listening ports)
+- ⚠️ **User account structure** (UID 0 accounts only)
+- ⚠️ **SSH client configuration** (user-accessible settings)
+- ⚠️ **Available security tools** (installed packages)
+- ⚠️ **User-accessible file permissions** (home directory only)
+- ⚠️ **Personal configuration** (shell, environment)
+
+### Console Warning System
+
+When running without sudo, bt-quickcheck will:
+
+1. **Display prominent warnings** at startup explaining limitations
+2. **Show which checks are being skipped** and why they require sudo
+3. **Provide a detailed summary** of what was checked vs. what was missed
+4. **Recommend running with sudo** for comprehensive assessment
+
+### Production vs Personal Mode
+
+- **Production Mode**: Requires sudo for meaningful security assessment and compliance validation
+- **Personal Mode**: Can provide basic security insights without sudo, but comprehensive assessment still requires elevated privileges
+
+### Example Output Differences
+
+#### With Sudo:
+```
+=== Accounts and Sudo === (Full access) [user security]
+[OK] Only root has UID 0
+[OK] No NOPASSWD sudo entries
+[WARN] 3 accounts without passwords detected
+```
+
+#### Without Sudo:
+```
+=== Accounts and Sudo === (Limited - requires sudo) [user security]
+[OK] Only root has UID 0
+[WARN] NOPASSWD sudo check skipped - requires sudo access
+[WARN] Password audit skipped - requires sudo access to /etc/shadow
 ```
 
 ## Security Assessment Categories
@@ -242,10 +318,10 @@ sudo ./bt-quickcheck.sh -m production
 
 ### Basic Security Assessment
 ```bash
-# Quick assessment with console output
+# Comprehensive assessment with console output (recommended)
 sudo ./bt-quickcheck.sh
 
-# Assessment without sudo (limited checks)
+# Limited assessment without sudo (basic checks only)
 ./bt-quickcheck.sh -m personal
 ```
 
