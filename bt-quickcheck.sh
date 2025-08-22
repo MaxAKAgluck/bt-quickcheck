@@ -1240,8 +1240,9 @@ section_container_security() {
 			
 			# Check for privileged containers (requires root)
 			if is_root; then
-				privileged_containers=$(docker ps --format "table {{.Names}}\t{{.Command}}" 2>/dev/null | grep -c privileged || echo 0)
-				if [ "$privileged_containers" -gt 0 ]; then
+				privileged_containers=$(docker ps --format "table {{.Names}}\t{{.Command}}" 2>/dev/null | grep -c privileged 2>/dev/null || echo 0)
+				privileged_containers=$(echo "$privileged_containers" | tr -d '\n' | awk '{print $1}')
+				if [ "${privileged_containers:-0}" -gt 0 ]; then
 					rec=$(get_recommendation "Review and minimize privileged containers" \
 						"Audit privileged containers: 'docker ps --filter=\"privileged=true\"'" \
 						"Critical: Review all privileged containers, minimize capabilities, implement security policies")
@@ -1250,8 +1251,9 @@ section_container_security() {
 				fi
 				
 				# Check for dangerous host mounts
-				dangerous_mounts=$(docker ps --format "{{.Mounts}}" 2>/dev/null | grep -E "(docker\.sock|/etc|/proc|/sys)" | wc -l || echo 0)
-				if [ "$dangerous_mounts" -gt 0 ]; then
+				dangerous_mounts=$(docker ps --format "{{.Mounts}}" 2>/dev/null | grep -E "(docker\.sock|/etc|/proc|/sys)" | wc -l 2>/dev/null || echo 0)
+				dangerous_mounts=$(echo "$dangerous_mounts" | tr -d '\n' | awk '{print $1}')
+				if [ "${dangerous_mounts:-0}" -gt 0 ]; then
 					rec="Review host mounts: 'docker ps --format \"table {{.Names}}\\t{{.Mounts}}\"'"
 					add_finding "Container Security" "WARN" "Containers with sensitive host mounts detected" "$rec"
 					warn "Dangerous host mounts detected"
@@ -1406,8 +1408,10 @@ section_application_security() {
 	
 	# Web server detection and security
 	web_servers=("nginx" "apache2" "httpd")
+	web_server_found=false
 	for server in "${web_servers[@]}"; do
 		if systemctl is-active --quiet "$server" 2>/dev/null; then
+			web_server_found=true
 			add_finding "App Security" "INFO" "$server web server is active" ""
 			[ "$OUTPUT_FORMAT" = "console" ] && info "$server detected"
 			
@@ -1434,12 +1438,20 @@ section_application_security() {
 		fi
 	done
 	
+	# Add baseline finding if no web servers found
+	if [ "$web_server_found" = false ]; then
+		add_finding "App Security" "INFO" "No web servers detected" "Web server security checks skipped"
+		[ "$OUTPUT_FORMAT" = "console" ] && info "No web servers detected"
+	fi
+	
 	# Database exposure checks
 	databases=("mysql:3306" "postgresql:5432" "mongodb:27017" "redis:6379")
+	database_found=false
 	for db_info in "${databases[@]}"; do
 		IFS=':' read -r db_name db_port <<< "$db_info"
 		
 		if systemctl is-active --quiet "$db_name" 2>/dev/null || systemctl is-active --quiet "${db_name}d" 2>/dev/null; then
+			database_found=true
 			add_finding "App Security" "INFO" "$db_name database service detected" ""
 			
 			# Check if database is listening on all interfaces
@@ -1455,10 +1467,18 @@ section_application_security() {
 			fi
 		fi
 	done
+	
+	# Add baseline finding if no databases found
+	if [ "$database_found" = false ]; then
+		add_finding "App Security" "INFO" "No database services detected" "Database security checks skipped"
+		[ "$OUTPUT_FORMAT" = "console" ] && info "No database services detected"
+	fi
 }
 
 section_secrets_sensitive_data() {
 	print_section "Secrets & Sensitive Data"
+	
+	secrets_findings_made=false
 	
 	# Common locations for sensitive files
 	sensitive_locations=(
@@ -1478,18 +1498,23 @@ section_secrets_sensitive_data() {
 			if [ -f "$location" ]; then
 				# File permissions check
 				if [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
+					secrets_findings_made=true
 					rec="Secure file permissions: 'chmod 600 $location'"
 					add_finding "Secrets" "WARN" "$location has permissive permissions ($perms)" "$rec"
 					warn "Insecure file: $(basename "$location")"
 				else
+					secrets_findings_made=true
 					add_finding "Secrets" "OK" "$location has secure permissions" ""
 				fi
 			elif [ -d "$location" ]; then
 				# Directory permissions check
 				if [ "$perms" != "700" ] && [ "$perms" != "750" ]; then
+					secrets_findings_made=true
 					rec="Secure directory permissions: 'chmod 700 $location'"
 					add_finding "Secrets" "WARN" "$location has permissive permissions ($perms)" "$rec"
 					warn "Insecure directory: $(basename "$location")"
+				else
+					secrets_findings_made=true
 				fi
 			fi
 		fi
@@ -1498,6 +1523,7 @@ section_secrets_sensitive_data() {
 	# Check for .env files with loose permissions
 	if [ "$OPERATION_MODE" = "personal" ]; then
 		find "$HOME" -name ".env" -type f -perm /044 2>/dev/null | head -5 | while read -r env_file; do
+			secrets_findings_made=true
 			rec="Secure .env file: 'chmod 600 $env_file'"
 			add_finding "Secrets" "WARN" ".env file with world-readable permissions: $env_file" "$rec"
 		done
@@ -1505,6 +1531,7 @@ section_secrets_sensitive_data() {
 	
 	# SSH agent forwarding check
 	if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+		secrets_findings_made=true
 		rec=$(get_recommendation "Be cautious with SSH agent forwarding - disable if not needed" \
 			"Review SSH agent forwarding usage and disable for sensitive connections" \
 			"Implement SSH bastion hosts and disable agent forwarding to production systems")
@@ -1513,21 +1540,31 @@ section_secrets_sensitive_data() {
 	
 	# GPG agent check
 	if pgrep -f gpg-agent >/dev/null; then
+		secrets_findings_made=true
 		add_finding "Secrets" "INFO" "GPG agent is running" ""
 		if [ "$OPERATION_MODE" = "production" ]; then
 			rec="Ensure GPG keys are properly managed and rotated according to policy"
 			add_finding "Secrets" "INFO" "Verify GPG key management procedures" "$rec"
 		fi
 	fi
+	
+	# Add baseline finding if no sensitive data findings were made
+	if [ "$secrets_findings_made" = false ]; then
+		add_finding "Secrets" "INFO" "No sensitive files or agents detected" "Common sensitive data locations checked"
+		[ "$OUTPUT_FORMAT" = "console" ] && info "No sensitive files or agents detected"
+	fi
 }
 
 section_cloud_remote_mgmt() {
 	print_section "Cloud & Remote Management"
 	
+	cloud_findings_made=false
+	
 	# Cloud agent detection
 	cloud_agents=("cloud-init" "waagent" "google-osconfig-agent" "amazon-ssm-agent")
 	for agent in "${cloud_agents[@]}"; do
 		if systemctl is-active --quiet "$agent" 2>/dev/null || pgrep -f "$agent" >/dev/null; then
+			cloud_findings_made=true
 			add_finding "Cloud Management" "INFO" "$agent detected and active" ""
 			[ "$OUTPUT_FORMAT" = "console" ] && info "$agent active"
 			
@@ -1545,6 +1582,7 @@ section_cloud_remote_mgmt() {
 	remote_services=("vncserver" "xrdp" "teamviewerd" "anydesk")
 	for service in "${remote_services[@]}"; do
 		if systemctl is-active --quiet "$service" 2>/dev/null || pgrep -f "$service" >/dev/null; then
+			cloud_findings_made=true
 			rec=$(get_recommendation "Remove $service if not needed: 'sudo systemctl disable $service'" \
 				"Secure $service with strong authentication and access controls" \
 				"Implement MFA and strict access policies for $service")
@@ -1555,9 +1593,16 @@ section_cloud_remote_mgmt() {
 	
 	# Check for VNC ports
 	if ss -tln 2>/dev/null | grep -q ":59[0-9][0-9]"; then
+		cloud_findings_made=true
 		rec="Secure or disable VNC access - consider SSH tunneling instead"
 		add_finding "Cloud Management" "WARN" "VNC service listening on network" "$rec"
 		warn "VNC service exposed"
+	fi
+	
+	# Add baseline finding if no cloud/remote management findings were made
+	if [ "$cloud_findings_made" = false ]; then
+		add_finding "Cloud Management" "INFO" "No cloud agents or remote management services detected" "Cloud and remote management security checks completed"
+		[ "$OUTPUT_FORMAT" = "console" ] && info "No cloud agents or remote management services detected"
 	fi
 }
 
