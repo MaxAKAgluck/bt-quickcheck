@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.5.0
+# Version: 0.5.1
 # 
 # SECURITY DISCLAIMER:
 # This script performs READ-ONLY security assessment of Linux systems.
@@ -65,6 +65,58 @@ safe_read() {
 safe_dir_check() {
     local dir="$1"
     [ -d "$dir" ] && [ -r "$dir" ]
+}
+
+# Check if a section should be run based on privileges and mode
+should_run_section() {
+    local section="$1"
+    local requires_root="${2:-false}"
+    
+    # If section requires root and we don't have it, skip
+    if [ "$requires_root" = "true" ] && ! is_root; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Display skip message for sections that require root
+skip_section() {
+    local section="$1"
+    local reason="${2:-requires root access}"
+    
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}\n" "$section"
+        printf "${COLOR_YELLOW}[SKIP]${COLOR_RESET} Section skipped - %s\n" "$reason"
+        printf "${COLOR_YELLOW}       Run with sudo for comprehensive assessment${COLOR_RESET}\n"
+    fi
+    
+    add_finding "$section" "INFO" "Section skipped without sudo" "Run script with sudo for complete assessment"
+}
+
+# Enhanced print_section that shows privilege requirements
+print_section_with_privilege_info() {
+    local section="$1"
+    local requires_root="${2:-false}"
+    local check_count="${3:-}"
+    
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}" "$section"
+        
+        if [ "$requires_root" = "true" ] && ! is_root; then
+            printf " ${COLOR_YELLOW}(Limited - requires sudo)${COLOR_RESET}"
+        elif [ "$requires_root" = "true" ] && is_root; then
+            printf " ${COLOR_GREEN}(Full access)${COLOR_RESET}"
+        fi
+        
+        if [ -n "$check_count" ]; then
+            printf " ${COLOR_BLUE}[%s checks]${COLOR_RESET}" "$check_count"
+        fi
+        
+        printf "\n"
+    fi
+    
+    SECTIONS+=("$section")
 }
 
 # Validate output format
@@ -313,8 +365,15 @@ section_system() {
 }
 
 section_updates() {
-	print_section "Updates"
+	print_section_with_privilege_info "Updates" "false" "package status"
+	
 	pm=$(detect_pkg_mgr)
+	
+	# Note about package cache updates requiring sudo
+	if ! is_root && [ "$OUTPUT_FORMAT" = "console" ]; then
+		info "Package cache may be outdated without sudo - results may not reflect latest available updates"
+	fi
+	
 	case "$pm" in
 		apt)
 			if is_root; then apt-get update -qq >/dev/null 2>&1; fi
@@ -507,9 +566,9 @@ section_auditing() {
 }
 
 section_accounts() {
-	print_section "Accounts and Sudo"
+	print_section_with_privilege_info "Accounts and Sudo" "true" "user security"
 	
-	# Check for unauthorized root accounts (UID 0)
+	# Check for unauthorized root accounts (UID 0) - this can be done without root
 	unauthorized_root=$(awk -F: '($3 == "0" && $1 != "root") {print $1}' /etc/passwd 2>/dev/null)
 	if [ -n "$unauthorized_root" ]; then
 		rec=$(get_recommendation "Remove unauthorized UID 0 accounts or investigate: $unauthorized_root" \
@@ -527,30 +586,40 @@ section_accounts() {
 	add_finding "Accounts" "INFO" "UID 0 accounts: $all_uid0" ""
 	[ "$OUTPUT_FORMAT" = "console" ] && echo "UID0: $all_uid0"
 	
-	# Check for NOPASSWD sudo entries
-	if [ -r /etc/sudoers ]; then
-		nopasswd_entries=$(grep -R "NOPASSWD" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)
-		if [ -n "$nopasswd_entries" ]; then
-			rec=$(get_recommendation "Review NOPASSWD sudo entries for security risks" \
-				"Consider requiring passwords for sudo access or limit to specific commands" \
-				"Audit NOPASSWD entries: document business justification or remove")
-			add_finding "Accounts" "WARN" "NOPASSWD sudo entries found" "$rec"
-			warn "NOPASSWD sudo entries found"
-			[ "$OUTPUT_FORMAT" = "console" ] && echo "$nopasswd_entries" | sed 's/^/NOPASSWD: /'
-		else
-			add_finding "Accounts" "OK" "No NOPASSWD sudo entries" ""
-			ok "No NOPASSWD sudo entries"
+	# Check for NOPASSWD sudo entries - requires root access
+	if is_root; then
+		if [ -r /etc/sudoers ]; then
+			nopasswd_entries=$(grep -R "NOPASSWD" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)
+			if [ -n "$nopasswd_entries" ]; then
+				rec=$(get_recommendation "Review NOPASSWD sudo entries for security risks" \
+					"Consider requiring passwords for sudo access or limit to specific commands" \
+					"Audit NOPASSWD entries: document business justification or remove")
+				add_finding "Accounts" "WARN" "NOPASSWD sudo entries found" "$rec"
+				warn "NOPASSWD sudo entries found"
+				[ "$OUTPUT_FORMAT" = "console" ] && echo "$nopasswd_entries" | sed 's/^/NOPASSWD: /'
+			else
+				add_finding "Accounts" "OK" "No NOPASSWD sudo entries" ""
+				ok "No NOPASSWD sudo entries"
+			fi
 		fi
-	fi
-	
-	# Check for accounts without passwords
-	empty_pass=$(awk -F: '($2 == "" || $2 == "!") {print $1}' /etc/shadow 2>/dev/null | head -10 | tr '\n' ' ' || true)
-	if [ -n "$empty_pass" ] && [ "$empty_pass" != " " ]; then
-		rec=$(get_recommendation "Set passwords or lock accounts without passwords" \
-			"Lock unused accounts: 'sudo usermod -L username' or set strong passwords" \
-			"Audit passwordless accounts: lock service accounts, enforce password policy")
-		add_finding "Accounts" "WARN" "Accounts without passwords: $empty_pass" "$rec"
-		warn "Accounts without passwords detected"
+		
+		# Check for accounts without passwords - requires root access to /etc/shadow
+		empty_pass=$(awk -F: '($2 == "" || $2 == "!") {print $1}' /etc/shadow 2>/dev/null | head -10 | tr '\n' ' ' || true)
+		if [ -n "$empty_pass" ] && [ "$empty_pass" != " " ]; then
+			rec=$(get_recommendation "Set passwords or lock accounts without passwords" \
+				"Lock unused accounts: 'sudo usermod -L username' or set strong passwords" \
+				"Audit passwordless accounts: lock service accounts, enforce password policy")
+			add_finding "Accounts" "WARN" "Accounts without passwords: $empty_pass" "$rec"
+			warn "Accounts without passwords detected"
+		fi
+	else
+		# Limited checks without root
+		if [ "$OUTPUT_FORMAT" = "console" ]; then
+			warn "NOPASSWD sudo check skipped - requires sudo access"
+			warn "Password audit skipped - requires sudo access to /etc/shadow"
+		fi
+		add_finding "Accounts" "INFO" "NOPASSWD sudo check requires root access" "Run script with sudo for complete account analysis"
+		add_finding "Accounts" "INFO" "Password audit requires root access" "Run script with sudo for complete account analysis"
 	fi
 }
 
@@ -566,7 +635,7 @@ section_permissions() {
 }
 
 section_intrusion_detection() {
-	print_section "Intrusion Detection"
+	print_section_with_privilege_info "Intrusion Detection" "true" "security monitoring"
 	
 	# Check for fail2ban
 	if command_exists fail2ban-client; then
@@ -574,13 +643,16 @@ section_intrusion_detection() {
 			add_finding "Intrusion Detection" "OK" "fail2ban is active" ""
 			ok "fail2ban is active"
 			
-			# Get jail status
+			# Get jail status - requires root
 			if is_root; then
 				jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' \t' || true)
 				if [ -n "$jails" ] && [ "$jails" != "" ]; then
 					add_finding "Intrusion Detection" "INFO" "fail2ban jails: $jails" ""
 					[ "$OUTPUT_FORMAT" = "console" ] && info "Active jails: $jails"
 				fi
+			else
+				[ "$OUTPUT_FORMAT" = "console" ] && info "fail2ban jail details require sudo access"
+				add_finding "Intrusion Detection" "INFO" "fail2ban jail status requires root access" "Run with sudo for detailed jail information"
 			fi
 		else
 			rec=$(get_recommendation "Start fail2ban: 'sudo systemctl start fail2ban'" \
@@ -597,21 +669,37 @@ section_intrusion_detection() {
 		[ "$OUTPUT_FORMAT" = "console" ] && info "fail2ban not installed"
 	fi
 	
-	# Check for suspicious login attempts in auth logs
-	if [ -r /var/log/auth.log ]; then
-		failed_logins=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -5 | wc -l || echo 0)
-		if [ "$failed_logins" -gt 3 ]; then
-			rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/auth.log'"
-			add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
-			warn "Recent failed login attempts detected"
+	# Check for suspicious login attempts in auth logs - requires root access
+	if is_root; then
+		if [ -r /var/log/auth.log ]; then
+			failed_logins=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -5 | wc -l || echo 0)
+			if [ "$failed_logins" -gt 3 ]; then
+				rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/auth.log'"
+				add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
+				warn "Recent failed login attempts detected"
+			else
+				add_finding "Intrusion Detection" "OK" "No recent failed login attempts in auth.log" ""
+				ok "No recent failed logins detected"
+			fi
+		elif [ -r /var/log/secure ]; then
+			failed_logins=$(grep "Failed password" /var/log/secure 2>/dev/null | tail -5 | wc -l || echo 0)
+			if [ "$failed_logins" -gt 3 ]; then
+				rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/secure'"
+				add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
+				warn "Recent failed login attempts detected"
+			else
+				add_finding "Intrusion Detection" "OK" "No recent failed login attempts in secure log" ""
+				ok "No recent failed logins detected"
+			fi
+		else
+			add_finding "Intrusion Detection" "INFO" "No standard auth logs found" "Check system-specific log locations"
 		fi
-	elif [ -r /var/log/secure ]; then
-		failed_logins=$(grep "Failed password" /var/log/secure 2>/dev/null | tail -5 | wc -l || echo 0)
-		if [ "$failed_logins" -gt 3 ]; then
-			rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/secure'"
-			add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
-			warn "Recent failed login attempts detected"
+	else
+		# Without root, cannot read auth logs
+		if [ "$OUTPUT_FORMAT" = "console" ]; then
+			warn "Authentication log analysis skipped - requires sudo access"
 		fi
+		add_finding "Intrusion Detection" "INFO" "Authentication log analysis requires root access" "Run script with sudo to check for failed login attempts"
 	fi
 }
 
@@ -1598,6 +1686,52 @@ section_backup_resilience() {
 	fi
 }
 
+# Summary of limitations when running without sudo
+section_privilege_summary() {
+	if ! is_root; then
+		print_section "Privilege Limitations Summary"
+		
+		if [ "$OUTPUT_FORMAT" = "console" ]; then
+			echo "${COLOR_YELLOW}This scan was run without sudo privileges. The following security checks were limited or skipped:${COLOR_RESET}"
+			echo
+			echo "${COLOR_YELLOW}SKIPPED/LIMITED CHECKS:${COLOR_RESET}"
+			echo "• ${COLOR_YELLOW}System log analysis${COLOR_RESET} (auth.log, secure, system logs)"
+			echo "• ${COLOR_YELLOW}Password policy audit${COLOR_RESET} (/etc/shadow access)"
+			echo "• ${COLOR_YELLOW}Sudo configuration review${COLOR_RESET} (/etc/sudoers analysis)"
+			echo "• ${COLOR_YELLOW}System service configurations${COLOR_RESET} (limited service status only)"
+			echo "• ${COLOR_YELLOW}Package integrity verification${COLOR_RESET} (rpm -Va, debsums)"
+			echo "• ${COLOR_YELLOW}Advanced file permissions${COLOR_RESET} (system-wide SUID/SGID scans)"
+			echo "• ${COLOR_YELLOW}Process forensics${COLOR_RESET} (network connections, capabilities)"
+			echo "• ${COLOR_YELLOW}Container security${COLOR_RESET} (privileged containers, host mounts)"
+			echo "• ${COLOR_YELLOW}Kernel module analysis${COLOR_RESET} (loaded modules inspection)"
+			echo "• ${COLOR_YELLOW}EDR/monitoring agents${COLOR_RESET} (detailed configuration)"
+			echo
+			echo "${COLOR_GREEN}COMPLETED CHECKS:${COLOR_RESET}"
+			echo "• ${COLOR_GREEN}Basic system information${COLOR_RESET} (kernel, distro, uptime)"
+			echo "• ${COLOR_GREEN}Public network services${COLOR_RESET} (listening ports)"
+			echo "• ${COLOR_GREEN}User account structure${COLOR_RESET} (UID 0 accounts)"
+			echo "• ${COLOR_GREEN}SSH client configuration${COLOR_RESET} (user-accessible settings)"
+			echo "• ${COLOR_GREEN}Available security tools${COLOR_RESET} (installed packages)"
+			echo "• ${COLOR_GREEN}User-accessible file permissions${COLOR_RESET} (home directory)"
+			echo "• ${COLOR_GREEN}Personal configuration${COLOR_RESET} (shell, environment)"
+			echo
+		fi
+		
+		if [ "$OPERATION_MODE" = "production" ]; then
+			rec="Production environments require comprehensive security assessment - run with sudo for compliance"
+			add_finding "Privilege Summary" "WARN" "Limited production security assessment without sudo" "$rec"
+		else
+			rec="For complete personal security assessment, run: sudo $0"
+			add_finding "Privilege Summary" "INFO" "Personal security scan completed with limitations" "$rec"
+		fi
+		
+		if [ "$OUTPUT_FORMAT" = "console" ]; then
+			echo "${COLOR_BLUE}For comprehensive security assessment, run:${COLOR_RESET} ${COLOR_GREEN}sudo $0${COLOR_RESET}"
+			echo
+		fi
+	fi
+}
+
 section_summary() {
 	print_section "Summary"
 	
@@ -1621,6 +1755,10 @@ section_summary() {
 	echo "bt-quickcheck v${VERSION} completed."
 	echo "Total findings: $total_findings (CRIT: $crit_count, WARN: $warn_count, OK: $ok_count, INFO: $info_count)"
 	echo "Mode: $OPERATION_MODE | Review CRIT and WARN items above."
+	
+	if ! is_root; then
+		echo "${COLOR_YELLOW}Note: This was a limited scan without sudo privileges.${COLOR_RESET}"
+	fi
 	
 	add_finding "Summary" "INFO" "Scan completed: $total_findings findings" ""
 	add_finding "Summary" "INFO" "Critical: $crit_count, Warnings: $warn_count, OK: $ok_count, Info: $info_count" ""
@@ -1752,6 +1890,20 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "   • May access sensitive files for security analysis"
 	echo "   • All data remains local - no external transmission"
 	echo
+	
+	# Check if running without sudo and display prominent warning
+	if ! is_root; then
+		echo "${COLOR_YELLOW}⚠️  LIMITED SCAN WARNING:${COLOR_RESET}"
+		echo "${COLOR_YELLOW}   • Running without sudo - many security checks will be skipped${COLOR_RESET}"
+		echo "${COLOR_YELLOW}   • System files, logs, and privileged information cannot be accessed${COLOR_RESET}"
+		echo "${COLOR_YELLOW}   • For comprehensive security assessment, run: ${COLOR_BLUE}sudo $0${COLOR_RESET}"
+		if [ "$OPERATION_MODE" = "production" ]; then
+			echo "${COLOR_RED}   • Production mode requires sudo for meaningful security assessment${COLOR_RESET}"
+		fi
+		echo "${COLOR_YELLOW}   • Current scan will show basic system information and user-accessible checks only${COLOR_RESET}"
+		echo
+	fi
+	
 	echo "🔍 Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
 	if [ -n "$OUTPUT_FILE" ]; then
 		echo "📄 Output: $OUTPUT_FILE"
@@ -1795,6 +1947,7 @@ section_secrets_sensitive_data
 section_cloud_remote_mgmt
 section_edr_monitoring
 section_backup_resilience
+section_privilege_summary
 section_summary
 
 # Generate output based on format
