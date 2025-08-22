@@ -23,6 +23,39 @@
 
 set -euo pipefail  # Strict error handling: exit on error, undefined vars, pipe failures
 
+# Enhanced error handling for critical sections
+handle_section_error() {
+    local section="$1"
+    local line="$2"
+    local error="$3"
+    
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        warn "Error in $section (line $line): $error"
+        warn "Continuing with remaining checks..."
+    fi
+    add_finding "$section" "WARN" "Section error encountered: $error" "Review section implementation"
+}
+
+# Safe section runner - runs sections with error isolation
+run_section_safely() {
+    local section_func="$1"
+    local section_name="$2"
+    
+    # Temporarily disable exit on error for this section
+    set +e
+    $section_func
+    local exit_code=$?
+    set -e
+    
+    if [ $exit_code -ne 0 ]; then
+        if [ "$OUTPUT_FORMAT" = "console" ]; then
+            warn "Section $section_name encountered an error (exit code: $exit_code)"
+            warn "Continuing with remaining security checks..."
+        fi
+        add_finding "$section_name" "WARN" "Section execution error" "Section failed with exit code $exit_code - review manually"
+    fi
+}
+
 VERSION="0.5.1"
 
 # Output format (default: console)
@@ -440,27 +473,28 @@ section_updates() {
 section_listening() {
 	print_section "Listening Services"
 	if command_exists ss; then
-		ss -tulpen 2>/dev/null | sed -n '1,30p'
+		ss -tulpen 2>/dev/null | sed -n '1,30p' || true
 	elif command_exists netstat; then
-		netstat -tulpen 2>/dev/null | sed -n '1,30p'
+		netstat -tulpen 2>/dev/null | sed -n '1,30p' || true
 	else
 		warn "Neither ss nor netstat available"
+		add_finding "Listening Services" "WARN" "No network tools available" "Install ss or netstat packages"
 	fi
 }
 
 section_firewall() {
 	print_section "Firewall"
 	if command_exists ufw; then
-		ufw status verbose 2>/dev/null | sed 's/^/ufw: /'
+		ufw status verbose 2>/dev/null | sed 's/^/ufw: /' || true
 	fi
 	if command_exists firewall-cmd; then
-		firewall-cmd --state 2>/dev/null | sed 's/^/firewalld: /'
-		firewall-cmd --list-all 2>/dev/null | sed 's/^/firewalld: /' | sed -n '1,50p'
+		firewall-cmd --state 2>/dev/null | sed 's/^/firewalld: /' || true
+		firewall-cmd --list-all 2>/dev/null | sed 's/^/firewalld: /' | sed -n '1,50p' || true
 	fi
 	if command_exists nft; then
-		nft list ruleset 2>/dev/null | sed -n '1,50p' | sed 's/^/nftables: /'
+		nft list ruleset 2>/dev/null | sed -n '1,50p' | sed 's/^/nftables: /' || true
 	elif command_exists iptables; then
-		iptables -S 2>/dev/null | sed -n '1,50p' | sed 's/^/iptables: /'
+		iptables -S 2>/dev/null | sed -n '1,50p' | sed 's/^/iptables: /' || true
 	fi
 }
 
@@ -470,8 +504,8 @@ section_ssh() {
 	
 	if [ -r "$sshd_cfg" ]; then
 		# PermitRootLogin check
-		perm_root=$(grep -Ei '^\s*PermitRootLogin\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}')
-		if [[ "$perm_root" =~ ^(no|prohibit-password)$ ]]; then
+		perm_root=$(grep -Ei '^\s*PermitRootLogin\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}' || true)
+		if [ "$perm_root" = "no" ] || [ "$perm_root" = "prohibit-password" ]; then
 			add_finding "SSH" "OK" "PermitRootLogin is $perm_root" ""
 			ok "PermitRootLogin is $perm_root"
 		else
@@ -483,7 +517,7 @@ section_ssh() {
 		fi
 		
 		# PasswordAuthentication check
-		pass_auth=$(grep -Ei '^\s*PasswordAuthentication\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}')
+		pass_auth=$(grep -Ei '^\s*PasswordAuthentication\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}' || true)
 		if [ "$pass_auth" = "no" ]; then
 			add_finding "SSH" "OK" "PasswordAuthentication is no" ""
 			ok "PasswordAuthentication is no"
@@ -569,7 +603,7 @@ section_accounts() {
 	print_section_with_privilege_info "Accounts and Sudo" "true" "user security"
 	
 	# Check for unauthorized root accounts (UID 0) - this can be done without root
-	unauthorized_root=$(awk -F: '($3 == "0" && $1 != "root") {print $1}' /etc/passwd 2>/dev/null)
+	unauthorized_root=$(awk -F: '($3 == "0" && $1 != "root") {print $1}' /etc/passwd 2>/dev/null || true)
 	if [ -n "$unauthorized_root" ]; then
 		rec=$(get_recommendation "Remove unauthorized UID 0 accounts or investigate: $unauthorized_root" \
 			"CRITICAL: Investigate unauthorized root accounts immediately" \
@@ -582,7 +616,7 @@ section_accounts() {
 	fi
 	
 	# List all UID 0 accounts for reference
-	all_uid0=$(awk -F: '($3==0){print $1}' /etc/passwd 2>/dev/null | tr '\n' ' ')
+	all_uid0=$(awk -F: '($3==0){print $1}' /etc/passwd 2>/dev/null | tr '\n' ' ' || true)
 	add_finding "Accounts" "INFO" "UID 0 accounts: $all_uid0" ""
 	[ "$OUTPUT_FORMAT" = "console" ] && echo "UID0: $all_uid0"
 	
@@ -1922,33 +1956,33 @@ if [ -n "$OUTPUT_FILE" ]; then
 	fi
 fi
 
-# Run all checks
-section_system
-section_updates
-section_listening
-section_firewall
-section_ssh
-section_auditing
-section_accounts
-section_permissions
-section_intrusion_detection
-section_time_sync
-section_logging
-section_network_security
-section_package_integrity
-section_file_integrity
-section_persistence_mechanisms
-section_process_forensics
-section_secure_configuration
-section_container_security
-section_kernel_hardening
-section_application_security
-section_secrets_sensitive_data
-section_cloud_remote_mgmt
-section_edr_monitoring
-section_backup_resilience
-section_privilege_summary
-section_summary
+# Run all checks with error isolation
+run_section_safely section_system "System"
+run_section_safely section_updates "Updates"
+run_section_safely section_listening "Listening Services"
+run_section_safely section_firewall "Firewall"
+run_section_safely section_ssh "SSH Hardening"
+run_section_safely section_auditing "Auditing/Hardening"
+run_section_safely section_accounts "Accounts and Sudo"
+run_section_safely section_permissions "Risky Permissions"
+run_section_safely section_intrusion_detection "Intrusion Detection"
+run_section_safely section_time_sync "Time Synchronization"
+run_section_safely section_logging "Logging and Monitoring"
+run_section_safely section_network_security "Network Security"
+run_section_safely section_package_integrity "Package Integrity"
+run_section_safely section_file_integrity "File Integrity"
+run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
+run_section_safely section_process_forensics "Process & Forensics"
+run_section_safely section_secure_configuration "Secure Configuration"
+run_section_safely section_container_security "Container & Virtualization Security"
+run_section_safely section_kernel_hardening "Kernel & System Hardening"
+run_section_safely section_application_security "Application-Level Protections"
+run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
+run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
+run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
+run_section_safely section_backup_resilience "Resilience & Backup"
+run_section_safely section_privilege_summary "Privilege Limitations Summary"
+run_section_safely section_summary "Summary"
 
 # Generate output based on format
 generate_output() {
