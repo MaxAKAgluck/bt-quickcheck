@@ -832,8 +832,9 @@ section_network_security() {
 	
 	# Check for open ports with no firewall
 	if command_exists ss; then
-		listening_ports=$(ss -tuln 2>/dev/null | grep LISTEN | wc -l)
-		if [ "$listening_ports" -gt 5 ]; then
+		listening_ports=$(ss -tuln 2>/dev/null | grep LISTEN | wc -l 2>/dev/null || echo 0)
+		listening_ports=$(echo "$listening_ports" | tr -d '\n' | awk '{print $1}')
+		if [ "${listening_ports:-0}" -gt 5 ]; then
 			rec=$(get_recommendation "Review listening services and close unnecessary ports" \
 				"Audit open ports: 'ss -tuln' and disable unused services" \
 				"Implement network segmentation and service hardening policies")
@@ -980,8 +981,9 @@ section_persistence_mechanisms() {
 	# Check crontabs for all users
 	if command_exists crontab; then
 		# Current user crontab
-		user_cron=$(crontab -l 2>/dev/null | grep -v '^#' | wc -l || echo 0)
-		if [ "$user_cron" -gt 0 ]; then
+		user_cron=$(crontab -l 2>/dev/null | grep -v '^#' | wc -l 2>/dev/null || echo 0)
+		user_cron=$(echo "$user_cron" | tr -d '\n' | awk '{print $1}')
+		if [ "${user_cron:-0}" -gt 0 ]; then
 			rec=$(get_recommendation "Review user crontab entries: 'crontab -l'" \
 				"Audit user cron jobs for unauthorized entries" \
 				"Document and validate all scheduled tasks")
@@ -1005,8 +1007,9 @@ section_persistence_mechanisms() {
 	
 	# Check systemd timers
 	if command_exists systemctl; then
-		active_timers=$(systemctl list-timers --no-pager 2>/dev/null | grep -c '\.timer' || echo 0)
-		if [ "$active_timers" -gt 0 ]; then
+		active_timers=$(systemctl list-timers --no-pager 2>/dev/null | grep -c '\.timer' 2>/dev/null || echo 0)
+		active_timers=$(echo "$active_timers" | tr -d '\n' | awk '{print $1}')
+		if [ "${active_timers:-0}" -gt 0 ]; then
 			rec="Review active systemd timers: 'systemctl list-timers'"
 			add_finding "Persistence" "INFO" "$active_timers systemd timer(s) active" "$rec"
 			[ "$OUTPUT_FORMAT" = "console" ] && info "Active timers: $active_timers"
@@ -1017,8 +1020,9 @@ section_persistence_mechanisms() {
 	startup_files=("/etc/rc.local" "/etc/init.d/rc.local")
 	for startup_file in "${startup_files[@]}"; do
 		if [ -f "$startup_file" ] && [ -s "$startup_file" ]; then
-			executable_lines=$(grep -v '^#' "$startup_file" | grep -v '^$' | wc -l)
-			if [ "$executable_lines" -gt 1 ]; then  # More than just exit 0
+			executable_lines=$(grep -v '^#' "$startup_file" | grep -v '^$' | wc -l 2>/dev/null || echo 0)
+			executable_lines=$(echo "$executable_lines" | tr -d '\n' | awk '{print $1}')
+			if [ "${executable_lines:-0}" -gt 1 ]; then  # More than just exit 0
 				rec="Review startup script: 'cat $startup_file'"
 				add_finding "Persistence" "WARN" "Active startup script: $startup_file" "$rec"
 				warn "Startup script detected: $startup_file"
@@ -1034,8 +1038,9 @@ section_persistence_mechanisms() {
 		for config in "${shell_configs[@]}"; do
 			if [ -f "$config" ]; then
 				# Check for suspicious additions (simplified check)
-				suspicious=$(grep -E '(curl|wget|nc |netcat|/tmp/|/dev/shm/)' "$config" 2>/dev/null | wc -l || echo 0)
-				if [ "$suspicious" -gt 0 ]; then
+				suspicious=$(grep -E '(curl|wget|nc |netcat|/tmp/|/dev/shm/)' "$config" 2>/dev/null | wc -l 2>/dev/null || echo 0)
+				suspicious=$(echo "$suspicious" | tr -d '\n' | awk '{print $1}')
+				if [ "${suspicious:-0}" -gt 0 ]; then
 					rec="Review shell config for suspicious entries: '$config'"
 					add_finding "Persistence" "WARN" "Suspicious entries in $(basename "$config")" "$rec"
 					warn "Suspicious shell config: $(basename "$config")"
@@ -1046,7 +1051,8 @@ section_persistence_mechanisms() {
 	
 	# Check loaded kernel modules
 	if command_exists lsmod; then
-		total_modules=$(lsmod | wc -l)
+		total_modules=$(lsmod | wc -l 2>/dev/null || echo 0)
+		total_modules=$(echo "$total_modules" | tr -d '\n' | awk '{print $1}')
 		add_finding "Persistence" "INFO" "$total_modules kernel modules loaded" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && info "Loaded modules: $total_modules"
 		
@@ -1065,13 +1071,15 @@ section_process_forensics() {
 	
 	# Process tree analysis
 	if command_exists pstree; then
-		process_count=$(pstree -p 2>/dev/null | wc -l)
+		process_count=$(pstree -p 2>/dev/null | wc -l 2>/dev/null || echo 0)
+		process_count=$(echo "$process_count" | tr -d '\n' | awk '{print $1}')
 		add_finding "Process Forensics" "INFO" "$process_count processes in tree" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && info "Process tree depth: $process_count"
 		
 		# Look for suspicious parent-child relationships (simplified)
-		suspicious_procs=$(pstree -p 2>/dev/null | grep -E '(sh|bash|nc|netcat|curl|wget).*\([0-9]+\).*\(' | wc -l || echo 0)
-		if [ "$suspicious_procs" -gt 0 ]; then
+		suspicious_procs=$(pstree -p 2>/dev/null | grep -E '(sh|bash|nc|netcat|curl|wget).*\([0-9]+\).*\(' | wc -l 2>/dev/null || echo 0)
+		suspicious_procs=$(echo "$suspicious_procs" | tr -d '\n' | awk '{print $1}')
+		if [ "${suspicious_procs:-0}" -gt 0 ]; then
 			rec="Review process tree for anomalies: 'pstree -p | grep -E \"(sh|bash|nc|netcat)\""
 			add_finding "Process Forensics" "WARN" "Suspicious process relationships detected" "$rec"
 			warn "Unusual process tree detected"
@@ -1080,8 +1088,10 @@ section_process_forensics() {
 	
 	# Check for hidden processes (basic check)
 	if [ -d /proc ]; then
-		proc_count=$(ls -1 /proc | grep -E '^[0-9]+$' | wc -l)
-		ps_count=$(ps aux --no-headers 2>/dev/null | wc -l || echo 0)
+		proc_count=$(ls -1 /proc | grep -E '^[0-9]+$' | wc -l 2>/dev/null || echo 0)
+		proc_count=$(echo "$proc_count" | tr -d '\n' | awk '{print $1}')
+		ps_count=$(ps aux --no-headers 2>/dev/null | wc -l 2>/dev/null || echo 0)
+		ps_count=$(echo "$ps_count" | tr -d '\n' | awk '{print $1}')
 		
 		if [ "$proc_count" -gt 0 ] && [ "$ps_count" -gt 0 ]; then
 			diff=$((proc_count - ps_count))
@@ -1108,8 +1118,9 @@ section_process_forensics() {
 		fi
 		
 		# Check for processes in tmp directories
-		tmp_procs=$(ps aux 2>/dev/null | grep -E '/tmp/|/dev/shm/' | grep -v grep | wc -l || echo 0)
-		if [ "$tmp_procs" -gt 0 ]; then
+		tmp_procs=$(ps aux 2>/dev/null | grep -E '/tmp/|/dev/shm/' | grep -v grep | wc -l 2>/dev/null || echo 0)
+		tmp_procs=$(echo "$tmp_procs" | tr -d '\n' | awk '{print $1}')
+		if [ "${tmp_procs:-0}" -gt 0 ]; then
 			rec="Investigate processes running from temporary directories"
 			add_finding "Process Forensics" "WARN" "Processes running from temp directories" "$rec"
 			warn "Processes in temp dirs detected"
@@ -1489,7 +1500,7 @@ section_secrets_sensitive_data() {
 	fi
 	
 	# SSH agent forwarding check
-	if [ -n "$SSH_AUTH_SOCK" ]; then
+	if [ -n "${SSH_AUTH_SOCK:-}" ]; then
 		rec=$(get_recommendation "Be cautious with SSH agent forwarding - disable if not needed" \
 			"Review SSH agent forwarding usage and disable for sensitive connections" \
 			"Implement SSH bastion hosts and disable agent forwarding to production systems")
@@ -1987,7 +1998,13 @@ run_section_safely section_summary "Summary"
 # Generate output based on format
 generate_output() {
 	case "$OUTPUT_FORMAT" in
-		json) generate_json_output;;
+		json) 
+			# Ensure we have findings to output
+			if [ ${#FINDINGS[@]} -eq 0 ]; then
+				add_finding "System" "INFO" "No findings generated" "This should not happen in normal operation"
+			fi
+			generate_json_output
+			;;
 		html) generate_html_output;;
 		txt) generate_txt_output;;
 		console) 
