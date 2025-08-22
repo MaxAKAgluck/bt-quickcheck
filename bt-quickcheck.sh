@@ -376,8 +376,12 @@ section_system() {
 	
 	# Distribution information
 	if [ -r /etc/os-release ]; then
+		# Save our script version before sourcing os-release
+		SCRIPT_VERSION="$VERSION"
 		. /etc/os-release
 		distro="${PRETTY_NAME:-unknown}"
+		# Restore our script version
+		VERSION="$SCRIPT_VERSION"
 		add_finding "System" "INFO" "Distribution: $distro" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && echo "Distro: $distro"
 	fi
@@ -1718,8 +1722,9 @@ section_backup_resilience() {
 	
 	# LVM snapshot capability
 	if command_exists lvs; then
-		lv_count=$(lvs --noheadings 2>/dev/null | wc -l || echo 0)
-		if [ "$lv_count" -gt 0 ]; then
+		lv_count=$(lvs --noheadings 2>/dev/null | wc -l 2>/dev/null || echo 0)
+		lv_count=$(echo "$lv_count" | tr -d '\n' | awk '{print $1}')
+		if [ "${lv_count:-0}" -gt 0 ]; then
 			add_finding "Backup/Resilience" "INFO" "LVM detected - snapshot capability available" ""
 		fi
 	fi
@@ -1737,28 +1742,28 @@ section_privilege_summary() {
 		print_section "Privilege Limitations Summary"
 		
 		if [ "$OUTPUT_FORMAT" = "console" ]; then
-			echo "${COLOR_YELLOW}This scan was run without sudo privileges. The following security checks were limited or skipped:${COLOR_RESET}"
+			printf "${COLOR_YELLOW}This scan was run without sudo privileges. The following security checks were limited or skipped:${COLOR_RESET}\n"
 			echo
-			echo "${COLOR_YELLOW}SKIPPED/LIMITED CHECKS:${COLOR_RESET}"
-			echo "• ${COLOR_YELLOW}System log analysis${COLOR_RESET} (auth.log, secure, system logs)"
-			echo "• ${COLOR_YELLOW}Password policy audit${COLOR_RESET} (/etc/shadow access)"
-			echo "• ${COLOR_YELLOW}Sudo configuration review${COLOR_RESET} (/etc/sudoers analysis)"
-			echo "• ${COLOR_YELLOW}System service configurations${COLOR_RESET} (limited service status only)"
-			echo "• ${COLOR_YELLOW}Package integrity verification${COLOR_RESET} (rpm -Va, debsums)"
-			echo "• ${COLOR_YELLOW}Advanced file permissions${COLOR_RESET} (system-wide SUID/SGID scans)"
-			echo "• ${COLOR_YELLOW}Process forensics${COLOR_RESET} (network connections, capabilities)"
-			echo "• ${COLOR_YELLOW}Container security${COLOR_RESET} (privileged containers, host mounts)"
-			echo "• ${COLOR_YELLOW}Kernel module analysis${COLOR_RESET} (loaded modules inspection)"
-			echo "• ${COLOR_YELLOW}EDR/monitoring agents${COLOR_RESET} (detailed configuration)"
+			printf "${COLOR_YELLOW}SKIPPED/LIMITED CHECKS:${COLOR_RESET}\n"
+			printf "• ${COLOR_YELLOW}System log analysis${COLOR_RESET} (auth.log, secure, system logs)\n"
+			printf "• ${COLOR_YELLOW}Password policy audit${COLOR_RESET} (/etc/shadow access)\n"
+			printf "• ${COLOR_YELLOW}Sudo configuration review${COLOR_RESET} (/etc/sudoers analysis)\n"
+			printf "• ${COLOR_YELLOW}System service configurations${COLOR_RESET} (limited service status only)\n"
+			printf "• ${COLOR_YELLOW}Package integrity verification${COLOR_RESET} (rpm -Va, debsums)\n"
+			printf "• ${COLOR_YELLOW}Advanced file permissions${COLOR_RESET} (system-wide SUID/SGID scans)\n"
+			printf "• ${COLOR_YELLOW}Process forensics${COLOR_RESET} (network connections, capabilities)\n"
+			printf "• ${COLOR_YELLOW}Container security${COLOR_RESET} (privileged containers, host mounts)\n"
+			printf "• ${COLOR_YELLOW}Kernel module analysis${COLOR_RESET} (loaded modules inspection)\n"
+			printf "• ${COLOR_YELLOW}EDR/monitoring agents${COLOR_RESET} (detailed configuration)\n"
 			echo
-			echo "${COLOR_GREEN}COMPLETED CHECKS:${COLOR_RESET}"
-			echo "• ${COLOR_GREEN}Basic system information${COLOR_RESET} (kernel, distro, uptime)"
-			echo "• ${COLOR_GREEN}Public network services${COLOR_RESET} (listening ports)"
-			echo "• ${COLOR_GREEN}User account structure${COLOR_RESET} (UID 0 accounts)"
-			echo "• ${COLOR_GREEN}SSH client configuration${COLOR_RESET} (user-accessible settings)"
-			echo "• ${COLOR_GREEN}Available security tools${COLOR_RESET} (installed packages)"
-			echo "• ${COLOR_GREEN}User-accessible file permissions${COLOR_RESET} (home directory)"
-			echo "• ${COLOR_GREEN}Personal configuration${COLOR_RESET} (shell, environment)"
+			printf "${COLOR_GREEN}COMPLETED CHECKS:${COLOR_RESET}\n"
+			printf "• ${COLOR_GREEN}Basic system information${COLOR_RESET} (kernel, distro, uptime)\n"
+			printf "• ${COLOR_GREEN}Public network services${COLOR_RESET} (listening ports)\n"
+			printf "• ${COLOR_GREEN}User account structure${COLOR_RESET} (UID 0 accounts)\n"
+			printf "• ${COLOR_GREEN}SSH client configuration${COLOR_RESET} (user-accessible settings)\n"
+			printf "• ${COLOR_GREEN}Available security tools${COLOR_RESET} (installed packages)\n"
+			printf "• ${COLOR_GREEN}User-accessible file permissions${COLOR_RESET} (home directory)\n"
+			printf "• ${COLOR_GREEN}Personal configuration${COLOR_RESET} (shell, environment)\n"
 			echo
 		fi
 		
@@ -1771,7 +1776,7 @@ section_privilege_summary() {
 		fi
 		
 		if [ "$OUTPUT_FORMAT" = "console" ]; then
-			echo "${COLOR_BLUE}For comprehensive security assessment, run:${COLOR_RESET} ${COLOR_GREEN}sudo $0${COLOR_RESET}"
+			printf "${COLOR_BLUE}For comprehensive security assessment, run:${COLOR_RESET} ${COLOR_GREEN}sudo $0${COLOR_RESET}\n"
 			echo
 		fi
 	fi
@@ -1802,7 +1807,7 @@ section_summary() {
 	echo "Mode: $OPERATION_MODE | Review CRIT and WARN items above."
 	
 	if ! is_root; then
-		echo "${COLOR_YELLOW}Note: This was a limited scan without sudo privileges.${COLOR_RESET}"
+		printf "${COLOR_YELLOW}Note: This was a limited scan without sudo privileges.${COLOR_RESET}\n"
 	fi
 	
 	add_finding "Summary" "INFO" "Scan completed: $total_findings findings" ""
@@ -1938,14 +1943,14 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	
 	# Check if running without sudo and display prominent warning
 	if ! is_root; then
-		echo "${COLOR_YELLOW}⚠️  LIMITED SCAN WARNING:${COLOR_RESET}"
-		echo "${COLOR_YELLOW}   • Running without sudo - many security checks will be skipped${COLOR_RESET}"
-		echo "${COLOR_YELLOW}   • System files, logs, and privileged information cannot be accessed${COLOR_RESET}"
-		echo "${COLOR_YELLOW}   • For comprehensive security assessment, run: ${COLOR_BLUE}sudo $0${COLOR_RESET}"
+		printf "${COLOR_YELLOW}⚠️  LIMITED SCAN WARNING:${COLOR_RESET}\n"
+		printf "${COLOR_YELLOW}   • Running without sudo - many security checks will be skipped${COLOR_RESET}\n"
+		printf "${COLOR_YELLOW}   • System files, logs, and privileged information cannot be accessed${COLOR_RESET}\n"
+		printf "${COLOR_YELLOW}   • For comprehensive security assessment, run: ${COLOR_BLUE}sudo $0${COLOR_RESET}\n"
 		if [ "$OPERATION_MODE" = "production" ]; then
-			echo "${COLOR_RED}   • Production mode requires sudo for meaningful security assessment${COLOR_RESET}"
+			printf "${COLOR_RED}   • Production mode requires sudo for meaningful security assessment${COLOR_RESET}\n"
 		fi
-		echo "${COLOR_YELLOW}   • Current scan will show basic system information and user-accessible checks only${COLOR_RESET}"
+		printf "${COLOR_YELLOW}   • Current scan will show basic system information and user-accessible checks only${COLOR_RESET}\n"
 		echo
 	fi
 	
