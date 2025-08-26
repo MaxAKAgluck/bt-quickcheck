@@ -58,11 +58,11 @@ run_section_safely() {
     
     # Run section with timeout protection (with fallback for systems without timeout)
     if command_exists timeout; then
-        timeout "$timeout" bash -c "$section_func" 2>/dev/null
+        timeout "$timeout" "$section_func" 2>/dev/null
         local exit_code=$?
     else
         # Fallback: run without timeout if command not available
-        bash -c "$section_func" 2>/dev/null
+        "$section_func" 2>/dev/null
         local exit_code=$?
     fi
     
@@ -563,7 +563,7 @@ section_compliance_checks() {
 			add_finding "Compliance" "OK" "Compliance tool available: $tool" ""
 			ok "$tool available"
 		fi
-	fi
+	done
 }
 
 # Enhanced container security checks
