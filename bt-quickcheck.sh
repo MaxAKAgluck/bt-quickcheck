@@ -56,23 +56,14 @@ run_section_safely() {
     # Temporarily disable exit on error for this section
     set +e
     
-    # Run section with timeout protection (with fallback for systems without timeout)
-    if command_exists timeout; then
-        timeout "$timeout" "$section_func" 2>/dev/null
-        local exit_code=$?
-    else
-        # Fallback: run without timeout if command not available
-        "$section_func" 2>/dev/null
-        local exit_code=$?
-    fi
+    # Run section directly (functions are in the same scope)
+    $section_func 2>/dev/null
+    local exit_code=$?
     
     set -e
     
-    if [ $exit_code -eq 124 ]; then
-        # Timeout occurred
-        handle_section_error "$section_name" "TIMEOUT" "Section execution timed out after ${timeout}s"
-    elif [ $exit_code -ne 0 ]; then
-        # Other error occurred
+    if [ $exit_code -ne 0 ]; then
+        # Error occurred
         handle_section_error "$section_name" "ERROR" "Section failed with exit code $exit_code"
     fi
 }
