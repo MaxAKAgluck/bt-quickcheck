@@ -554,7 +554,7 @@ section_compliance_checks() {
 		if [ -f "$policy" ]; then
 			add_finding "Compliance" "INFO" "Security policy file: $(basename "$policy")" ""
 		fi
-	fi
+	done
 	
 	# Check for compliance tools
 	compliance_tools=("openscap" "lynis" "tiger" "rkhunter")
