@@ -57,7 +57,7 @@ run_section_safely() {
     set +e
     
     # Run section directly (functions are in the same scope)
-    $section_func 2>/dev/null
+    eval "$section_func" 2>/dev/null
     local exit_code=$?
     
     set -e
@@ -453,12 +453,17 @@ section_enhanced_kernel_security() {
 		"net.ipv6.conf.default.accept_source_route:0:IPv6 default source route acceptance"
 	)
 	
+	hardening_checks_total=0
+	hardening_checks_enabled=0
+	
 	for check in "${enhanced_hardening_checks[@]}"; do
 		IFS=':' read -r sysctl_name expected_value description <<< "$check"
 		if [ -f "/proc/sys/${sysctl_name//./\/}" ]; then
+			hardening_checks_total=$((hardening_checks_total + 1))
 			current_value=$(safe_read "/proc/sys/${sysctl_name//./\/}")
 			[ -z "$current_value" ] && current_value="0"
 			if [ "$current_value" = "$expected_value" ]; then
+				hardening_checks_enabled=$((hardening_checks_enabled + 1))
 				add_finding "Enhanced Kernel Security" "OK" "$description enabled" ""
 				ok "$description enabled"
 			else
@@ -469,13 +474,49 @@ section_enhanced_kernel_security() {
 		fi
 	done
 	
+	if [ "$hardening_checks_total" -gt 0 ]; then
+		add_finding "Enhanced Kernel Security" "INFO" "Kernel hardening: $hardening_checks_enabled/$hardening_checks_total enabled" ""
+		info "Kernel hardening: $hardening_checks_enabled/$hardening_checks_total enabled"
+	else
+		add_finding "Enhanced Kernel Security" "INFO" "No kernel hardening parameters accessible" ""
+		info "No kernel hardening parameters accessible"
+	fi
+	
 	# Check for additional security modules
 	security_modules=("apparmor" "selinux" "yama" "capability" "integrity")
+	security_modules_loaded=0
+	
 	for module in "${security_modules[@]}"; do
 		if lsmod | grep -q "^${module}"; then
+			security_modules_loaded=$((security_modules_loaded + 1))
 			add_finding "Enhanced Kernel Security" "OK" "$module security module loaded" ""
+			ok "$module security module loaded"
 		fi
 	done
+	
+	if [ "$security_modules_loaded" -gt 0 ]; then
+		add_finding "Enhanced Kernel Security" "INFO" "Security modules loaded: $security_modules_loaded" ""
+		info "Security modules loaded: $security_modules_loaded"
+	else
+		rec="Load security modules: 'sudo modprobe apparmor' or 'sudo modprobe yama'"
+		add_finding "Enhanced Kernel Security" "WARN" "No security modules loaded" "$rec"
+		warn "No security modules loaded"
+	fi
+	
+	# Check for Secure Boot
+	if [ -f /sys/firmware/efi/efivars/SecureBoot-* ]; then
+		secure_boot_status=$(cat /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | od -An -tu1 | tail -c +5 | head -c 1)
+		if [ "$secure_boot_status" = "1" ]; then
+			add_finding "Enhanced Kernel Security" "OK" "Secure Boot enabled" ""
+			ok "Secure Boot enabled"
+		else
+			add_finding "Enhanced Kernel Security" "WARN" "Secure Boot disabled" ""
+			warn "Secure Boot disabled"
+		fi
+	else
+		add_finding "Enhanced Kernel Security" "INFO" "Secure Boot status not accessible" ""
+		info "Secure Boot status not accessible"
+	fi
 }
 
 # Enhanced network security checks
@@ -492,12 +533,17 @@ section_enhanced_network_security() {
 		"net.ipv4.conf.default.log_martians:1:Default martian packet logging"
 	)
 	
+	network_checks_total=0
+	network_checks_enabled=0
+	
 	for check in "${network_hardening_checks[@]}"; do
 		IFS=':' read -r sysctl_name expected_value description <<< "$check"
 		if [ -f "/proc/sys/${sysctl_name//./\/}" ]; then
+			network_checks_total=$((network_checks_total + 1))
 			current_value=$(safe_read "/proc/sys/${sysctl_name//./\/}")
 			[ -z "$current_value" ] && current_value="0"
 			if [ "$current_value" = "$expected_value" ]; then
+				network_checks_enabled=$((network_checks_enabled + 1))
 				add_finding "Enhanced Network Security" "OK" "$description enabled" ""
 				ok "$description enabled"
 			else
@@ -508,12 +554,39 @@ section_enhanced_network_security() {
 		fi
 	done
 	
+	if [ "$network_checks_total" -gt 0 ]; then
+		add_finding "Enhanced Network Security" "INFO" "Network hardening: $network_checks_enabled/$network_checks_total enabled" ""
+		info "Network hardening: $network_checks_enabled/$network_checks_total enabled"
+	else
+		add_finding "Enhanced Network Security" "INFO" "No network hardening parameters accessible" ""
+		info "No network hardening parameters accessible"
+	fi
+	
 	# Check for network namespace isolation
 	if [ -d /proc/net ]; then
 		net_namespaces=$(ls /proc/net/ 2>/dev/null | wc -l)
 		if [ "$net_namespaces" -gt 5 ]; then
 			add_finding "Enhanced Network Security" "INFO" "Network namespaces detected: $net_namespaces" ""
+			info "Network namespaces: $net_namespaces"
+		else
+			add_finding "Enhanced Network Security" "INFO" "Standard network configuration detected" ""
+			info "Standard network configuration"
 		fi
+	else
+		add_finding "Enhanced Network Security" "WARN" "Network filesystem not accessible" ""
+		warn "Network filesystem not accessible"
+	fi
+	
+	# Check for network interface security
+	if command_exists ip; then
+		interfaces=$(ip link show 2>/dev/null | grep -c "UP" || echo "0")
+		if [ "$interfaces" -gt 0 ]; then
+			add_finding "Enhanced Network Security" "INFO" "Active network interfaces: $interfaces" ""
+			info "Active interfaces: $interfaces"
+		fi
+	else
+		add_finding "Enhanced Network Security" "INFO" "ip command not available" ""
+		info "ip command not available"
 	fi
 }
 
@@ -522,39 +595,98 @@ section_compliance_checks() {
 	print_section "Compliance & Audit"
 	
 	# Check for audit configuration
+	audit_configured=0
 	if [ -f /etc/audit/auditd.conf ]; then
+		audit_configured=1
 		audit_config=$(grep -E "^(max_log_file|num_logs|max_log_file_action)" /etc/audit/auditd.conf 2>/dev/null || true)
 		if [ -n "$audit_config" ]; then
 			add_finding "Compliance" "OK" "Audit daemon configuration found" ""
 			ok "Audit configuration present"
+		else
+			rec="Configure audit daemon settings in /etc/audit/auditd.conf"
+			add_finding "Compliance" "WARN" "Audit daemon configuration incomplete" "$rec"
+			warn "Audit configuration incomplete"
 		fi
+		
+		# Check audit service status
+		if command_exists systemctl && is_root; then
+			if systemctl is-active --quiet auditd; then
+				add_finding "Compliance" "OK" "Audit daemon service is running" ""
+				ok "Audit service running"
+			else
+				rec="Start audit daemon service: 'sudo systemctl start auditd'"
+				add_finding "Compliance" "WARN" "Audit daemon service not running" "$rec"
+				warn "Audit service not running"
+			fi
+		fi
+	else
+		rec="Install and configure auditd: 'sudo apt install auditd' or 'sudo yum install audit'"
+		add_finding "Compliance" "WARN" "Audit daemon configuration not found" "$rec"
+		warn "Audit daemon not configured"
 	fi
 	
 	# Check for log retention policies
+	log_retention_configured=0
 	if [ -f /etc/logrotate.conf ]; then
+		log_retention_configured=1
 		retention_policy=$(grep -E "rotate|compress|delaycompress" /etc/logrotate.conf 2>/dev/null || true)
 		if [ -n "$retention_policy" ]; then
 			add_finding "Compliance" "OK" "Log rotation policy configured" ""
 			ok "Log rotation configured"
+		else
+			rec="Configure log rotation policies in /etc/logrotate.conf"
+			add_finding "Compliance" "WARN" "Log rotation policy incomplete" "$rec"
+			warn "Log rotation incomplete"
 		fi
+	else
+		add_finding "Compliance" "INFO" "Log rotation configuration not found" ""
+		info "Log rotation not configured"
 	fi
 	
 	# Check for security policy files
 	security_policies=("/etc/security/access.conf" "/etc/security/limits.conf" "/etc/security/namespace.conf")
+	security_policies_found=0
+	
 	for policy in "${security_policies[@]}"; do
 		if [ -f "$policy" ]; then
+			security_policies_found=$((security_policies_found + 1))
 			add_finding "Compliance" "INFO" "Security policy file: $(basename "$policy")" ""
+			info "Security policy: $(basename "$policy")"
 		fi
 	done
 	
+	if [ "$security_policies_found" -eq 0 ]; then
+		add_finding "Compliance" "INFO" "No security policy files found" ""
+		info "No security policy files found"
+	fi
+	
 	# Check for compliance tools
 	compliance_tools=("openscap" "lynis" "tiger" "rkhunter")
+	compliance_tools_found=0
+	
 	for tool in "${compliance_tools[@]}"; do
 		if command_exists "$tool"; then
+			compliance_tools_found=$((compliance_tools_found + 1))
 			add_finding "Compliance" "OK" "Compliance tool available: $tool" ""
 			ok "$tool available"
 		fi
 	done
+	
+	if [ "$compliance_tools_found" -eq 0 ]; then
+		rec="Install compliance tools: 'sudo apt install lynis' or 'sudo yum install lynis'"
+		add_finding "Compliance" "WARN" "No compliance tools detected" "$rec"
+		warn "No compliance tools detected"
+	fi
+	
+	# Summary
+	if [ "$audit_configured" -eq 1 ] || [ "$log_retention_configured" -eq 1 ] || [ "$security_policies_found" -gt 0 ] || [ "$compliance_tools_found" -gt 0 ]; then
+		add_finding "Compliance" "INFO" "Compliance framework partially configured" ""
+		info "Compliance framework partially configured"
+	else
+		rec="Implement compliance framework (auditd, log rotation, security policies, compliance tools)"
+		add_finding "Compliance" "WARN" "No compliance framework detected" "$rec"
+		warn "No compliance framework detected"
+	fi
 }
 
 # Enhanced container security checks
@@ -563,33 +695,68 @@ section_enhanced_container_security() {
 	
 	# Check for container runtime security
 	if command_exists docker; then
+		add_finding "Enhanced Container Security" "INFO" "Docker runtime detected" ""
+		info "Docker runtime detected"
+		
 		# Check Docker daemon security configuration
 		if [ -f /etc/docker/daemon.json ]; then
 			security_config=$(grep -E "(live-restore|userland-proxy|no-new-privileges)" /etc/docker/daemon.json 2>/dev/null || true)
 			if [ -n "$security_config" ]; then
 				add_finding "Enhanced Container Security" "OK" "Docker security hardening configured" ""
 				ok "Docker security hardening"
+			else
+				rec="Configure Docker security hardening in /etc/docker/daemon.json"
+				add_finding "Enhanced Container Security" "WARN" "Docker security hardening not configured" "$rec"
+				warn "Docker security hardening not configured"
 			fi
+		else
+			rec="Create /etc/docker/daemon.json with security hardening options"
+			add_finding "Enhanced Container Security" "WARN" "Docker daemon configuration file not found" "$rec"
+			warn "Docker daemon configuration not found"
 		fi
 		
 		# Check for running containers with security profiles
 		if is_root; then
-			unconfined_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | xargs -I {} docker inspect --format '{{.HostConfig.SecurityOpt}}' {} 2>/dev/null | grep -c "unconfined" || echo "0")
-			if [ "$unconfined_containers" -gt 0 ]; then
-				rec="Review containers running without security profiles"
-				add_finding "Enhanced Container Security" "WARN" "$unconfined_containers container(s) without security profiles" "$rec"
-				warn "Unconfined containers detected"
+			running_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | wc -l || echo "0")
+			if [ "$running_containers" -gt 0 ]; then
+				add_finding "Enhanced Container Security" "INFO" "$running_containers container(s) running" ""
+				info "$running_containers container(s) running"
+				
+				unconfined_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | xargs -I {} docker inspect --format '{{.HostConfig.SecurityOpt}}' {} 2>/dev/null | grep -c "unconfined" || echo "0")
+				if [ "$unconfined_containers" -gt 0 ]; then
+					rec="Review containers running without security profiles"
+					add_finding "Enhanced Container Security" "WARN" "$unconfined_containers container(s) without security profiles" "$rec"
+					warn "Unconfined containers detected"
+				else
+					add_finding "Enhanced Container Security" "OK" "All running containers have security profiles" ""
+					ok "All containers have security profiles"
+				fi
+			else
+				add_finding "Enhanced Container Security" "INFO" "No containers currently running" ""
+				info "No containers running"
 			fi
+		else
+			add_finding "Enhanced Container Security" "INFO" "Docker container inspection requires sudo access" ""
+			info "Container inspection requires sudo access"
 		fi
+	else
+		add_finding "Enhanced Container Security" "INFO" "Docker runtime not detected" ""
+		info "Docker runtime not detected"
 	fi
 	
 	# Check for Kubernetes security
 	if command_exists kubectl; then
+		add_finding "Enhanced Container Security" "INFO" "Kubernetes CLI detected" ""
+		info "Kubernetes CLI detected"
+		
 		# Check for RBAC configuration
 		if kubectl get clusterrolebinding 2>/dev/null | grep -q "cluster-admin"; then
 			rec="Review cluster-admin bindings for security implications"
 			add_finding "Enhanced Container Security" "WARN" "Cluster admin bindings detected" "$rec"
 			warn "Cluster admin bindings found"
+		else
+			add_finding "Enhanced Container Security" "OK" "No cluster-admin bindings detected" ""
+			ok "No cluster-admin bindings"
 		fi
 		
 		# Check for network policies
@@ -597,7 +764,14 @@ section_enhanced_container_security() {
 		if [ "$network_policies" -gt 0 ]; then
 			add_finding "Enhanced Container Security" "OK" "Network policies configured: $network_policies" ""
 			ok "Network policies configured"
+		else
+			rec="Configure network policies for pod-to-pod communication control"
+			add_finding "Enhanced Container Security" "WARN" "No network policies configured" "$rec"
+			warn "No network policies configured"
 		fi
+	else
+		add_finding "Enhanced Container Security" "INFO" "Kubernetes CLI not detected" ""
+		info "Kubernetes CLI not detected"
 	fi
 }
 
@@ -607,8 +781,11 @@ section_enhanced_file_integrity() {
 	
 	# Check for additional integrity monitoring tools
 	integrity_tools=("aide" "tripwire" "ossec" "samhain" "integrity")
+	tools_found=0
+	
 	for tool in "${integrity_tools[@]}"; do
 		if command_exists "$tool"; then
+			tools_found=$((tools_found + 1))
 			add_finding "Enhanced File Integrity" "OK" "File integrity tool available: $tool" ""
 			ok "$tool available"
 			
@@ -628,10 +805,19 @@ section_enhanced_file_integrity() {
 		fi
 	done
 	
+	if [ "$tools_found" -eq 0 ]; then
+		rec="Install file integrity monitoring tools: 'sudo apt install aide' or 'sudo yum install aide'"
+		add_finding "Enhanced File Integrity" "WARN" "No file integrity monitoring tools detected" "$rec"
+		warn "No file integrity tools detected"
+	fi
+	
 	# Check for critical file modifications
 	critical_files=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config" "/etc/fstab")
+	critical_files_checked=0
+	
 	for file in "${critical_files[@]}"; do
 		if [ -f "$file" ]; then
+			critical_files_checked=$((critical_files_checked + 1))
 			# Check for recent modifications
 			last_mod=$(stat -c "%Y" "$file" 2>/dev/null || echo "0")
 			current_time=$(date +%s)
@@ -639,9 +825,21 @@ section_enhanced_file_integrity() {
 			
 			if [ "$days_since_mod" -lt 30 ]; then
 				add_finding "Enhanced File Integrity" "INFO" "$(basename "$file") modified $days_since_mod days ago" ""
+				info "$(basename "$file") modified $days_since_mod days ago"
+			else
+				add_finding "Enhanced File Integrity" "OK" "$(basename "$file") not modified recently ($days_since_mod days ago)" ""
+				ok "$(basename "$file") not modified recently"
 			fi
 		fi
 	done
+	
+	if [ "$critical_files_checked" -gt 0 ]; then
+		add_finding "Enhanced File Integrity" "INFO" "Checked $critical_files_checked critical system files" ""
+		info "Checked $critical_files_checked critical files"
+	else
+		add_finding "Enhanced File Integrity" "INFO" "No critical system files accessible for modification checking" ""
+		info "No critical files accessible"
+	fi
 }
 
 # Enhanced process security checks
@@ -650,10 +848,17 @@ section_enhanced_process_security() {
 	
 	# Check for process isolation
 	if [ -d /proc ]; then
+		add_finding "Enhanced Process Security" "INFO" "Process filesystem accessible" ""
+		info "Process filesystem accessible"
+		
 		# Check for process namespaces
 		namespaces=$(ls /proc/*/ns/ 2>/dev/null | wc -l || echo "0")
 		if [ "$namespaces" -gt 0 ]; then
 			add_finding "Enhanced Process Security" "INFO" "Process namespaces detected: $namespaces" ""
+			info "Process namespaces: $namespaces"
+		else
+			add_finding "Enhanced Process Security" "INFO" "No process namespaces detected" ""
+			info "No process namespaces detected"
 		fi
 		
 		# Check for process capabilities
@@ -663,8 +868,22 @@ section_enhanced_process_security() {
 				rec="Review processes with elevated capabilities"
 				add_finding "Enhanced Process Security" "WARN" "$privileged_processes process(es) with elevated capabilities" "$rec"
 				warn "Elevated capabilities detected"
+			else
+				add_finding "Enhanced Process Security" "OK" "No processes with elevated capabilities detected" ""
+				ok "No elevated capabilities detected"
+			fi
+		else
+			if ! is_root; then
+				add_finding "Enhanced Process Security" "INFO" "Process capability checking requires sudo access" ""
+				info "Capability checking requires sudo access"
+			else
+				add_finding "Enhanced Process Security" "INFO" "getcap command not available" ""
+				info "getcap command not available"
 			fi
 		fi
+	else
+		add_finding "Enhanced Process Security" "WARN" "Process filesystem not accessible" ""
+		warn "Process filesystem not accessible"
 	fi
 	
 	# Check for memory protection
@@ -673,7 +892,26 @@ section_enhanced_process_security() {
 		if [ "$writeback_centisecs" -lt 500 ]; then
 			add_finding "Enhanced Process Security" "OK" "Memory writeback protection enabled" ""
 			ok "Memory protection enabled"
+		else
+			rec="Configure memory writeback protection: 'echo 500 | sudo tee /proc/sys/vm/dirty_writeback_centisecs'"
+			add_finding "Enhanced Process Security" "WARN" "Memory writeback protection not configured" "$rec"
+			warn "Memory protection not configured"
 		fi
+	else
+		add_finding "Enhanced Process Security" "INFO" "Memory protection sysctl not available" ""
+		info "Memory protection sysctl not available"
+	fi
+	
+	# Check for process tree
+	if command_exists pstree; then
+		process_count=$(ps aux | wc -l 2>/dev/null || echo "0")
+		if [ "$process_count" -gt 0 ]; then
+			add_finding "Enhanced Process Security" "INFO" "System running $process_count processes" ""
+			info "System running $process_count processes"
+		fi
+	else
+		add_finding "Enhanced Process Security" "INFO" "pstree command not available" ""
+		info "pstree command not available"
 	fi
 }
 
@@ -683,29 +921,55 @@ section_enhanced_logging_security() {
 	
 	# Check for log file permissions
 	log_files=("/var/log/auth.log" "/var/log/secure" "/var/log/messages" "/var/log/syslog" "/var/log/kern.log")
+	log_files_found=0
+	secure_permissions=0
+	correct_ownership=0
+	
 	for log_file in "${log_files[@]}"; do
 		if [ -f "$log_file" ]; then
+			log_files_found=$((log_files_found + 1))
 			perms=$(stat -c "%a" "$log_file" 2>/dev/null || echo "unknown")
 			owner=$(stat -c "%U" "$log_file" 2>/dev/null || echo "unknown")
 			
 			if [ "$perms" = "600" ] || [ "$perms" = "640" ]; then
+				secure_permissions=$((secure_permissions + 1))
 				add_finding "Enhanced Logging Security" "OK" "$(basename "$log_file") has secure permissions" ""
+				ok "$(basename "$log_file") secure permissions"
 			else
 				rec="Secure log file permissions: 'sudo chmod 640 $log_file'"
 				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") has loose permissions ($perms)" "$rec"
+				warn "$(basename "$log_file") loose permissions ($perms)"
 			fi
 			
 			if [ "$owner" = "root" ] || [ "$owner" = "syslog" ]; then
+				correct_ownership=$((correct_ownership + 1))
 				add_finding "Enhanced Logging Security" "OK" "$(basename "$log_file") has correct ownership" ""
+				ok "$(basename "$log_file") correct ownership"
 			else
 				rec="Fix log file ownership: 'sudo chown root:adm $log_file'"
 				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") has incorrect ownership ($owner)" "$rec"
+				warn "$(basename "$log_file") incorrect ownership ($owner)"
 			fi
 		fi
 	done
 	
+	if [ "$log_files_found" -gt 0 ]; then
+		add_finding "Enhanced Logging Security" "INFO" "Checked $log_files_found log files" ""
+		info "Checked $log_files_found log files"
+		add_finding "Enhanced Logging Security" "INFO" "Secure permissions: $secure_permissions/$log_files_found" ""
+		info "Secure permissions: $secure_permissions/$log_files_found"
+		add_finding "Enhanced Logging Security" "INFO" "Correct ownership: $correct_ownership/$log_files_found" ""
+		info "Correct ownership: $correct_ownership/$log_files_found"
+	else
+		add_finding "Enhanced Logging Security" "WARN" "No standard log files found for permission checking" ""
+		warn "No standard log files found"
+	fi
+	
 	# Check for log forwarding configuration
 	if [ -f /etc/rsyslog.conf ]; then
+		add_finding "Enhanced Logging Security" "INFO" "rsyslog configuration found" ""
+		info "rsyslog configuration found"
+		
 		remote_forwarding=$(grep -E "^\s*\*\.\*\s+@@" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null || true)
 		if [ -n "$remote_forwarding" ]; then
 			add_finding "Enhanced Logging Security" "OK" "Remote log forwarding configured" ""
@@ -713,7 +977,20 @@ section_enhanced_logging_security() {
 		else
 			rec="Configure remote log forwarding for centralized logging"
 			add_finding "Enhanced Logging Security" "INFO" "No remote log forwarding detected" "$rec"
+			info "No remote log forwarding"
 		fi
+	else
+		add_finding "Enhanced Logging Security" "INFO" "rsyslog configuration not found" ""
+		info "rsyslog configuration not found"
+	fi
+	
+	# Check for logrotate configuration
+	if [ -f /etc/logrotate.conf ]; then
+		add_finding "Enhanced Logging Security" "OK" "Log rotation configuration found" ""
+		ok "Log rotation configured"
+	else
+		add_finding "Enhanced Logging Security" "INFO" "Log rotation configuration not found" ""
+		info "Log rotation not configured"
 	fi
 }
 
@@ -722,8 +999,11 @@ section_enhanced_network_access() {
 	print_section "Enhanced Network Access Controls"
 	
 	# Check for TCP wrappers configuration
+	tcp_wrappers_found=0
 	if [ -f /etc/hosts.allow ] || [ -f /etc/hosts.deny ]; then
+		tcp_wrappers_found=1
 		add_finding "Enhanced Network Access Controls" "INFO" "TCP wrappers configuration files present" ""
+		info "TCP wrappers configuration found"
 		
 		# Check for restrictive deny rules
 		if [ -f /etc/hosts.deny ]; then
@@ -731,25 +1011,82 @@ section_enhanced_network_access() {
 			if [ "$deny_rules" -gt 0 ]; then
 				add_finding "Enhanced Network Access Controls" "OK" "TCP wrappers deny rules configured" ""
 				ok "TCP wrappers deny rules"
+			else
+				rec="Configure TCP wrappers deny rules in /etc/hosts.deny"
+				add_finding "Enhanced Network Access Controls" "WARN" "TCP wrappers deny rules not configured" "$rec"
+				warn "TCP wrappers deny rules not configured"
 			fi
+		else
+			rec="Create /etc/hosts.deny with restrictive rules"
+			add_finding "Enhanced Network Access Controls" "WARN" "TCP wrappers deny file not found" "$rec"
+			warn "TCP wrappers deny file not found"
 		fi
+		
+		if [ -f /etc/hosts.allow ]; then
+			allow_rules=$(grep -v '^#' /etc/hosts.allow 2>/dev/null | wc -l || echo "0")
+			add_finding "Enhanced Network Access Controls" "INFO" "TCP wrappers allow rules: $allow_rules" ""
+			info "TCP wrappers allow rules: $allow_rules"
+		fi
+	else
+		add_finding "Enhanced Network Access Controls" "INFO" "TCP wrappers configuration files not found" ""
+		info "TCP wrappers not configured"
 	fi
 	
 	# Check for additional firewall rules
-	if command_exists iptables; then
-		# Check for rate limiting rules
-		rate_limit_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "limit" || echo "0")
-		if [ "$rate_limit_rules" -gt 0 ]; then
-			add_finding "Enhanced Network Access Controls" "OK" "Rate limiting rules configured" ""
-			ok "Rate limiting configured"
+	firewall_tools=("iptables" "nft" "ufw" "firewalld")
+	firewall_found=0
+	
+	for tool in "${firewall_tools[@]}"; do
+		if command_exists "$tool"; then
+			firewall_found=1
+			add_finding "Enhanced Network Access Controls" "INFO" "Firewall tool detected: $tool" ""
+			info "Firewall tool: $tool"
+			
+			if [ "$tool" = "iptables" ]; then
+				# Check for rate limiting rules
+				rate_limit_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "limit" || echo "0")
+				if [ "$rate_limit_rules" -gt 0 ]; then
+					add_finding "Enhanced Network Access Controls" "OK" "Rate limiting rules configured" ""
+					ok "Rate limiting configured"
+				else
+					rec="Configure iptables rate limiting rules"
+					add_finding "Enhanced Network Access Controls" "WARN" "Rate limiting rules not configured" "$rec"
+					warn "Rate limiting not configured"
+				fi
+				
+				# Check for connection tracking
+				conntrack_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "state" || echo "0")
+				if [ "$conntrack_rules" -gt 0 ]; then
+					add_finding "Enhanced Network Access Controls" "OK" "Connection tracking configured" ""
+					ok "Connection tracking configured"
+				else
+					rec="Configure iptables connection tracking rules"
+					add_finding "Enhanced Network Access Controls" "WARN" "Connection tracking not configured" "$rec"
+					warn "Connection tracking not configured"
+				fi
+				
+				# Check total rules
+				total_rules=$(iptables -L INPUT -n 2>/dev/null | wc -l || echo "0")
+				add_finding "Enhanced Network Access Controls" "INFO" "iptables INPUT rules: $total_rules" ""
+				info "iptables INPUT rules: $total_rules"
+			fi
 		fi
-		
-		# Check for connection tracking
-		conntrack_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "state" || echo "0")
-		if [ "$conntrack_rules" -gt 0 ]; then
-			add_finding "Enhanced Network Access Controls" "OK" "Connection tracking configured" ""
-			ok "Connection tracking configured"
-		fi
+	done
+	
+	if [ "$firewall_found" -eq 0 ]; then
+		rec="Install and configure a firewall (ufw, firewalld, or iptables)"
+		add_finding "Enhanced Network Access Controls" "WARN" "No firewall tools detected" "$rec"
+		warn "No firewall tools detected"
+	fi
+	
+	# Summary
+	if [ "$tcp_wrappers_found" -eq 1 ] || [ "$firewall_found" -eq 1 ]; then
+		add_finding "Enhanced Network Access Controls" "INFO" "Network access controls partially configured" ""
+		info "Network access controls partially configured"
+	else
+		rec="Configure network access controls (TCP wrappers, firewall rules)"
+		add_finding "Enhanced Network Access Controls" "WARN" "No network access controls configured" "$rec"
+		warn "No network access controls configured"
 	fi
 }
 
@@ -2401,6 +2738,7 @@ done
 if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "🛡️  Blue Team QuickCheck v$VERSION - Linux Security Assessment"
+echo "🔧 Mode: $OPERATION_MODE | Enhanced Security Features (v0.6.0)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
 echo "⚠️  SECURITY NOTICE:"
@@ -2409,14 +2747,6 @@ echo "   • Requires sudo for comprehensive system analysis"
 echo "   • NO system modifications will be made"
 echo "   • May access sensitive files for security analysis"
 echo "   • All data remains local - no external transmission"
-echo
-echo "🔒 ENHANCED SECURITY FEATURES (v0.6.0):"
-echo "   • Enhanced input validation and command sanitization"
-echo "   • Advanced kernel and network security hardening checks"
-echo "   • Comprehensive compliance and audit validation"
-echo "   • Enhanced container and process security analysis"
-echo "   • Advanced file integrity and logging security checks"
-echo "   • Industry-standard security validation (CIS, NIST aligned)"
 echo
 	
 	# Check if running without sudo and display prominent warning
