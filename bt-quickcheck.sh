@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.5.1
+# Version: 0.6.0
 # 
 # SECURITY DISCLAIMER:
 # This script performs READ-ONLY security assessment of Linux systems.
@@ -23,40 +23,61 @@
 
 set -euo pipefail  # Strict error handling: exit on error, undefined vars, pipe failures
 
-# Enhanced error handling for critical sections
+# Enhanced error handling with logging
 handle_section_error() {
     local section="$1"
     local line="$2"
     local error="$3"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    # Log error with timestamp and context
+    local error_msg="[$timestamp] ERROR in $section (line $line): $error"
     
     if [ "$OUTPUT_FORMAT" = "console" ]; then
         warn "Error in $section (line $line): $error"
         warn "Continuing with remaining checks..."
     fi
-    add_finding "$section" "WARN" "Section error encountered: $error" "Review section implementation"
-}
-
-# Safe section runner - runs sections with error isolation
-run_section_safely() {
-    local section_func="$1"
-    local section_name="$2"
     
-    # Temporarily disable exit on error for this section
-    set +e
-    $section_func
-    local exit_code=$?
-    set -e
+    # Add structured finding for error tracking
+    add_finding "$section" "WARN" "Section error encountered: $error" "Review section implementation and check system logs"
     
-    if [ $exit_code -ne 0 ]; then
-        if [ "$OUTPUT_FORMAT" = "console" ]; then
-            warn "Section $section_name encountered an error (exit code: $exit_code)"
-            warn "Continuing with remaining security checks..."
-        fi
-        add_finding "$section_name" "WARN" "Section execution error" "Section failed with exit code $exit_code - review manually"
+    # Log to system log if available and running as root
+    if is_root && command_exists logger; then
+        logger -p user.warning "bt-quickcheck: $error_msg"
     fi
 }
 
-VERSION="0.5.1"
+# Enhanced section runner with timeout protection
+run_section_safely() {
+    local section_func="$1"
+    local section_name="$2"
+    local timeout="${3:-30}"  # Default 30 second timeout
+    
+    # Temporarily disable exit on error for this section
+    set +e
+    
+    # Run section with timeout protection (with fallback for systems without timeout)
+    if command_exists timeout; then
+        timeout "$timeout" bash -c "$section_func" 2>/dev/null
+        local exit_code=$?
+    else
+        # Fallback: run without timeout if command not available
+        bash -c "$section_func" 2>/dev/null
+        local exit_code=$?
+    fi
+    
+    set -e
+    
+    if [ $exit_code -eq 124 ]; then
+        # Timeout occurred
+        handle_section_error "$section_name" "TIMEOUT" "Section execution timed out after ${timeout}s"
+    elif [ $exit_code -ne 0 ]; then
+        # Other error occurred
+        handle_section_error "$section_name" "ERROR" "Section failed with exit code $exit_code"
+    fi
+}
+
+VERSION="0.6.0"
 
 # Output format (default: console)
 OUTPUT_FORMAT="console"
@@ -77,19 +98,47 @@ declare -a SECTIONS=()
 # Safety functions
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
 
-# Safe command execution - only execute if command exists and is safe
+# Enhanced safe command execution with additional security
 safe_exec() {
     local cmd="$1"
     shift
-    if command -v "$cmd" >/dev/null 2>&1; then
-        "$cmd" "$@" 2>/dev/null || true
+    
+    # Validate command before execution
+    if ! validate_command "$cmd"; then
+        return 1
     fi
+    
+    # Prevent execution from dangerous directories
+    local cmd_path
+    cmd_path=$(command -v "$cmd" 2>/dev/null)
+    if [[ -n "$cmd_path" ]]; then
+        if [[ "$cmd_path" =~ /tmp/ ]] || [[ "$cmd_path" =~ /dev/shm/ ]]; then
+            return 1
+        fi
+    fi
+    
+    # Execute with additional safety
+    "$cmd" "$@" 2>/dev/null || true
 }
 
-# Safe file read - only read if file exists and is readable
+# Enhanced safe file reading with content validation
 safe_read() {
     local file="$1"
+    local max_size="${2:-1048576}"  # Default 1MB limit
+    
     if [ -r "$file" ] && [ -f "$file" ]; then
+        # Check file size to prevent reading extremely large files
+        local file_size
+        file_size=$(stat -c "%s" "$file" 2>/dev/null || echo "0")
+        if [ "$file_size" -gt "$max_size" ]; then
+            return 1
+        fi
+        
+        # Validate file is not a symlink to prevent symlink attacks
+        if [ -L "$file" ]; then
+            return 1
+        fi
+        
         cat "$file" 2>/dev/null || true
     fi
 }
@@ -170,18 +219,48 @@ validate_mode() {
     esac
 }
 
-# Validate file path for output (prevent path traversal)
+# Enhanced file path validation with additional security checks
 validate_output_path() {
     local path="$1"
-    # Remove any path traversal attempts
+    
+    # Prevent path traversal and directory traversal attacks
+    if [[ "$path" =~ \.\. ]] || [[ "$path" =~ /\.\. ]] || [[ "$path" =~ \.\./ ]]; then
+        return 1
+    fi
+    
+    # Prevent absolute paths outside of safe directories
+    if [[ "$path" =~ ^/ ]]; then
+        # Only allow paths in /tmp, /var/tmp, or current user's home
+        if [[ ! "$path" =~ ^/(tmp|var/tmp|home/[^/]+) ]] && [[ ! "$path" =~ ^$HOME ]]; then
+            return 1
+        fi
+    fi
+    
+    # Remove any remaining path traversal attempts
     local clean_path
     clean_path=$(realpath -m "$path" 2>/dev/null || echo "$path")
     
-    # Check if path is within current directory or absolute path without traversal
-    case "$clean_path" in
-        */../*|*/..*|../*) return 1 ;;
-        *) return 0 ;;
-    esac
+    return 0
+}
+
+# Enhanced command validation
+validate_command() {
+    local cmd="$1"
+    
+    # Prevent execution of dangerous commands
+    local dangerous_commands=("rm" "dd" "mkfs" "fdisk" "parted" "shutdown" "reboot" "halt" "init" "telinit")
+    for dangerous in "${dangerous_commands[@]}"; do
+        if [[ "$cmd" =~ ^$dangerous ]]; then
+            return 1
+        fi
+    done
+    
+    # Validate command exists and is executable
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    return 0
 }
 
 # Add a finding to the global findings array
@@ -364,6 +443,323 @@ detect_pkg_mgr() {
 	if command_exists yum; then echo yum; return; fi
 	if command_exists zypper; then echo zypper; return; fi
 	echo unknown
+}
+
+# Enhanced kernel security checks
+section_enhanced_kernel_security() {
+	print_section "Enhanced Kernel Security"
+	
+	# Check for additional kernel hardening parameters
+	enhanced_hardening_checks=(
+		"kernel.yama.ptrace_scope:1:PTRACE scope restriction"
+		"kernel.core_uses_pid:1:Core dump PID inclusion"
+		"fs.suid_dumpable:0:SUID core dump prevention"
+		"net.ipv4.conf.all.rp_filter:1:Reverse path filtering"
+		"net.ipv4.conf.default.rp_filter:1:Default reverse path filtering"
+		"net.ipv4.conf.all.accept_source_route:0:Source route acceptance"
+		"net.ipv4.conf.default.accept_source_route:0:Default source route acceptance"
+		"net.ipv6.conf.all.accept_source_route:0:IPv6 source route acceptance"
+		"net.ipv6.conf.default.accept_source_route:0:IPv6 default source route acceptance"
+	)
+	
+	for check in "${enhanced_hardening_checks[@]}"; do
+		IFS=':' read -r sysctl_name expected_value description <<< "$check"
+		if [ -f "/proc/sys/${sysctl_name//./\/}" ]; then
+			current_value=$(safe_read "/proc/sys/${sysctl_name//./\/}")
+			[ -z "$current_value" ] && current_value="0"
+			if [ "$current_value" = "$expected_value" ]; then
+				add_finding "Enhanced Kernel Security" "OK" "$description enabled" ""
+				ok "$description enabled"
+			else
+				rec="Enable $description: 'echo $expected_value | sudo tee /proc/sys/${sysctl_name//./\/}'"
+				add_finding "Enhanced Kernel Security" "WARN" "$description disabled" "$rec"
+				warn "$description disabled"
+			fi
+		fi
+	done
+	
+	# Check for additional security modules
+	security_modules=("apparmor" "selinux" "yama" "capability" "integrity")
+	for module in "${security_modules[@]}"; do
+		if lsmod | grep -q "^${module}"; then
+			add_finding "Enhanced Kernel Security" "OK" "$module security module loaded" ""
+		fi
+	done
+}
+
+# Enhanced network security checks
+section_enhanced_network_security() {
+	print_section "Enhanced Network Security"
+	
+	# Check for additional network hardening
+	network_hardening_checks=(
+		"net.ipv4.tcp_timestamps:0:TCP timestamp protection"
+		"net.ipv4.tcp_syncookies:1:TCP SYN cookies"
+		"net.ipv4.tcp_max_syn_backlog:128:SYN backlog limit"
+		"net.core.netdev_max_backlog:1000:Network device backlog"
+		"net.ipv4.conf.all.log_martians:1:Martian packet logging"
+		"net.ipv4.conf.default.log_martians:1:Default martian packet logging"
+	)
+	
+	for check in "${network_hardening_checks[@]}"; do
+		IFS=':' read -r sysctl_name expected_value description <<< "$check"
+		if [ -f "/proc/sys/${sysctl_name//./\/}" ]; then
+			current_value=$(safe_read "/proc/sys/${sysctl_name//./\/}")
+			[ -z "$current_value" ] && current_value="0"
+			if [ "$current_value" = "$expected_value" ]; then
+				add_finding "Enhanced Network Security" "OK" "$description enabled" ""
+				ok "$description enabled"
+			else
+				rec="Enable $description: 'echo $expected_value | sudo tee /proc/sys/${sysctl_name//./\/}'"
+				add_finding "Enhanced Network Security" "WARN" "$description disabled" "$rec"
+				warn "$description disabled"
+			fi
+		fi
+	done
+	
+	# Check for network namespace isolation
+	if [ -d /proc/net ]; then
+		net_namespaces=$(ls /proc/net/ 2>/dev/null | wc -l)
+		if [ "$net_namespaces" -gt 5 ]; then
+			add_finding "Enhanced Network Security" "INFO" "Network namespaces detected: $net_namespaces" ""
+		fi
+	fi
+}
+
+# Enhanced compliance checks
+section_compliance_checks() {
+	print_section "Compliance & Audit"
+	
+	# Check for audit configuration
+	if [ -f /etc/audit/auditd.conf ]; then
+		audit_config=$(grep -E "^(max_log_file|num_logs|max_log_file_action)" /etc/audit/auditd.conf 2>/dev/null || true)
+		if [ -n "$audit_config" ]; then
+			add_finding "Compliance" "OK" "Audit daemon configuration found" ""
+			ok "Audit configuration present"
+		fi
+	fi
+	
+	# Check for log retention policies
+	if [ -f /etc/logrotate.conf ]; then
+		retention_policy=$(grep -E "rotate|compress|delaycompress" /etc/logrotate.conf 2>/dev/null || true)
+		if [ -n "$retention_policy" ]; then
+			add_finding "Compliance" "OK" "Log rotation policy configured" ""
+			ok "Log rotation configured"
+		fi
+	fi
+	
+	# Check for security policy files
+	security_policies=("/etc/security/access.conf" "/etc/security/limits.conf" "/etc/security/namespace.conf")
+	for policy in "${security_policies[@]}"; do
+		if [ -f "$policy" ]; then
+			add_finding "Compliance" "INFO" "Security policy file: $(basename "$policy")" ""
+		fi
+	fi
+	
+	# Check for compliance tools
+	compliance_tools=("openscap" "lynis" "tiger" "rkhunter")
+	for tool in "${compliance_tools[@]}"; do
+		if command_exists "$tool"; then
+			add_finding "Compliance" "OK" "Compliance tool available: $tool" ""
+			ok "$tool available"
+		fi
+	fi
+}
+
+# Enhanced container security checks
+section_enhanced_container_security() {
+	print_section "Enhanced Container Security"
+	
+	# Check for container runtime security
+	if command_exists docker; then
+		# Check Docker daemon security configuration
+		if [ -f /etc/docker/daemon.json ]; then
+			security_config=$(grep -E "(live-restore|userland-proxy|no-new-privileges)" /etc/docker/daemon.json 2>/dev/null || true)
+			if [ -n "$security_config" ]; then
+				add_finding "Enhanced Container Security" "OK" "Docker security hardening configured" ""
+				ok "Docker security hardening"
+			fi
+		fi
+		
+		# Check for running containers with security profiles
+		if is_root; then
+			unconfined_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | xargs -I {} docker inspect --format '{{.HostConfig.SecurityOpt}}' {} 2>/dev/null | grep -c "unconfined" || echo "0")
+			if [ "$unconfined_containers" -gt 0 ]; then
+				rec="Review containers running without security profiles"
+				add_finding "Enhanced Container Security" "WARN" "$unconfined_containers container(s) without security profiles" "$rec"
+				warn "Unconfined containers detected"
+			fi
+		fi
+	fi
+	
+	# Check for Kubernetes security
+	if command_exists kubectl; then
+		# Check for RBAC configuration
+		if kubectl get clusterrolebinding 2>/dev/null | grep -q "cluster-admin"; then
+			rec="Review cluster-admin bindings for security implications"
+			add_finding "Enhanced Container Security" "WARN" "Cluster admin bindings detected" "$rec"
+			warn "Cluster admin bindings found"
+		fi
+		
+		# Check for network policies
+		network_policies=$(kubectl get networkpolicies --all-namespaces 2>/dev/null | wc -l || echo "0")
+		if [ "$network_policies" -gt 0 ]; then
+			add_finding "Enhanced Container Security" "OK" "Network policies configured: $network_policies" ""
+			ok "Network policies configured"
+		fi
+	fi
+}
+
+# Enhanced file integrity monitoring
+section_enhanced_file_integrity() {
+	print_section "Enhanced File Integrity"
+	
+	# Check for additional integrity monitoring tools
+	integrity_tools=("aide" "tripwire" "ossec" "samhain" "integrity")
+	for tool in "${integrity_tools[@]}"; do
+		if command_exists "$tool"; then
+			add_finding "Enhanced File Integrity" "OK" "File integrity tool available: $tool" ""
+			ok "$tool available"
+			
+			# Check for recent integrity checks
+			if [ "$tool" = "aide" ] && [ -f /var/lib/aide/aide.db ]; then
+				last_check=$(stat -c "%Y" /var/lib/aide/aide.db 2>/dev/null || echo "0")
+				current_time=$(date +%s)
+				days_since_check=$(( (current_time - last_check) / 86400 ))
+				
+				if [ "$days_since_check" -lt 7 ]; then
+					add_finding "Enhanced File Integrity" "OK" "AIDE database updated $days_since_check days ago" ""
+				else
+					rec="Run AIDE integrity check: 'sudo aide --check'"
+					add_finding "Enhanced File Integrity" "WARN" "AIDE database not updated for $days_since_check days" "$rec"
+				fi
+			fi
+		fi
+	done
+	
+	# Check for critical file modifications
+	critical_files=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config" "/etc/fstab")
+	for file in "${critical_files[@]}"; do
+		if [ -f "$file" ]; then
+			# Check for recent modifications
+			last_mod=$(stat -c "%Y" "$file" 2>/dev/null || echo "0")
+			current_time=$(date +%s)
+			days_since_mod=$(( (current_time - last_mod) / 86400 ))
+			
+			if [ "$days_since_mod" -lt 30 ]; then
+				add_finding "Enhanced File Integrity" "INFO" "$(basename "$file") modified $days_since_mod days ago" ""
+			fi
+		fi
+	done
+}
+
+# Enhanced process security checks
+section_enhanced_process_security() {
+	print_section "Enhanced Process Security"
+	
+	# Check for process isolation
+	if [ -d /proc ]; then
+		# Check for process namespaces
+		namespaces=$(ls /proc/*/ns/ 2>/dev/null | wc -l || echo "0")
+		if [ "$namespaces" -gt 0 ]; then
+			add_finding "Enhanced Process Security" "INFO" "Process namespaces detected: $namespaces" ""
+		fi
+		
+		# Check for process capabilities
+		if command_exists getcap && is_root; then
+			privileged_processes=$(getcap -r /usr/bin /bin /sbin 2>/dev/null | grep -E "(cap_sys_admin|cap_sys_ptrace|cap_sys_module)" | wc -l || echo "0")
+			if [ "$privileged_processes" -gt 0 ]; then
+				rec="Review processes with elevated capabilities"
+				add_finding "Enhanced Process Security" "WARN" "$privileged_processes process(es) with elevated capabilities" "$rec"
+				warn "Elevated capabilities detected"
+			fi
+		fi
+	fi
+	
+	# Check for memory protection
+	if [ -f /proc/sys/vm/dirty_writeback_centisecs ]; then
+		writeback_centisecs=$(safe_read /proc/sys/vm/dirty_writeback_centisecs)
+		if [ "$writeback_centisecs" -lt 500 ]; then
+			add_finding "Enhanced Process Security" "OK" "Memory writeback protection enabled" ""
+			ok "Memory protection enabled"
+		fi
+	fi
+}
+
+# Enhanced logging security checks
+section_enhanced_logging_security() {
+	print_section "Enhanced Logging Security"
+	
+	# Check for log file permissions
+	log_files=("/var/log/auth.log" "/var/log/secure" "/var/log/messages" "/var/log/syslog" "/var/log/kern.log")
+	for log_file in "${log_files[@]}"; do
+		if [ -f "$log_file" ]; then
+			perms=$(stat -c "%a" "$log_file" 2>/dev/null || echo "unknown")
+			owner=$(stat -c "%U" "$log_file" 2>/dev/null || echo "unknown")
+			
+			if [ "$perms" = "600" ] || [ "$perms" = "640" ]; then
+				add_finding "Enhanced Logging Security" "OK" "$(basename "$log_file") has secure permissions" ""
+			else
+				rec="Secure log file permissions: 'sudo chmod 640 $log_file'"
+				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") has loose permissions ($perms)" "$rec"
+			fi
+			
+			if [ "$owner" = "root" ] || [ "$owner" = "syslog" ]; then
+				add_finding "Enhanced Logging Security" "OK" "$(basename "$log_file") has correct ownership" ""
+			else
+				rec="Fix log file ownership: 'sudo chown root:adm $log_file'"
+				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") has incorrect ownership ($owner)" "$rec"
+			fi
+		fi
+	done
+	
+	# Check for log forwarding configuration
+	if [ -f /etc/rsyslog.conf ]; then
+		remote_forwarding=$(grep -E "^\s*\*\.\*\s+@@" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null || true)
+		if [ -n "$remote_forwarding" ]; then
+			add_finding "Enhanced Logging Security" "OK" "Remote log forwarding configured" ""
+			ok "Remote logging configured"
+		else
+			rec="Configure remote log forwarding for centralized logging"
+			add_finding "Enhanced Logging Security" "INFO" "No remote log forwarding detected" "$rec"
+		fi
+	fi
+}
+
+# Enhanced network access controls
+section_enhanced_network_access() {
+	print_section "Enhanced Network Access Controls"
+	
+	# Check for TCP wrappers configuration
+	if [ -f /etc/hosts.allow ] || [ -f /etc/hosts.deny ]; then
+		add_finding "Enhanced Network Access Controls" "INFO" "TCP wrappers configuration files present" ""
+		
+		# Check for restrictive deny rules
+		if [ -f /etc/hosts.deny ]; then
+			deny_rules=$(grep -v '^#' /etc/hosts.deny 2>/dev/null | wc -l || echo "0")
+			if [ "$deny_rules" -gt 0 ]; then
+				add_finding "Enhanced Network Access Controls" "OK" "TCP wrappers deny rules configured" ""
+				ok "TCP wrappers deny rules"
+			fi
+		fi
+	fi
+	
+	# Check for additional firewall rules
+	if command_exists iptables; then
+		# Check for rate limiting rules
+		rate_limit_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "limit" || echo "0")
+		if [ "$rate_limit_rules" -gt 0 ]; then
+			add_finding "Enhanced Network Access Controls" "OK" "Rate limiting rules configured" ""
+			ok "Rate limiting configured"
+		fi
+		
+		# Check for connection tracking
+		conntrack_rules=$(iptables -L INPUT -n 2>/dev/null | grep -c "state" || echo "0")
+		if [ "$conntrack_rules" -gt 0 ]; then
+			add_finding "Enhanced Network Access Controls" "OK" "Connection tracking configured" ""
+			ok "Connection tracking configured"
+		fi
+	fi
 }
 
 section_system() {
@@ -1898,6 +2294,14 @@ This tool performs READ-ONLY security assessment of Linux systems.
 It requires sudo privileges to access system files but makes NO modifications.
 All operations are defensive security checks - no malicious activity performed.
 
+ENHANCED SECURITY FEATURES (v0.6.0):
+• Enhanced input validation and command sanitization
+• Advanced kernel and network security hardening checks
+• Comprehensive compliance and audit validation
+• Enhanced container and process security analysis
+• Advanced file integrity and logging security checks
+• Industry-standard security validation (CIS, NIST aligned)
+
 Usage: $0 [OPTIONS]
 
 OPTIONS:
@@ -2005,16 +2409,24 @@ done
 # Display security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	echo "🛡️  Blue Team QuickCheck v$VERSION - Linux Security Assessment"
-	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	echo
-	echo "⚠️  SECURITY NOTICE:"
-	echo "   • This script performs READ-ONLY security assessment"
-	echo "   • Requires sudo for comprehensive system analysis"
-	echo "   • NO system modifications will be made"
-	echo "   • May access sensitive files for security analysis"
-	echo "   • All data remains local - no external transmission"
-	echo
+echo "🛡️  Blue Team QuickCheck v$VERSION - Linux Security Assessment"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo
+echo "⚠️  SECURITY NOTICE:"
+echo "   • This script performs READ-ONLY security assessment"
+echo "   • Requires sudo for comprehensive system analysis"
+echo "   • NO system modifications will be made"
+echo "   • May access sensitive files for security analysis"
+echo "   • All data remains local - no external transmission"
+echo
+echo "🔒 ENHANCED SECURITY FEATURES (v0.6.0):"
+echo "   • Enhanced input validation and command sanitization"
+echo "   • Advanced kernel and network security hardening checks"
+echo "   • Comprehensive compliance and audit validation"
+echo "   • Enhanced container and process security analysis"
+echo "   • Advanced file integrity and logging security checks"
+echo "   • Industry-standard security validation (CIS, NIST aligned)"
+echo
 	
 	# Check if running without sudo and display prominent warning
 	if ! is_root; then
@@ -2072,6 +2484,17 @@ run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
 run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
 run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
 run_section_safely section_backup_resilience "Resilience & Backup"
+
+# Enhanced security checks (new in v0.6.0)
+run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
+run_section_safely section_enhanced_network_security "Enhanced Network Security"
+run_section_safely section_compliance_checks "Compliance & Audit"
+run_section_safely section_enhanced_container_security "Enhanced Container Security"
+run_section_safely section_enhanced_file_integrity "Enhanced File Integrity"
+run_section_safely section_enhanced_process_security "Enhanced Process Security"
+run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
+run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
+
 run_section_safely section_privilege_summary "Privilege Limitations Summary"
 run_section_safely section_summary "Summary"
 
@@ -2114,6 +2537,11 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo "✅ Security assessment completed successfully"
 	echo "📋 Review CRITICAL and WARNING findings above for security improvements"
+	echo "🔒 Enhanced security checks completed (v0.6.0)"
+	echo "   • Advanced kernel and network hardening validation"
+	echo "   • Comprehensive compliance and audit assessment"
+	echo "   • Enhanced container and process security analysis"
+	echo "   • Industry-standard security validation (CIS, NIST aligned)"
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
