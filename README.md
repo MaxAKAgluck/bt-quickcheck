@@ -10,6 +10,9 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 ## Table of Contents
 
 - [Features](#features)
+- [Why this exists](#why-this-exists)
+- [How this was built](#how-this-was-built)
+- [Project status](#project-status)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -26,16 +29,15 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 
 ## Features
 
-- 🛡️ **Comprehensive Security Assessment**: 32 security categories with 80+ specialized checks
-- ⚡ **Fast & Lightweight**: Single script, no installation required, minimal system impact  
-- 🎯 **Blue Team Focused**: Defensive security posture assessment, not penetration testing
-- 🔒 **Read-Only & Safe**: Zero system modifications, enterprise-safe operation
-- 🚀 **Enhanced Security (v0.6.0)**: Advanced input validation, command sanitization, and industry-standard compliance
-- 📊 **Multiple Output Formats**: Console, JSON, HTML, and TXT reports
-- 🏠 **Dual Operation Modes**: Personal and Production environments with tailored recommendations
-- 🔍 **Actionable Results**: Clear severity levels with specific remediation guidance
-- 🚀 **One-Liner Deployment**: Instant remote execution via curl
-- 🏢 **Enterprise Ready**: CIS Benchmark and NIST Framework alignment
+- Comprehensive baseline: 30+ categories and many targeted checks
+- Fast and lightweight: single script, no install, minimal system impact
+- Blue team focused: defensive posture checks rather than privilege escalation
+- Read-only by design: does not change system state
+- Multiple outputs: console, JSON, HTML, and plain text
+- Personal and production modes with contextual recommendations
+- Actionable results with severity levels and next steps
+- One-liner friendly for quick remote use
+- Alignment with common guidance (CIS/NIST)
 
 ## Quick Start
 
@@ -48,6 +50,18 @@ curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-q
 chmod +x bt-quickcheck.sh
 sudo ./bt-quickcheck.sh
 ```
+
+## Why this exists
+
+I wanted a quick, practical way to baseline a Linux host from a defender’s point of view without hauling in a full-blown auditing suite. This script favors fast, useful signal over exhaustive checks, and tries to point you toward the next best action.
+
+## How this was built
+
+This project was created primarily using the LLM IDE Cursor and the Claude 4 Sonnet thinking model, with additional external research and manual review. Expect some rough edges—suggestions and fixes are very welcome.
+
+## Project status
+
+This is an early, evolving tool. The script is still raw and under development. Output formats and checks may change as things improve. If something feels off, please open an issue or PR.
 
 ## Installation
 
@@ -217,20 +231,20 @@ When running without sudo, bt-quickcheck will:
 - **EDR/monitoring**: Antivirus/EDR detection, SIEM forwarding, log analysis tools
 - **Backup/resilience**: Backup tools, cloud configs, filesystem snapshots, disaster recovery
 
-### Enhanced Security Checks (v0.6.0) 🆕
-- **Enhanced Kernel Security**: Advanced kernel hardening parameters, YAMA protection, reverse path filtering
-- **Enhanced Network Security**: TCP timestamp protection, SYN cookies, Martian packet logging, namespace isolation
-- **Compliance & Audit**: Audit configuration validation, log retention policies, compliance tools detection
-- **Enhanced Container Security**: Docker daemon security, container security profiles, Kubernetes RBAC validation
-- **Enhanced File Integrity**: Advanced integrity monitoring tools, AIDE database freshness, critical file tracking
-- **Enhanced Process Security**: Process namespace isolation, elevated capabilities detection, memory protection
-- **Enhanced Logging Security**: Log file permissions validation, ownership verification, remote forwarding
-- **Enhanced Network Access Controls**: TCP wrappers configuration, firewall rate limiting, connection tracking
+### Enhanced Security Checks (v0.6.0)
+- Enhanced Kernel Security: Advanced kernel hardening parameters, YAMA protection, reverse path filtering
+- Enhanced Network Security: TCP timestamp protection, SYN cookies, Martian packet logging, namespace isolation
+- Compliance & Audit: Audit configuration validation, log retention policies, compliance tools detection
+- Enhanced Container Security: Docker daemon security, container security profiles, Kubernetes RBAC validation
+- Enhanced File Integrity: Advanced integrity monitoring tools, AIDE database freshness, critical file tracking
+- Enhanced Process Security: Process namespace isolation, elevated capabilities detection, memory protection
+- Enhanced Logging Security: Log file permissions validation, ownership verification, remote forwarding
+- Enhanced Network Access Controls: TCP wrappers configuration, firewall rate limiting, connection tracking
 
 Each finding includes:
-- ✅ **Severity level**: OK, WARN, CRIT, INFO
-- 💡 **Actionable recommendations** tailored to operation mode (personal vs production)
-- 📋 **Structured output** for automation and reporting
+- Severity level: OK, WARN, CRIT, INFO
+- Recommendations tailored to mode (personal vs production)
+- Structured output for automation and reporting
 
 ## Output Formats
 
@@ -273,7 +287,7 @@ sudo ./bt-quickcheck.sh -f txt -o security-report.txt
 sudo ./bt-quickcheck.sh -m personal
 ```
 - Home/personal machine recommendations
-- Security through obscurity suggestions
+- Security-through-obscurity suggestions
 - User-friendly guidance
 
 ### Production Mode
@@ -306,65 +320,85 @@ sudo ./bt-quickcheck.sh -m production
 
 ## Security & Safety
 
-### 🔒 Read-Only Operations
+### Read-only operations
 - Zero system modifications - pure assessment tool
 - Safe file access with permission validation
 - Protected against accidental writes or changes
 
-### 🛡️ Enhanced Input Validation & Protection (v0.6.0)
-- **Advanced Command Validation**: Prevents execution of dangerous commands (rm, dd, mkfs, etc.)
-- **Enhanced Path Sanitization**: Stronger protection against path traversal attacks
-- **Command Path Validation**: Prevents execution from dangerous directories (/tmp, /dev/shm)
-- **File Size Limits**: Prevents reading extremely large files (default 1MB limit)
-- **Symlink Protection**: Prevents symlink-based attacks
-- **Input Sanitization**: Comprehensive validation of all user inputs
+### Input validation and protections (v0.6.0)
+- Advanced command validation to prevent dangerous executions
+- Path sanitization to avoid traversal issues
+- Command path validation (avoid /tmp, /dev/shm)
+- File size limits (default 1MB) to prevent large reads
+- Symlink protection
+- Input sanitization for user-provided values
 
-### ⚡ Robust Error Handling & Timeout Protection
-- **Strict Shell Mode**: `set -euo pipefail` for robust error handling
-- **Enhanced Error Logging**: Timestamped error logging with system log integration
-- **Timeout Protection**: 30-second timeout for sections to prevent hanging
-- **Graceful Degradation**: Fallback for systems without timeout command
-- **Comprehensive Error Reporting**: Detailed error tracking and reporting
+### Error handling and section isolation
+- Strict shell mode: `set -euo pipefail`
+- Timestamped error logging with optional system log integration
+- Per-section error capture without stopping the run
+- Continues remaining checks even if a section fails
+- Structured error reporting
 
-### 🔍 Enhanced Transparency & Compliance
-- **Clear Security Disclaimers**: Comprehensive security notices and privacy statements
-- **Operation Logging**: Detailed logging of all security assessment activities
-- **No External Transmission**: All data remains local for security
-- **Minimal Privilege Requirements**: Clear sudo justification with privilege escalation guidance
-- **Industry Standards Alignment**: CIS Benchmark and NIST Framework compliance
+### Transparency and compliance
+- Clear security disclaimers and privacy statements
+- Operation logging (local only)
+- No external transmission of data
+- Minimal privilege requirements with justification
+- Basic alignment with CIS Benchmarks and NIST CSF
 
-### 🚀 Advanced Security Features
-- **Enhanced Kernel Security**: Advanced kernel hardening parameter validation
-- **Network Security Hardening**: Comprehensive network security configuration analysis
-- **Container Security**: Advanced container and Kubernetes security validation
-- **Process Security**: Enhanced process isolation and capability analysis
-- **File Integrity**: Advanced integrity monitoring and baseline management
-- **Compliance Validation**: Enterprise-grade compliance and audit checking
+### Additional security features
+- Advanced kernel security parameter validation
+- Network security configuration analysis
+- Container and Kubernetes security checks
+- Process isolation and capability review
+- Integrity monitoring and baseline management
+- Compliance and audit-oriented validations
 
 ## Enhanced Security Features (v0.6.0)
 
-### 🚀 **Advanced Security Framework**
-The latest version introduces enterprise-grade security features that align with industry best practices:
+### Advanced Security Framework
+The latest version introduces security features that align with common best practices:
 
-- **Enhanced Input Validation**: Prevents command injection and path traversal attacks
-- **Advanced Command Sanitization**: Blocks execution of dangerous system commands
-- **Comprehensive Path Protection**: Enhanced security against directory traversal attacks
-- **Timeout Protection**: Prevents hanging sections from blocking execution
-- **Enhanced Error Logging**: System log integration for audit trails
+- Enhanced input validation (command injection and path traversal prevention)
+- Command sanitization (block dangerous commands)
+- Path protections against directory traversal
+- Section error isolation to avoid entire-run failures
+- Error logging with system log integration
 
-### 🏢 **Enterprise Compliance Features**
-- **CIS Benchmark Alignment**: Many checks now align with CIS Linux Benchmark controls
-- **NIST Framework Support**: Enhanced security controls following NIST cybersecurity framework
-- **Advanced Kernel Security**: Comprehensive kernel hardening parameter validation
-- **Container Security**: Advanced Docker and Kubernetes security analysis
-- **Process Security**: Enhanced process isolation and capability analysis
+### Enterprise Compliance Features
+- CIS Benchmark alignment for several checks
+- NIST Cybersecurity Framework-inspired guidance
+- Kernel hardening parameter validation
+- Docker and Kubernetes security analysis
+- Process isolation and capability review
 
-### 🔍 **Enhanced Assessment Capabilities**
-- **32 Security Categories**: Up from 24 categories in previous versions
-- **80+ Specialized Checks**: Comprehensive security validation across all areas
-- **Advanced Network Security**: Enhanced network hardening and access control validation
-- **File Integrity Monitoring**: Advanced integrity checking and baseline management
-- **Compliance Validation**: Enterprise-grade compliance and audit checking
+### Enhanced Assessment Capabilities
+- 32 security categories (up from 24)
+- 80+ focused checks
+- Network hardening and access control validation
+- File integrity monitoring and baseline management
+- Compliance-oriented validations
+
+### Enhanced Error Handling & Section Isolation
+
+#### Section Isolation
+- **Per-section Error Handling**: Individual sections are executed with error capture
+- **Graceful Degradation**: The script continues with remaining checks if one fails
+- **Hang Prevention (Best-effort)**: Sections are designed to avoid long blocks; hard timeouts may depend on environment tooling
+- **Resource Protection**: Defensive patterns to minimize resource exhaustion
+
+#### Enhanced Error Logging
+- **Timestamped Errors**: All errors include UTC timestamps
+- **System Log Integration**: Errors logged to system logs when running as root
+- **Structured Error Tracking**: Comprehensive error categorization and reporting
+- **Audit Trail**: Complete error history for compliance and debugging
+
+#### Error Recovery
+- **Section Isolation**: Errors in one section don't affect others
+- **Graceful Degradation**: Script continues with remaining checks
+- **Error Reporting**: Clear error messages with actionable recommendations
+- **Debugging Support**: Detailed error context for troubleshooting
 
 ## Examples
 
@@ -490,80 +524,41 @@ sudo ./bt-quickcheck.sh | grep "Enhanced Network Access Controls"
 
 ## Implementation Progress
 
-✅ **v0.6.0 - Enterprise Security & Industry Standards** 🆕
-- 🚀 **Enhanced Security Framework**: Advanced input validation, command sanitization, and industry-standard compliance
-- 🔒 **Advanced Input Validation**: Dangerous command prevention, enhanced path sanitization, symlink protection
-- 🛡️ **Enhanced Error Handling**: Timeout protection, system log integration, comprehensive error tracking
-- 🔍 **Industry Standards**: CIS Benchmark and NIST Framework alignment for enterprise environments
-- 🏢 **Enterprise Features**: Advanced kernel security, container security, compliance validation
-- 📊 **Enhanced Assessment**: 32 security categories with 80+ specialized checks
-- ✅ **Blue Team Excellence**: Comprehensive defensive security posture assessment
+v0.6.0
+- Enhanced input validation, command sanitization, and compliance-oriented checks
+- Additional error handling and logging; section isolation
+- CIS/NIST-aligned checks where practical
+- Kernel, container, and compliance additions
+- Expanded categories and checks
 
-✅ **v0.5.1 - Security Hardened & Standards Compliant**
-- 🔒 **Enhanced Security**: Comprehensive disclaimers, read-only operations, safe file access
-- 🛡️ **Input Validation**: Path traversal protection, argument validation, error handling
-- ⚡ **Strict Mode**: `set -euo pipefail` for robust error handling
-- 🔍 **Safe Operations**: Protected file access functions, permission checks
-- 📋 **User Transparency**: Clear security notices, privacy statements, operation logging
-- ✅ **Cybersecurity Standards**: Aligned with defensive security best practices
+v0.5.1
+- Security disclaimers, read-only safeguards, safer file access
+- Input/path validation, stricter error handling
+- Structured user notices and logging
 
-✅ **v0.5.0 - Enterprise Security Assessment**
-- Container security: Docker/Podman/LXC/Kubernetes detection and hardening
-- Advanced kernel hardening: Secure Boot, lockdown mode, grsecurity detection
-- Application-level security: Web servers, databases, TLS configuration
-- Secrets management: API keys, SSH keys, sensitive file permissions
-- Cloud and remote management security assessment
-- EDR/AV detection and SIEM forwarding validation
-- Backup and disaster recovery capability assessment
-- 24 security categories with 50+ specialized checks
+v0.5.0
+- Container security (Docker/Podman/LXC/Kubernetes) and hardening
+- Kernel hardening (Secure Boot, lockdown mode, grsecurity detection)
+- Application-level checks (web, DB, TLS)
+- Secrets management, cloud/remote management, EDR/SIEM, backups
 
-✅ **v0.4.0 - Advanced Security Hardening** 
-- File integrity monitoring with SHA256 baselines and AIDE/Tripwire integration
-- Persistence mechanism detection (cron, timers, startup scripts, kernel modules)
-- Process forensics and hidden process detection
-- Kernel hardening and secure configuration validation
+v0.4.0
+- File integrity monitoring (SHA256 baselines, AIDE/Tripwire integration)
+- Persistence detection (cron, timers, startup scripts, kernel modules)
+- Process forensics and hidden process heuristics
 
-✅ **v0.3.0 - Comprehensive Security Assessment**
-- Multiple output formats (JSON, HTML, TXT) with structured data
-- Personal vs Production operation modes with tailored recommendations
-- Intrusion detection (fail2ban, auth logs, suspicious activity)
-- Time synchronization and logging infrastructure validation
-- Network security and package integrity verification
+v0.3.0
+- Multiple output formats (JSON/HTML/TXT)
+- Personal vs production modes
+- Intrusion detection, time sync, logging validation
 
-✅ **v0.2.0 - Core Security Baseline**
-- Fast, read-only security posture assessment
-- SSH hardening, firewall status, user account analysis
-- Update management and basic permission auditing
-
-
-
-## Roadmap
-
-### Recently Implemented (v0.6.0) ✅
-- 🔧 **CIS Benchmark Integration**: Advanced checks aligned with CIS Linux Benchmark controls
-- 🐳 **Enhanced Container Security**: Comprehensive container and Kubernetes security validation
-- 🚀 **Advanced Security Framework**: Enhanced input validation and command sanitization
-- 📊 **Industry Standards**: NIST Framework alignment and enterprise compliance features
-- 🔍 **Enhanced Assessment**: 8 new security categories with advanced validation
-
-### Planned Features
-- 🔌 **Pluggable Framework**: Enable/disable specific check categories
-- 🔇 **Quiet Mode**: Fail-only output and minimal verbosity options
-- 📊 **Enhanced SIEM Integration**: Improved JSON schema and log forwarding
-- 🚀 **Performance Optimization**: Faster execution and reduced resource usage
-- 🔐 **Custom Policy Integration**: Support for organization-specific security policies
-- 📈 **Trend Analysis**: Historical security posture tracking and reporting
-
-### Long-term Vision
-- Integration with popular security frameworks (NIST, ISO 27001)
-- Cloud-native security assessments (AWS, Azure, GCP)
-- Real-time monitoring mode with alert capabilities
-- Plugin system for custom organizational checks
+v0.2.0
+- Core baseline: SSH hardening, firewall status, user account analysis, updates, permissions
 
 ## Enhanced Input Validation & Security Features
 
-### 🛡️ **Advanced Command Validation**
-The script now includes comprehensive command validation to prevent execution of dangerous system commands:
+### Advanced command validation
+The script includes command validation to prevent execution of dangerous system commands:
 
 ```bash
 # Dangerous commands are blocked:
@@ -573,23 +568,23 @@ rm, dd, mkfs, fdisk, parted, shutdown, reboot, halt, init, telinit
 ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 ```
 
-### 🔒 **Enhanced Path Sanitization**
-- **Path Traversal Prevention**: Blocks `../`, `..*`, and directory traversal attempts
-- **Safe Directory Validation**: Only allows execution from secure system directories
-- **Absolute Path Protection**: Restricts absolute paths to safe locations
-- **Symlink Protection**: Prevents symlink-based attacks
+### Path sanitization
+- Path traversal prevention for `../` and similar patterns
+- Execution limited to safe system directories
+- Absolute path restrictions
+- Symlink protection
 
-### 📁 **File Access Security**
-- **File Size Limits**: Default 1MB limit prevents reading extremely large files
-- **Permission Validation**: Checks file readability before access
-- **Location Validation**: Prevents access to dangerous directories
-- **Content Validation**: Safe file reading with error handling
+### File access
+- File size limits (default 1MB)
+- Permission checks before access
+- Location validation for risky directories
+- Safe reading with error handling
 
-### 🚫 **Command Execution Security**
-- **Path Validation**: Commands must exist and be executable
-- **Directory Validation**: Prevents execution from `/tmp/` or `/dev/shm/`
-- **Command Sanitization**: Validates all command parameters
-- **Safe Execution**: Wrapped execution with error handling
+### Command execution safety
+- Command existence and executability checks
+- Avoid executing from `/tmp/` or `/dev/shm/`
+- Parameter sanitization
+- Wrapped execution with error handling
 
 ## References
 
@@ -608,7 +603,7 @@ ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 
 ## Security Improvements in v0.6.0
 
-### 🚀 **What's New in This Version**
+### What's New in This Version
 
 #### Enhanced Input Validation & Security
 - **Command Injection Prevention**: Blocks execution of dangerous system commands (rm, dd, mkfs, etc.)
@@ -630,16 +625,8 @@ ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 - **CIS Benchmark Alignment**: Many checks now align with CIS Linux Benchmark controls
 - **NIST Framework Support**: Enhanced security controls following NIST cybersecurity framework
 - **Compliance Validation**: Enterprise-grade compliance and audit checking
-- **Advanced Logging**: Enhanced error logging with system log integration
-- **Timeout Protection**: 30-second timeout for sections to prevent hanging
-
-### 🔒 **Security Benefits**
-- **Reduced Attack Surface**: Enhanced input validation prevents common attack vectors
-- **Better Compliance**: Industry-standard security validation for enterprise environments
-- **Improved Reliability**: Timeout protection and enhanced error handling
-- **Enhanced Audit Trail**: Comprehensive logging and error tracking
-- **Industry Standards**: Alignment with CIS, NIST, and Blue Team best practices
-- **Enterprise Ready**: Production-grade security assessment capabilities
+- **Enhanced Logging**: Improved error logging with system log integration
+- **Section Isolation**: Prevents a failing section from blocking execution
 
 ## Contributing
 
@@ -712,9 +699,9 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Contact & Support
 
-- 📧 **Issues**: [GitHub Issues](https://github.com/MaxAKAgluck/bt-quickcheck/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/MaxAKAgluck/bt-quickcheck/discussions)
-- 🔒 **Security Issues**: Please report security vulnerabilities via GitHub's private vulnerability reporting
+- Issues: [GitHub Issues](https://github.com/MaxAKAgluck/bt-quickcheck/issues)
+- Discussions: [GitHub Discussions](https://github.com/MaxAKAgluck/bt-quickcheck/discussions)
+- Security: Please report vulnerabilities via GitHub's private vulnerability reporting
 
 ## Acknowledgments
 
@@ -726,42 +713,35 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Enterprise Compliance & Industry Standards
 
-### 🏢 **CIS Benchmark Alignment**
+### CIS Benchmark Alignment
 Many security checks in v0.6.0 now align with CIS Linux Benchmark controls:
 
-- **Kernel Hardening**: CIS Controls 3.1, 3.2, 3.3
-- **Network Security**: CIS Controls 4.1, 4.2, 4.3
-- **Access Control**: CIS Controls 5.1, 5.2, 5.3
-- **Audit & Logging**: CIS Controls 6.1, 6.2, 6.3
-- **System Maintenance**: CIS Controls 7.1, 7.2, 7.3
+- Kernel hardening: CIS Controls 3.1, 3.2, 3.3
+- Network security: CIS Controls 4.1, 4.2, 4.3
+- Access control: CIS Controls 5.1, 5.2, 5.3
+- Audit & logging: CIS Controls 6.1, 6.2, 6.3
+- System maintenance: CIS Controls 7.1, 7.2, 7.3
 
-### 📋 **NIST Framework Support**
-Enhanced security controls following NIST Cybersecurity Framework:
+### NIST Framework Support
+Guidance inspired by the NIST Cybersecurity Framework:
 
-- **Identify**: System and asset discovery, business environment assessment
-- **Protect**: Access control, awareness training, data security
-- **Detect**: Anomaly detection, security monitoring, detection processes
-- **Respond**: Response planning, communications, analysis
-- **Recover**: Recovery planning, improvements, communications
+- Identify: System and asset discovery, business environment assessment
+- Protect: Access control, awareness training, data security
+- Detect: Anomaly detection, security monitoring, detection processes
+- Respond: Response planning, communications, analysis
+- Recover: Recovery planning, improvements, communications
 
-### 🔒 **Compliance Validation Features**
-- **Audit Configuration**: Comprehensive audit daemon validation
-- **Log Retention**: Log rotation and retention policy checking
-- **Security Policies**: Access control and limits configuration
-- **Compliance Tools**: Industry-standard compliance tool detection
-- **Enterprise Logging**: Centralized logging and monitoring validation
-
-### 🚀 **Production Environment Ready**
-- **Enterprise Security**: Advanced security validation for business environments
-- **Compliance Reporting**: Structured output for compliance audits
-- **Risk Assessment**: Comprehensive security risk evaluation
-- **Remediation Guidance**: Actionable recommendations for security improvements
-- **Industry Best Practices**: Alignment with security industry standards
+### Compliance validation features
+- Audit daemon configuration checks
+- Log rotation and retention policy checks
+- Access control and limits configuration
+- Compliance tool detection
+- Centralized logging validation
 
 ---
 
-**⚠️ Disclaimer**: This tool is provided as-is for defensive security assessment purposes. Always ensure you have proper authorization before running security assessments on any system.
+Disclaimer: This tool is provided as-is for defensive assessment purposes. Only run it on systems you are authorized to assess.
 
-**🔒 Security Notice**: This tool includes enhanced security features to prevent common attack vectors. All operations are read-only and designed for defensive security assessment only.
+Security notice: The script is read-only and includes safeguards to avoid risky operations. Data stays local.
 
 
