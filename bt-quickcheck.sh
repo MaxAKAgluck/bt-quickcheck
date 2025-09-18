@@ -98,7 +98,7 @@ run_section_safely() {
     set -e
 }
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 # Output format (default: console)
 OUTPUT_FORMAT="console"
@@ -360,6 +360,7 @@ generate_json_output() {
 generate_html_output() {
     local timestamp=$(date)
     local hostname=$(hostname 2>/dev/null || echo "unknown")
+    local total_count=${#FINDINGS[@]}
     
     cat << EOF
 <!DOCTYPE html>
@@ -388,7 +389,7 @@ generate_html_output() {
 <div class="container">
     <div class="header">
         <h1>Blue Team QuickCheck Report</h1>
-        <p><strong>Host:</strong> $hostname | <strong>Mode:</strong> $OPERATION_MODE | <strong>Generated:</strong> $timestamp | <strong>Version:</strong> $VERSION</p>
+        <p><strong>Host:</strong> $hostname | <strong>Mode:</strong> $OPERATION_MODE | <strong>Generated:</strong> $timestamp | <strong>Version:</strong> $VERSION | <strong>Total findings:</strong> $total_count</p>
     </div>
 EOF
 
