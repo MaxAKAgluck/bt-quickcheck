@@ -12,10 +12,10 @@ Note: As of v0.6.1, production mode adds stricter checks (firewall required, rem
 ## Table of Contents
 
 - [Features](#features)
+- [Quick Start](#quick-start)
 - [Why this exists](#why-this-exists)
 - [How this was built](#how-this-was-built)
 - [Project status](#project-status)
-- [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Security Assessment Categories](#security-assessment-categories)
