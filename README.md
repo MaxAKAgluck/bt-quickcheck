@@ -5,7 +5,9 @@
 [![Linux](https://img.shields.io/badge/platform-linux-blue.svg)](https://kernel.org/)
 [![Security](https://img.shields.io/badge/security-blue%20team-blue.svg)](https://github.com/MaxAKAgluck/bt-quickcheck)
 
-A fast, no-hassle Linux one-liner to baseline a host from a blue team perspective. Inspired by linPEAS' ease-of-use, but focused on defensive posture checks (configuration, hygiene, and quick wins) instead of privilege escalation. **Now with enhanced security features and industry-standard compliance validation.**
+A fast, no-hassle Linux one-liner to baseline a host from a blue team perspective. Inspired by linPEAS' ease-of-use, but focused on defensive posture checks (configuration, hygiene, and quick wins) instead of privilege escalation.
+
+Note: As of v0.6.1, production mode adds stricter checks (firewall required, remote logging expected, stronger time sync expectations) and a new Resource Health section. When using `-o`, the script suppresses scan chatter, shows a short spinner, and prints only where the report was saved and the execution mode.
 
 ## Table of Contents
 
@@ -203,33 +205,60 @@ When running without sudo, bt-quickcheck will:
 [WARN] Password audit skipped - requires sudo access to /etc/shadow
 ```
 
+## Operation Modes
+
+### Personal Mode (Default)
+```bash
+sudo ./bt-quickcheck.sh -m personal
+```
+- Home/personal machine recommendations
+- Security-through-obscurity suggestions
+- User-friendly guidance
+
+### Production Mode
+```bash
+sudo ./bt-quickcheck.sh -m production
+```
+- Stricter recommendations and severities
+- Additional checks enabled (see below)
+- Compliance and centralization focus
+
+### Mode Differences (high-level)
+- Firewall: production requires host firewall tooling/rules (WARN/CRIT if missing); personal suggests
+- Logging: production expects remote forwarding to a central collector; personal optional
+- Time sync: production discourages minimal timesyncd, prefers chrony/ntp with multiple sources
+- File integrity: production checks for AIDE/Tripwire and recommends automated monitoring
+- EDR: production may flag missing EDR as CRIT and expects SIEM/forwarding
+- Resource health (production-only): CPU/memory/disk space checks
+
 ## Security Assessment Categories
 
 ### Core Security Checks
-- **System basics**: distro, kernel, uptime, virtualization hints
-- **Patching**: pending updates (apt/dnf/yum/zypper) with mode-specific update recommendations
-- **Network exposure**: listening services summary and port analysis
-- **Firewall**: `ufw`, `firewalld`, `nftables`/`iptables` status and rules
-- **SSH hardening**: `PermitRootLogin`, `PasswordAuthentication`, access controls, port configuration
-- **Auditing and hardening**: `auditd`, SELinux/AppArmor status with activation guidance
-- **User accounts**: unauthorized UID 0 accounts, passwordless accounts, NOPASSWD sudo entries
-- **Risky permissions**: world-writable files/dirs, SUID binaries in sensitive paths
-- **Intrusion detection**: `fail2ban` status, recent failed login attempts, suspicious activity
-- **Time synchronization**: `chrony`, `ntpd`, `systemd-timesyncd` status and configuration
-- **Logging and monitoring**: `rsyslog`/`syslog-ng`, log file permissions, `logrotate` configuration
-- **Network security**: TCP SYN cookies, excessive open ports, IPv6 status (personal mode)
-- **Package integrity**: RPM/DEB package modification detection (`rpm -Va`, `debsums`)
-- **File integrity**: SHA256 hashes of critical binaries/configs, AIDE/Tripwire integration (production)
-- **Persistence mechanisms**: Cron jobs, systemd timers, startup scripts, shell configs, kernel modules
-- **Process forensics**: Process tree analysis, hidden process detection, temp directory execution
-- **Secure configuration**: Kernel hardening flags, umask settings, core dumps, 2FA indicators
-- **Container security**: Docker/Podman/LXC detection, privileged containers, dangerous host mounts, Kubernetes
-- **Kernel hardening**: Secure Boot, lockdown mode, module signing, grsecurity, advanced sysctl flags
-- **Application security**: Web server TLS config, database exposure, SSL/TLS enforcement
-- **Secrets management**: API keys, SSH keys, .env files permissions, agent forwarding detection
-- **Cloud/remote management**: Cloud agents, VNC/RDP detection, remote access security
-- **EDR/monitoring**: Antivirus/EDR detection, SIEM forwarding, log analysis tools
-- **Backup/resilience**: Backup tools, cloud configs, filesystem snapshots, disaster recovery
+- System basics: distro, kernel, uptime, virtualization hints
+- Patching: pending updates with mode-specific recommendations
+- Network exposure: listening services summary and port analysis
+- Firewall: ufw/firewalld/nftables/iptables presence and rules (prod requires)
+- SSH hardening: PermitRootLogin, PasswordAuthentication, access controls, port configuration
+- Auditing and hardening: auditd, SELinux/AppArmor status with activation guidance
+- User accounts: unauthorized UID 0 accounts, passwordless accounts, NOPASSWD sudo entries
+- Risky permissions: world-writable files/dirs, SUID binaries in sensitive paths
+- Intrusion detection: fail2ban status, recent failed login attempts, suspicious activity
+- Time synchronization: chrony/ntp/timesyncd status and configuration (prod prefers chrony/ntp)
+- Logging and monitoring: rsyslog/syslog-ng, log file permissions, logrotate, remote forwarding (prod expects)
+- Network security: TCP SYN cookies, excessive open ports, IPv6 status (personal mode)
+- Package integrity: RPM/DEB verification (rpm -Va, debsums)
+- File integrity: SHA256 hashes; prod checks for AIDE/Tripwire and monitoring
+- Persistence mechanisms: cron jobs, timers, startup scripts, shell configs, kernel modules
+- Process forensics: process tree analysis, capabilities, temp directory execution
+- Secure configuration: kernel hardening flags, umask settings, core dumps, 2FA indicators
+- Container security: Docker/Podman/LXC detection, privileged containers, host mounts, Kubernetes
+- Kernel hardening: Secure Boot, lockdown mode, module signing, grsecurity, advanced sysctl flags
+- Application security: web server TLS, database exposure, SSL/TLS enforcement
+- Secrets management: API keys, SSH keys, .env files permissions, agent forwarding detection
+- Cloud/remote management: cloud agents, VNC/RDP detection, remote access security
+- EDR/monitoring: antivirus/EDR detection, SIEM/forwarding expectations (prod stricter)
+- Backup/resilience: tools, snapshots, disaster recovery
+- Resource health (production): CPU load, memory usage, disk space thresholds
 
 ### Enhanced Security Checks (v0.6.0)
 - Enhanced Kernel Security: Advanced kernel hardening parameters, YAMA protection, reverse path filtering
@@ -279,248 +308,6 @@ sudo ./bt-quickcheck.sh -f txt -o security-report.txt
 - Simple text format
 - Email-friendly output
 - Legacy system compatible
-
-## Operation Modes
-
-### Personal Mode (Default)
-```bash
-sudo ./bt-quickcheck.sh -m personal
-```
-- Home/personal machine recommendations
-- Security-through-obscurity suggestions
-- User-friendly guidance
-
-### Production Mode
-```bash
-sudo ./bt-quickcheck.sh -m production
-```
-- Enterprise environment recommendations
-- Compliance-focused checks
-- Business continuity considerations
-
-### Mode Comparison
-
-| Check Category | Personal Mode | Production Mode |
-|---|---|---|
-| **SSH Port** | Suggests changing from default port 22 | Focuses on access controls and key management |
-| **Updates** | Recommends manual updates + auto-security | Emphasizes scheduled maintenance windows |
-| **Fail2ban** | Basic SSH protection | Custom rules + centralized monitoring |
-| **Time Sync** | Basic NTP setup | Enterprise NTP with multiple sources |
-| **IPv6** | Suggests disabling if unused | Keeps enabled for business needs |
-| **Logging** | Local log management | Centralized logging + compliance |
-| **User Accounts** | Focus on home security practices | Emphasis on business policies |
-| **File Integrity** | Quick SHA256 hashes of critical files | AIDE/Tripwire integration + monitoring |
-| **Persistence** | Basic cron/startup script scanning | Full timer/module/service analysis |
-| **Forensics** | Simple process tree analysis | Advanced ELF capabilities + network process mapping |
-| **Containers** | Basic Docker security warnings | Comprehensive container hardening + K8s CIS benchmarks |
-| **Kernel** | Basic hardening flag suggestions | Full compliance checking + module signing enforcement |
-| **Applications** | Simple HTTPS recommendations | Enterprise TLS config + database security policies |
-| **EDR/AV** | Basic antivirus suggestions | Corporate EDR requirements + SIEM integration |
-| **Backups** | Personal backup tool recommendations | Enterprise DR procedures + offsite backup validation |
-
-## Security & Safety
-
-### Read-only operations
-- Zero system modifications - pure assessment tool
-- Safe file access with permission validation
-- Protected against accidental writes or changes
-
-### Input validation and protections (v0.6.0)
-- Advanced command validation to prevent dangerous executions
-- Path sanitization to avoid traversal issues
-- Command path validation (avoid /tmp, /dev/shm)
-- File size limits (default 1MB) to prevent large reads
-- Symlink protection
-- Input sanitization for user-provided values
-
-### Error handling and section isolation
-- Strict shell mode: `set -euo pipefail`
-- Timestamped error logging with optional system log integration
-- Per-section error capture without stopping the run
-- Continues remaining checks even if a section fails
-- Structured error reporting
-
-### Transparency and compliance
-- Clear security disclaimers and privacy statements
-- Operation logging (local only)
-- No external transmission of data
-- Minimal privilege requirements with justification
-- Basic alignment with CIS Benchmarks and NIST CSF
-
-### Additional security features
-- Advanced kernel security parameter validation
-- Network security configuration analysis
-- Container and Kubernetes security checks
-- Process isolation and capability review
-- Integrity monitoring and baseline management
-- Compliance and audit-oriented validations
-
-## Enhanced Security Features (v0.6.0)
-
-### Advanced Security Framework
-The latest version introduces security features that align with common best practices:
-
-- Enhanced input validation (command injection and path traversal prevention)
-- Command sanitization (block dangerous commands)
-- Path protections against directory traversal
-- Section error isolation to avoid entire-run failures
-- Error logging with system log integration
-
-### Enterprise Compliance Features
-- CIS Benchmark alignment for several checks
-- NIST Cybersecurity Framework-inspired guidance
-- Kernel hardening parameter validation
-- Docker and Kubernetes security analysis
-- Process isolation and capability review
-
-### Enhanced Assessment Capabilities
-- 32 security categories (up from 24)
-- 80+ focused checks
-- Network hardening and access control validation
-- File integrity monitoring and baseline management
-- Compliance-oriented validations
-
-### Enhanced Error Handling & Section Isolation
-
-#### Section Isolation
-- **Per-section Error Handling**: Individual sections are executed with error capture
-- **Graceful Degradation**: The script continues with remaining checks if one fails
-- **Hang Prevention (Best-effort)**: Sections are designed to avoid long blocks; hard timeouts may depend on environment tooling
-- **Resource Protection**: Defensive patterns to minimize resource exhaustion
-
-#### Enhanced Error Logging
-- **Timestamped Errors**: All errors include UTC timestamps
-- **System Log Integration**: Errors logged to system logs when running as root
-- **Structured Error Tracking**: Comprehensive error categorization and reporting
-- **Audit Trail**: Complete error history for compliance and debugging
-
-#### Error Recovery
-- **Section Isolation**: Errors in one section don't affect others
-- **Graceful Degradation**: Script continues with remaining checks
-- **Error Reporting**: Clear error messages with actionable recommendations
-- **Debugging Support**: Detailed error context for troubleshooting
-
-## Examples
-
-### Basic Security Assessment
-```bash
-# Comprehensive assessment with console output (recommended)
-sudo ./bt-quickcheck.sh
-
-# Limited assessment without sudo (basic checks only)
-./bt-quickcheck.sh -m personal
-```
-
-### Generate Reports
-```bash
-# JSON report for automation
-sudo ./bt-quickcheck.sh -f json -o security-$(date +%Y%m%d).json
-
-# HTML report for management
-sudo ./bt-quickcheck.sh -m production -f html -o production-security-report.html
-
-# Text report for documentation
-sudo ./bt-quickcheck.sh -f txt -o baseline-$(hostname).txt
-```
-
-### Enhanced Security Assessment (v0.6.0)
-```bash
-# Run enhanced security checks with new features
-sudo ./bt-quickcheck.sh
-
-# Production mode with enhanced compliance validation
-sudo ./bt-quickcheck.sh -m production -f json -o production-security-v0.6.0.json
-
-# Generate comprehensive HTML report with enhanced features
-sudo ./bt-quickcheck.sh -m production -f html -o enhanced-security-report.html
-```
-
-### Enterprise Usage
-```bash
-# Production environment assessment
-sudo ./bt-quickcheck.sh -m production -f json -o /var/log/security-assessment.json
-
-# Multiple format generation
-sudo ./bt-quickcheck.sh -m production -f html -o security-report.html
-sudo ./bt-quickcheck.sh -m production -f json -o security-report.json
-```
-
-### New Enhanced Security Checks
-```bash
-# Enhanced kernel security validation
-sudo ./bt-quickcheck.sh | grep "Enhanced Kernel Security"
-
-# Advanced container security analysis
-sudo ./bt-quickcheck.sh | grep "Enhanced Container Security"
-
-# Compliance and audit validation
-sudo ./bt-quickcheck.sh | grep "Compliance & Audit"
-
-# Enhanced file integrity monitoring
-sudo ./bt-quickcheck.sh | grep "Enhanced File Integrity"
-
-# Process security analysis
-sudo ./bt-quickcheck.sh | grep "Enhanced Process Security"
-
-# Advanced logging security
-sudo ./bt-quickcheck.sh | grep "Enhanced Logging Security"
-
-# Network access controls
-sudo ./bt-quickcheck.sh | grep "Enhanced Network Access Controls"
-```
-
-### Enhanced Security Check Details
-
-#### Enhanced Kernel Security
-- **YAMA Protection**: PTRACE scope restriction validation
-- **Core Dump Prevention**: SUID core dump protection
-- **Reverse Path Filtering**: Network spoofing protection
-- **Source Route Protection**: Prevents source routing attacks
-- **Security Module Detection**: AppArmor, SELinux, YAMA, capability, integrity
-
-#### Enhanced Network Security
-- **TCP Timestamp Protection**: Prevents timestamp-based attacks
-- **SYN Cookie Validation**: SYN flood protection
-- **Backlog Limits**: Connection queue management
-- **Martian Packet Logging**: Suspicious packet detection
-- **Network Namespace Isolation**: Container network security
-
-#### Compliance & Audit
-- **Audit Configuration**: Audit daemon settings validation
-- **Log Retention**: Log rotation and retention policy checking
-- **Security Policies**: Access control and limits configuration
-- **Compliance Tools**: OpenSCAP, Lynis, Tiger, RKHunter detection
-
-#### Enhanced Container Security
-- **Docker Hardening**: Daemon security configuration validation
-- **Security Profiles**: Container security profile analysis
-- **Kubernetes RBAC**: Role-based access control validation
-- **Network Policies**: Container network security policies
-- **Unconfined Detection**: Containers without security profiles
-
-#### Enhanced File Integrity
-- **Integrity Tools**: AIDE, Tripwire, OSSEC, Samhain detection
-- **Database Freshness**: AIDE database update validation
-- **Critical File Tracking**: Important file modification monitoring
-- **Baseline Management**: File integrity baseline establishment
-
-#### Enhanced Process Security
-- **Namespace Isolation**: Process namespace detection
-- **Capability Analysis**: Elevated process capability identification
-- **Memory Protection**: Memory writeback protection validation
-- **Process Security**: Enhanced process isolation analysis
-
-#### Enhanced Logging Security
-- **Permission Validation**: Log file permission checking (600/640)
-- **Ownership Verification**: Log file ownership validation
-- **Remote Forwarding**: Centralized logging configuration
-- **Audit Trail**: Comprehensive logging security analysis
-
-#### Enhanced Network Access Controls
-- **TCP Wrappers**: Host-based access control validation
-- **Firewall Rules**: Rate limiting and connection tracking
-- **Access Control**: Network access restriction validation
-- **Security Policies**: Network security policy enforcement
 
 ## Implementation Progress
 
