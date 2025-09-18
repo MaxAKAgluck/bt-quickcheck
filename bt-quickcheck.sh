@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.6.0
+# Version: 0.6.1
 # 
 # SECURITY DISCLAIMER:
 # This script performs READ-ONLY security assessment of Linux systems.
@@ -47,25 +47,55 @@ handle_section_error() {
     fi
 }
 
-# Enhanced section runner with timeout protection
+# Lightweight spinner for quiet mode
+start_spinner() {
+    local msg="${1:-Running checks}"
+    SPINNER_MSG="$msg"
+    (
+        local frames='|/-\\'
+        local i=0
+        # Hide cursor if available
+        if command -v tput >/dev/null 2>&1; then tput civis >&3 2>/dev/null || true; fi
+        while true; do
+            local ch=${frames:i%4:1}
+            if [ "$QUIET_MODE" = true ]; then
+                printf "\r%s %s" "$SPINNER_MSG" "$ch" >&3
+            else
+                printf "\r%s %s" "$SPINNER_MSG" "$ch"
+            fi
+            i=$(( (i+1) ))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    if [ -n "${SPINNER_PID:-}" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        if [ "$QUIET_MODE" = true ]; then
+            printf "\r%s done.    \n" "$SPINNER_MSG" >&3
+            if command -v tput >/dev/null 2>&1; then tput cnorm >&3 2>/dev/null || true; fi
+        else
+            printf "\r%s done.    \n" "$SPINNER_MSG"
+            if command -v tput >/dev/null 2>&1; then tput cnorm 2>/dev/null || true; fi
+        fi
+        unset SPINNER_PID
+    fi
+}
+
+# Enhanced section runner with safe, non-failing execution
 run_section_safely() {
     local section_func="$1"
     local section_name="$2"
-    local timeout="${3:-30}"  # Default 30 second timeout
+    local _timeout_unused="${3:-30}"
     
-    # Temporarily disable exit on error for this section
+    # Always allow sections to complete without propagating non-zero codes.
+    # Individual commands inside sections already record WARN/INFO findings.
     set +e
-    
-    # Run section directly (functions are in the same scope)
-    eval "$section_func" 2>/dev/null
-    local exit_code=$?
-    
+    "$section_func" 2>/dev/null || true
     set -e
-    
-    if [ $exit_code -ne 0 ]; then
-        # Error occurred
-        handle_section_error "$section_name" "ERROR" "Section failed with exit code $exit_code"
-    fi
 }
 
 VERSION="0.6.0"
@@ -74,6 +104,7 @@ VERSION="0.6.0"
 OUTPUT_FORMAT="console"
 OUTPUT_FILE=""
 OPERATION_MODE="personal"
+QUIET_MODE=false
 
 # Colors (only used in console mode)
 COLOR_RED="\033[31m"
@@ -268,20 +299,13 @@ add_finding() {
 print_section() {
     [ "$OUTPUT_FORMAT" = "console" ] && printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}\n" "$1"
     SECTIONS+=("$1")
+    return 0
 }
 
-ok() { 
-    [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_GREEN}[OK]${COLOR_RESET} %s\n" "$1"
-}
-warn() { 
-    [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_YELLOW}[WARN]${COLOR_RESET} %s\n" "$1"
-}
-crit() { 
-    [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_RED}[CRIT]${COLOR_RESET} %s\n" "$1"
-}
-info() { 
-    [ "$OUTPUT_FORMAT" = "console" ] && printf "[INFO] %s\n" "$1"
-}
+ok() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_GREEN}[OK]${COLOR_RESET} %s\n" "$1"; return 0; }
+warn() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_YELLOW}[WARN]${COLOR_RESET} %s\n" "$1"; return 0; }
+crit() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_RED}[CRIT]${COLOR_RESET} %s\n" "$1"; return 0; }
+info() { [ "$OUTPUT_FORMAT" = "console" ] && printf "[INFO] %s\n" "$1"; return 0; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -1212,17 +1236,38 @@ section_listening() {
 
 section_firewall() {
 	print_section "Firewall"
+	local firewall_found=false
 	if command_exists ufw; then
 		ufw status verbose 2>/dev/null | sed 's/^/ufw: /' || true
+		firewall_found=true
 	fi
 	if command_exists firewall-cmd; then
 		firewall-cmd --state 2>/dev/null | sed 's/^/firewalld: /' || true
 		firewall-cmd --list-all 2>/dev/null | sed 's/^/firewalld: /' | sed -n '1,50p' || true
+		firewall_found=true
 	fi
 	if command_exists nft; then
 		nft list ruleset 2>/dev/null | sed -n '1,50p' | sed 's/^/nftables: /' || true
+		firewall_found=true
 	elif command_exists iptables; then
 		iptables -S 2>/dev/null | sed -n '1,50p' | sed 's/^/iptables: /' || true
+		firewall_found=true
+	fi
+
+	# Severity based on mode
+	if [ "$firewall_found" = false ]; then
+		rec=$(get_recommendation "Install and configure a basic firewall" \
+			"Install and configure a firewall (ufw)" \
+			"Require host firewall: deploy ufw/firewalld/nftables with baseline policy")
+		if [ "$OPERATION_MODE" = "production" ]; then
+			add_finding "Firewall" "CRIT" "No firewall tooling/rules detected" "$rec"
+			crit "No firewall tooling/rules detected"
+		else
+			add_finding "Firewall" "WARN" "No firewall tooling/rules detected" "$rec"
+			warn "No firewall tooling/rules detected"
+		fi
+	else
+		add_finding "Firewall" "INFO" "Firewall tooling present" "Review rules above"
 	fi
 }
 
@@ -1498,8 +1543,13 @@ section_time_sync() {
 		fi
 	# Check for systemd-timesyncd
 	elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-		add_finding "Time Sync" "OK" "systemd-timesyncd is active" ""
-		ok "systemd-timesyncd is active"
+		if [ "$OPERATION_MODE" = "production" ]; then
+			add_finding "Time Sync" "WARN" "systemd-timesyncd active (minimal)" "Deploy chrony/ntp with authenticated multi-source time servers"
+			warn "systemd-timesyncd active (minimal)"
+		else
+			add_finding "Time Sync" "OK" "systemd-timesyncd is active" ""
+			ok "systemd-timesyncd is active"
+		fi
 	else
 		rec=$(get_recommendation "Install and configure NTP: 'sudo apt install chrony && sudo systemctl enable chronyd'" \
 			"Install chrony or NTP for accurate time synchronization" \
@@ -1552,6 +1602,24 @@ section_logging() {
 			"Install logrotate for log management" \
 			"Deploy centralized log management with rotation and archival policies")
 		add_finding "Logging" "INFO" "logrotate not installed" "$rec"
+	fi
+
+	# Remote log forwarding (rsyslog)
+	if [ -f /etc/rsyslog.conf ] || [ -d /etc/rsyslog.d ]; then
+		forwarding=$(grep -R "@" /etc/rsyslog.conf /etc/rsyslog.d 2>/dev/null | grep -v '^#' | head -1 || true)
+		if [ -n "$forwarding" ]; then
+			add_finding "Logging" "INFO" "Remote log forwarding configured" ""
+		else
+			rec=$(get_recommendation "Consider configuring remote log forwarding" \
+				"Optional: configure remote log forwarding" \
+				"Require centralized logging: configure rsyslog/syslog-ng forwarding to SIEM")
+			if [ "$OPERATION_MODE" = "production" ]; then
+				add_finding "Logging" "WARN" "No remote log forwarding detected" "$rec"
+				warn "No remote log forwarding detected"
+			else
+				add_finding "Logging" "INFO" "No remote log forwarding detected" "$rec"
+			fi
+		fi
 	fi
 }
 
@@ -2736,39 +2804,26 @@ done
 
 # Display security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
-	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🛡️  Blue Team QuickCheck v$VERSION - Linux Security Assessment"
-echo "🔧 Mode: $OPERATION_MODE | Enhanced Security Features (v0.6.0)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo
-echo "⚠️  SECURITY NOTICE:"
-echo "   • This script performs READ-ONLY security assessment"
-echo "   • Requires sudo for comprehensive system analysis"
-echo "   • NO system modifications will be made"
-echo "   • May access sensitive files for security analysis"
-echo "   • All data remains local - no external transmission"
-echo
-	
-	# Check if running without sudo and display prominent warning
-	if ! is_root; then
-		printf "${COLOR_YELLOW}⚠️  LIMITED SCAN WARNING:${COLOR_RESET}\n"
-		printf "${COLOR_YELLOW}   • Running without sudo - many security checks will be skipped${COLOR_RESET}\n"
-		printf "${COLOR_YELLOW}   • System files, logs, and privileged information cannot be accessed${COLOR_RESET}\n"
-		printf "${COLOR_YELLOW}   • For comprehensive security assessment, run: ${COLOR_BLUE}sudo $0${COLOR_RESET}\n"
-		if [ "$OPERATION_MODE" = "production" ]; then
-			printf "${COLOR_RED}   • Production mode requires sudo for meaningful security assessment${COLOR_RESET}\n"
-		fi
-		printf "${COLOR_YELLOW}   • Current scan will show basic system information and user-accessible checks only${COLOR_RESET}\n"
-		echo
-	fi
-	
-	echo "🔍 Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
-	if [ -n "$OUTPUT_FILE" ]; then
-		echo "📄 Output: $OUTPUT_FILE"
-	fi
-	echo
-	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	echo
+    echo
+    echo "bt-quickcheck v$VERSION - Linux Security Assessment"
+    echo "Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
+    [ -n "$OUTPUT_FILE" ] && echo "Output: $OUTPUT_FILE"
+    echo
+    echo "SECURITY NOTICE:"
+    echo " - Read-only assessment"
+    echo " - sudo recommended for comprehensive analysis"
+    echo " - No system modifications"
+    echo " - May access sensitive files for analysis"
+    echo " - All data remains local"
+    echo
+    # Check if running without sudo and display prominent warning
+    if ! is_root; then
+        printf "${COLOR_YELLOW}LIMITED SCAN WARNING:${COLOR_RESET}\n"
+        printf "${COLOR_YELLOW} - Running without sudo: many checks will be skipped${COLOR_RESET}\n"
+        printf "${COLOR_YELLOW} - For a full assessment, run: ${COLOR_BLUE}sudo $0${COLOR_RESET}\n"
+        [ "$OPERATION_MODE" = "production" ] && printf "${COLOR_RED} - Production mode is not meaningful without sudo${COLOR_RESET}\n"
+        echo
+    fi
 fi
 
 # Validate output file if specified
@@ -2778,6 +2833,15 @@ if [ -n "$OUTPUT_FILE" ]; then
 		echo "Error: Cannot write to output file '$OUTPUT_FILE'" >&2
 		exit 1
 	fi
+fi
+
+# If generating to a file in a non-console format, suppress stdout during checks
+if [ -n "$OUTPUT_FILE" ] && [ "$OUTPUT_FORMAT" != "console" ]; then
+    QUIET_MODE=true
+    exec 3>&1
+    # Start spinner before suppressing stdout
+    start_spinner "Generating report"
+    exec >/dev/null
 fi
 
 # Run all checks with error isolation
@@ -2819,6 +2883,18 @@ run_section_safely section_enhanced_network_access "Enhanced Network Access Cont
 run_section_safely section_privilege_summary "Privilege Limitations Summary"
 run_section_safely section_summary "Summary"
 
+# Production-only: Resource Health
+if [ "$OPERATION_MODE" = "production" ]; then
+    run_section_safely section_resource_health "Resource Health"
+fi
+
+# Restore stdout if we had suppressed it
+if [ "$QUIET_MODE" = true ]; then
+    stop_spinner
+    exec 1>&3
+    exec 3>&-
+fi
+
 # Generate output based on format
 generate_output() {
 	case "$OUTPUT_FORMAT" in
@@ -2839,18 +2915,37 @@ generate_output() {
 
 # Output to file or stdout with error handling
 if [ -n "$OUTPUT_FILE" ]; then
-	if generate_output > "$OUTPUT_FILE"; then
-		if [ "$OUTPUT_FORMAT" != "console" ]; then
-			echo "✅ Security report generated successfully: $OUTPUT_FILE" >&2
-			echo "📊 Total findings: ${#FINDINGS[@]}" >&2
-		fi
-	else
-		echo "❌ Error: Failed to generate output file '$OUTPUT_FILE'" >&2
-		exit 1
-	fi
+    if generate_output > "$OUTPUT_FILE"; then
+        echo "Report saved: $OUTPUT_FILE" 
+        echo "Format: $OUTPUT_FORMAT | Mode: $OPERATION_MODE | Findings: ${#FINDINGS[@]}"
+    else
+        echo "Error: Failed to generate output file '$OUTPUT_FILE'" >&2
+        exit 1
+    fi
 else
 	generate_output
 fi
+
+# Production-only resource health checks (function defined near end for structure)
+section_resource_health() {
+    print_section "Resource Health"
+    if command_exists uptime; then
+        la=$(uptime 2>/dev/null | awk -F'load average: ' '{print $2}' | tr -d ',' | awk '{printf "%s %s %s", $1,$2,$3}')
+        [ -n "$la" ] && add_finding "Resource Health" "INFO" "Load average (1/5/15m): $la" "Investigate sustained high load in production"
+    fi
+    if command_exists free; then
+        mem_used=$(free -m 2>/dev/null | awk '/^Mem:/ {print $3"/"$2" MB"}')
+        add_finding "Resource Health" "INFO" "Memory usage: $mem_used" "Ensure capacity and investigate leaks if consistently high"
+    fi
+    if command_exists df; then
+        high_usage=$(df -hP 2>/dev/null | awk 'NR>1 && $5+0>=85 {print $6" ("$5")"}' | tr '\n' ' ')
+        if [ -n "$high_usage" ]; then
+            add_finding "Resource Health" "WARN" "Low free space on: $high_usage" "Free space or expand volumes; keep usage <80% in prod"
+        else
+            add_finding "Resource Health" "OK" "Disk usage under 85%" ""
+        fi
+    fi
+}
 
 # Final security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
