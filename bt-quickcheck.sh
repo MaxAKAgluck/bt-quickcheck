@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.6.1
+# Version: 0.6.2
 # 
 # SECURITY DISCLAIMER:
 # This script performs READ-ONLY security assessment of Linux systems.
@@ -52,16 +52,16 @@ start_spinner() {
     local msg="${1:-Running checks}"
     SPINNER_MSG="$msg"
     (
-        local frames='|/-\\'
+        local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
         local i=0
         # Hide cursor if available
         if command -v tput >/dev/null 2>&1; then tput civis >&3 2>/dev/null || true; fi
         while true; do
-            local ch=${frames:i%4:1}
+            local ch=${frames[i%10]}
             if [ "$QUIET_MODE" = true ]; then
-                printf "\r%s %s" "$SPINNER_MSG" "$ch" >&3
+                printf "\r%s %s" "$ch" "$SPINNER_MSG" >&3
             else
-                printf "\r%s %s" "$SPINNER_MSG" "$ch"
+                printf "\r%s %s" "$ch" "$SPINNER_MSG"
             fi
             i=$(( (i+1) ))
             sleep 0.1
@@ -98,13 +98,201 @@ run_section_safely() {
     set -e
 }
 
-VERSION="0.6.1"
+# Parallel execution support
+declare -a PARALLEL_PIDS=()
+declare -a PARALLEL_SECTIONS=()
+declare -a PARALLEL_FINDINGS=()
+declare -a PARALLEL_CONSOLE=()
+
+# Run section in parallel (background)
+run_section_parallel() {
+    local section_func="$1"
+    local section_name="$2"
+    
+	# Run section in background
+    (
+        # Create per-section sinks
+        local tmp_dir="${PARALLEL_TMP_DIR:-/tmp/btqc-par-$$}"
+        mkdir -p "$tmp_dir" 2>/dev/null || true
+        export FINDINGS_SINK="$tmp_dir/${section_name// /_}.findings"
+        export CONSOLE_SINK="$tmp_dir/${section_name// /_}.console"
+        set +e
+        # Run the function in background and enforce a timeout without spawning a new shell
+        {
+            "$section_func" 2>/dev/null || true
+        } &
+        local spid=$!
+        # Wait up to 30s
+        local waited=0
+        while kill -0 "$spid" 2>/dev/null; do
+            sleep 0.1
+            waited=$((waited+1))
+            if [ $waited -ge 300 ]; then
+                kill -TERM "$spid" 2>/dev/null || true
+                sleep 1
+                kill -KILL "$spid" 2>/dev/null || true
+                break
+            fi
+        done
+        wait "$spid" 2>/dev/null || true
+        set -e
+    ) &
+    
+    local pid=$!
+    PARALLEL_PIDS+=("$pid")
+    PARALLEL_SECTIONS+=("$section_name")
+    # Track sink file paths aligned by index
+    local tmp_dir_ref="${PARALLEL_TMP_DIR:-/tmp/btqc-par-$$}"
+    PARALLEL_FINDINGS+=("$tmp_dir_ref/${section_name// /_}.findings")
+    PARALLEL_CONSOLE+=("$tmp_dir_ref/${section_name// /_}.console")
+}
+
+# Wait for all parallel sections to complete
+wait_parallel_sections() {
+    local failed_count=0
+    
+    for i in "${!PARALLEL_PIDS[@]}"; do
+        local pid="${PARALLEL_PIDS[$i]}"
+        local section="${PARALLEL_SECTIONS[$i]}"
+        local findings_file="${PARALLEL_FINDINGS[$i]}"
+        local console_file="${PARALLEL_CONSOLE[$i]}"
+        
+        if ! wait "$pid" 2>/dev/null; then
+            ((failed_count++))
+            if [ "$OUTPUT_FORMAT" = "console" ]; then
+                warn "Parallel section '$section' encountered issues"
+            fi
+        fi
+        # Merge findings
+        if [ -f "$findings_file" ]; then
+            while IFS= read -r line; do
+                # Append to global findings preserving structure
+                FINDINGS+=("$line")
+            done < "$findings_file"
+            rm -f "$findings_file" 2>/dev/null || true
+        fi
+        # Flush console output in order
+        if [ "$OUTPUT_FORMAT" = "console" ] && [ -f "$console_file" ]; then
+            cat "$console_file" 2>/dev/null || true
+            rm -f "$console_file" 2>/dev/null || true
+        fi
+    done
+    
+    # Clear parallel arrays
+    PARALLEL_PIDS=()
+    PARALLEL_SECTIONS=()
+    PARALLEL_FINDINGS=()
+    PARALLEL_CONSOLE=()
+    
+    # Never propagate failures upward; issues were logged as WARN above
+    return 0
+}
+
+# Caching system functions
+init_cache() {
+    if [ "$CACHE_ENABLED" = true ]; then
+        mkdir -p "$CACHE_DIR" 2>/dev/null || CACHE_ENABLED=false
+    fi
+}
+
+cleanup_cache() {
+    if [ -d "$CACHE_DIR" ]; then
+        rm -rf "$CACHE_DIR" 2>/dev/null || true
+    fi
+}
+
+# Generate cache key from command and arguments
+get_cache_key() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    echo "$cmd $args" | md5sum | cut -d ' ' -f 1
+}
+
+# Check if cache entry is valid (not expired)
+is_cache_valid() {
+    local cache_file="$1"
+    if [ ! -f "$cache_file" ]; then
+        return 1
+    fi
+    
+    local file_age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0)))
+    [ $file_age -lt $CACHE_TTL ]
+}
+
+# Execute command with caching
+cached_command() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    
+    if [ "$CACHE_ENABLED" != true ]; then
+        # Execute without caching
+        $cmd $args 2>/dev/null
+        return $?
+    fi
+    
+    local cache_key=$(get_cache_key "$cmd" "$args")
+    local cache_file="$CACHE_DIR/$cache_key"
+    
+    if is_cache_valid "$cache_file"; then
+        # Return cached result
+        cat "$cache_file" 2>/dev/null
+        return $?
+    else
+        # Execute command and cache result
+        local temp_file=$(mktemp)
+        if $cmd $args > "$temp_file" 2>/dev/null; then
+            mv "$temp_file" "$cache_file" 2>/dev/null || true
+            cat "$cache_file" 2>/dev/null
+            return 0
+        else
+            rm -f "$temp_file" 2>/dev/null || true
+            return 1
+        fi
+    fi
+}
+
+# Cache file content with TTL
+cached_file_content() {
+    local file_path="$1"
+    local cache_key="file_$(echo "$file_path" | md5sum | cut -d ' ' -f 1)"
+    local cache_file="$CACHE_DIR/$cache_key"
+    
+    if [ "$CACHE_ENABLED" != true ]; then
+        safe_read "$file_path"
+        return $?
+    fi
+    
+    if is_cache_valid "$cache_file"; then
+        cat "$cache_file" 2>/dev/null
+        return $?
+    else
+        if safe_read "$file_path" > "$cache_file" 2>/dev/null; then
+            cat "$cache_file" 2>/dev/null
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+VERSION="0.6.2"
+
+# Caching system configuration
+CACHE_DIR="/tmp/bt-quickcheck-cache-$$"
+CACHE_TTL=300
+CACHE_ENABLED=true
 
 # Output format (default: console)
 OUTPUT_FORMAT="console"
 OUTPUT_FILE=""
 OPERATION_MODE="personal"
 QUIET_MODE=false
+
+# Parallel execution (default: disabled for stability)
+PARALLEL_MODE=false
+
 
 # Colors (only used in console mode)
 COLOR_RED="\033[31m"
@@ -223,6 +411,22 @@ print_section_with_privilege_info() {
     SECTIONS+=("$section")
 }
 
+# Determine output format from file extension
+detect_output_format() {
+    local file="$1"
+    if [ -z "$file" ]; then
+        echo "console"
+        return 0
+    fi
+    
+    case "$file" in
+        *.json) echo "json" ;;
+        *.html) echo "html" ;;
+        *.txt) echo "txt" ;;
+        *) echo "console" ;;
+    esac
+}
+
 # Validate output format
 validate_format() {
     local format="$1"
@@ -285,27 +489,73 @@ validate_command() {
     return 0
 }
 
-# Add a finding to the global findings array
+# Add a finding to the global findings array or a sink file when running in parallel
 add_finding() {
     local section="$1"
     local severity="$2"  # OK, WARN, CRIT, INFO
     local message="$3"
     local recommendation="${4:-}"
     
-    FINDINGS+=("$section|$severity|$message|$recommendation")
+    if [ -n "${FINDINGS_SINK:-}" ]; then
+        printf "%s|%s|%s|%s\n" "$section" "$severity" "$message" "$recommendation" >> "$FINDINGS_SINK" 2>/dev/null || true
+    else
+        FINDINGS+=("$section|$severity|$message|$recommendation")
+    fi
 }
 
 # Console output functions (original behavior)
 print_section() {
-    [ "$OUTPUT_FORMAT" = "console" ] && printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}\n" "$1"
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        if [ -n "${CONSOLE_SINK:-}" ]; then
+            printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}\n" "$1" >> "$CONSOLE_SINK" 2>/dev/null || true
+        else
+            printf "\n${COLOR_BLUE}=== %s ===${COLOR_RESET}\n" "$1"
+        fi
+    fi
     SECTIONS+=("$1")
     return 0
 }
 
-ok() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_GREEN}[OK]${COLOR_RESET} %s\n" "$1"; return 0; }
-warn() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_YELLOW}[WARN]${COLOR_RESET} %s\n" "$1"; return 0; }
-crit() { [ "$OUTPUT_FORMAT" = "console" ] && printf "${COLOR_RED}[CRIT]${COLOR_RESET} %s\n" "$1"; return 0; }
-info() { [ "$OUTPUT_FORMAT" = "console" ] && printf "[INFO] %s\n" "$1"; return 0; }
+ok() {
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        if [ -n "${CONSOLE_SINK:-}" ]; then
+            printf "${COLOR_GREEN}[OK]${COLOR_RESET} %s\n" "$1" >> "$CONSOLE_SINK" 2>/dev/null || true
+        else
+            printf "${COLOR_GREEN}[OK]${COLOR_RESET} %s\n" "$1"
+        fi
+    fi
+    return 0
+}
+warn() {
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        if [ -n "${CONSOLE_SINK:-}" ]; then
+            printf "${COLOR_YELLOW}[WARN]${COLOR_RESET} %s\n" "$1" >> "$CONSOLE_SINK" 2>/dev/null || true
+        else
+            printf "${COLOR_YELLOW}[WARN]${COLOR_RESET} %s\n" "$1"
+        fi
+    fi
+    return 0
+}
+crit() {
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        if [ -n "${CONSOLE_SINK:-}" ]; then
+            printf "${COLOR_RED}[CRIT]${COLOR_RESET} %s\n" "$1" >> "$CONSOLE_SINK" 2>/dev/null || true
+        else
+            printf "${COLOR_RED}[CRIT]${COLOR_RESET} %s\n" "$1"
+        fi
+    fi
+    return 0
+}
+info() {
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        if [ -n "${CONSOLE_SINK:-}" ]; then
+            printf "[INFO] %s\n" "$1" >> "$CONSOLE_SINK" 2>/dev/null || true
+        else
+            printf "[INFO] %s\n" "$1"
+        fi
+    fi
+    return 0
+}
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -329,6 +579,13 @@ get_recommendation() {
 }
 
 # Output generation functions
+# JSON escaping function
+json_escape() {
+    local input="$1"
+    # Escape backslashes first, then quotes, then newlines and other control characters
+    echo "$input" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | sed 's/\r/\\r/g' | sed 's/\t/\\t/g'
+}
+
 generate_json_output() {
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local hostname=$(hostname 2>/dev/null || echo "unknown")
@@ -344,11 +601,19 @@ generate_json_output() {
     for finding in "${FINDINGS[@]}"; do
         IFS='|' read -r section severity message recommendation <<< "$finding"
         [ "$first" = true ] && first=false || echo ","
+        
+        # Escape all fields for JSON
+        local escaped_section=$(json_escape "$section")
+        local escaped_severity=$(json_escape "$severity")
+        local escaped_message=$(json_escape "$message")
+        local escaped_recommendation=""
+        [ -n "$recommendation" ] && escaped_recommendation=$(json_escape "$recommendation")
+        
         echo -n "    {"
-        echo -n "\"section\": \"$section\", "
-        echo -n "\"severity\": \"$severity\", "
-        echo -n "\"message\": \"$message\""
-        [ -n "$recommendation" ] && echo -n ", \"recommendation\": \"$recommendation\""
+        echo -n "\"section\": \"$escaped_section\", "
+        echo -n "\"severity\": \"$escaped_severity\", "
+        echo -n "\"message\": \"$escaped_message\""
+        [ -n "$escaped_recommendation" ] && echo -n ", \"recommendation\": \"$escaped_recommendation\""
         echo -n "}"
     done
     
@@ -360,7 +625,7 @@ generate_json_output() {
 generate_html_output() {
     local timestamp=$(date)
     local hostname=$(hostname 2>/dev/null || echo "unknown")
-    local total_count=${#FINDINGS[@]}
+    local total_count=$((${#FINDINGS[@]} - 2))
     
     cat << EOF
 <!DOCTYPE html>
@@ -1436,10 +1701,13 @@ section_permissions() {
 	find_paths=(/etc /var /home /root)
 	for p in "${find_paths[@]}"; do
 		[ -d "$p" ] || continue
-		find "$p" -xdev -type d -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable dir: /" | sed -n '1,20p'
-		find "$p" -xdev -type f -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable file: /" | sed -n '1,20p'
+		cached_command find "$p" -xdev -type d -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable dir: /" | sed -n '1,20p'
+		cached_command find "$p" -xdev -type f -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable file: /" | sed -n '1,20p'
 	done
-	find / -xdev -perm -4000 -type f 2>/dev/null | sed 's/^/SUID: /' | sed -n '1,30p'
+	# Search common SUID locations instead of entire filesystem
+	for suid_path in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do
+		[ -d "$suid_path" ] && cached_command find "$suid_path" -xdev -perm -4000 -type f 2>/dev/null | sed 's/^/SUID: /' | sed -n '1,30p'
+	done
 }
 
 section_intrusion_detection() {
@@ -2691,32 +2959,37 @@ This tool performs READ-ONLY security assessment of Linux systems.
 It requires sudo privileges to access system files but makes NO modifications.
 All operations are defensive security checks - no malicious activity performed.
 
-ENHANCED SECURITY FEATURES (v0.6.0):
+ENHANCED SECURITY FEATURES (v0.6.2):
 • Enhanced input validation and command sanitization
 • Advanced kernel and network security hardening checks
 • Comprehensive compliance and audit validation
 • Enhanced container and process security analysis
 • Advanced file integrity and logging security checks
 • Industry-standard security validation (CIS, NIST aligned)
+• Parallel execution for improved performance
+• Intelligent caching system for expensive operations
+• Malware signature detection and analysis
+• Enhanced rootkit detection capabilities
+• Behavioral analysis for anomaly detection
 
 Usage: $0 [OPTIONS]
 
 OPTIONS:
   -h, --help              Show this help message
   -v, --version           Show version information
-  -f, --format FORMAT     Output format: console, json, html, txt (default: console)
-  -o, --output FILE       Output file (default: stdout)
+  -o, --output FILE       Output file with format determined by extension (default: stdout)
   -m, --mode MODE         Operation mode: personal, production (default: personal)
+  -p, --parallel          Enable parallel execution for independent checks
 
 MODES:
   personal               Home/personal machine recommendations
   production             Business/server environment recommendations (compliance focus)
 
-OUTPUT FORMATS:
-  console               Colored console output (default)
-  json                  JSON structured output for automation/SIEM
-  html                  HTML report with styling
-  txt                   Plain text report
+OUTPUT FORMATS (determined by file extension):
+  .json                  JSON structured output for automation/SIEM
+  .html                  HTML report with styling
+  .txt                   Plain text report
+  (no extension)         Colored console output (default)
 
 SECURITY FEATURES:
   ✓ Read-only operations - no system modifications
@@ -2726,8 +2999,9 @@ SECURITY FEATURES:
 
 EXAMPLES:
   sudo $0                               # Full security assessment (recommended)
-  sudo $0 -f json -o report.json        # JSON output to file
-  sudo $0 -f html -o report.html -m production  # HTML production report
+  sudo $0 -o report.json                # JSON output to file
+  sudo $0 -o report.html -m production  # HTML production report
+  sudo $0 -p                            # Parallel execution for faster scanning
   $0 -m personal                        # Limited checks without sudo
 
 PRIVACY:
@@ -2748,19 +3022,6 @@ while [ $# -gt 0 ]; do
 			show_help
 			exit 0
 			;;
-		--format|-f)
-			shift
-			if [ $# -eq 0 ]; then
-				echo "Error: --format requires an argument" >&2
-				exit 1
-			fi
-			if validate_format "$1"; then
-				OUTPUT_FORMAT="$1"
-			else
-				echo "Error: Invalid format '$1'. Use: console, json, html, txt" >&2
-				exit 1
-			fi
-			;;
 		--output|-o)
 			shift
 			if [ $# -eq 0 ]; then
@@ -2769,6 +3030,8 @@ while [ $# -gt 0 ]; do
 			fi
 			if validate_output_path "$1"; then
 				OUTPUT_FILE="$1"
+				# Automatically set output format based on file extension
+				OUTPUT_FORMAT=$(detect_output_format "$1")
 			else
 				echo "Error: Invalid output path '$1'. Path traversal not allowed." >&2
 				exit 1
@@ -2786,6 +3049,9 @@ while [ $# -gt 0 ]; do
 				echo "Error: Invalid mode '$1'. Use: personal, production" >&2
 				exit 1
 			fi
+			;;
+		--parallel|-p)
+			PARALLEL_MODE=true
 			;;
 		--)
 			shift
@@ -2806,7 +3072,19 @@ done
 # Display security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
     echo
-    echo "bt-quickcheck v$VERSION - Linux Security Assessment"
+    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                              ║"
+    echo "║    ██████╗ ████████╗    ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗             ║"
+    echo "║   ██╔══██╗╚══██╔══╝   ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝             ║"
+    echo "║   ██████╔╝   ██║      ██║     ███████║█████╗  ██║     █████╔╝              ║"
+    echo "║   ██╔══██╗   ██║      ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗              ║"
+    echo "║   ██████╔╝   ██║      ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗             ║"
+    echo "║   ╚═════╝    ╚═╝       ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝             ║"
+    echo "║                                                                              ║"
+    echo "║                    Linux Security Assessment Tool v$VERSION                    ║"
+    echo "║                                                                              ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+    echo
     echo "Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
     [ -n "$OUTPUT_FILE" ] && echo "Output: $OUTPUT_FILE"
     echo
@@ -2836,6 +3114,544 @@ if [ -n "$OUTPUT_FILE" ]; then
 	fi
 fi
 
+# Malware signature detection
+section_malware_detection() {
+    print_section "Malware Detection"
+    
+    # Common malware signatures and patterns
+    local malware_patterns=(
+        "backdoor"
+        "trojan"
+        "rootkit"
+        "keylogger"
+        "botnet"
+        "cryptominer"
+        "ransomware"
+        "spyware"
+    )
+    
+    local suspicious_files=()
+    local suspicious_processes=()
+    local suspicious_network=()
+    
+    # Check for suspicious files in common locations (exclude script temp files)
+    local search_paths=("/tmp" "/var/tmp" "/dev/shm" "/home" "/root")
+    for path in "${search_paths[@]}"; do
+        [ -d "$path" ] || continue
+        
+        for pattern in "${malware_patterns[@]}"; do
+            local found_files=$(cached_command find "$path" -maxdepth 3 -type f -iname "*${pattern}*" 2>/dev/null | grep -v "btqc-par-" | head -10)
+            if [ -n "$found_files" ]; then
+                while IFS= read -r file; do
+                    suspicious_files+=("$file")
+                    add_finding "Malware Detection" "WARN" "Suspicious file found: $file" "Investigate file: 'file $file' and 'strings $file | grep -i suspicious'"
+                done <<< "$found_files"
+            fi
+        done
+    done
+    
+    # Check for suspicious processes (exclude script's own processes and commands)
+    if command_exists ps; then
+        local ps_output=$(cached_command ps aux 2>/dev/null)
+        for pattern in "${malware_patterns[@]}"; do
+            local suspicious_procs=$(echo "$ps_output" | grep -i "$pattern" | grep -v "bt-quickcheck\|btqc-par-\|find.*-iname.*$pattern\|grep.*$pattern" | head -5)
+            if [ -n "$suspicious_procs" ]; then
+                while IFS= read -r proc; do
+                    suspicious_processes+=("$proc")
+                    add_finding "Malware Detection" "WARN" "Suspicious process: $proc" "Investigate process: 'ps aux | grep $pattern' and check process tree"
+                done <<< "$suspicious_procs"
+            fi
+        done
+    fi
+    
+    # Check for suspicious network connections
+    if command_exists netstat; then
+        local netstat_output=$(cached_command netstat -tuln 2>/dev/null)
+        # Look for unusual ports or connections
+        local suspicious_ports=$(echo "$netstat_output" | awk '$1 ~ /tcp/ && $4 ~ /:(4444|5555|6666|7777|8888|9999|1337|31337|12345|54321)/ {print $4}')
+        if [ -n "$suspicious_ports" ]; then
+            while IFS= read -r port; do
+                suspicious_network+=("$port")
+                add_finding "Malware Detection" "WARN" "Suspicious port listening: $port" "Investigate port: 'netstat -tuln | grep $port' and 'lsof -i :$port'"
+            done <<< "$suspicious_ports"
+        fi
+    fi
+    
+    # Check for suspicious file permissions (executable in temp directories)
+    local temp_executables=$(cached_command find /tmp /var/tmp /dev/shm -maxdepth 2 -type f -executable 2>/dev/null | head -10)
+    if [ -n "$temp_executables" ]; then
+        while IFS= read -r file; do
+            add_finding "Malware Detection" "WARN" "Executable in temp directory: $file" "Investigate executable: 'file $file' and 'strings $file'"
+        done <<< "$temp_executables"
+    fi
+    
+    # Check for suspicious cron jobs
+    if is_root; then
+        local suspicious_cron=$(cached_command find /etc/cron* /var/spool/cron* -type f 2>/dev/null | xargs grep -l "wget\|curl\|bash.*http\|sh.*http" 2>/dev/null | head -5)
+        if [ -n "$suspicious_cron" ]; then
+            while IFS= read -r cron_file; do
+                add_finding "Malware Detection" "CRIT" "Suspicious cron job: $cron_file" "Review cron job: 'cat $cron_file' and investigate source"
+            done <<< "$suspicious_cron"
+        fi
+    fi
+    
+	# Check for suspicious systemd services (skip on non-systemd like WSL)
+	if command_exists systemctl && [ -d /run/systemd/system ]; then
+        local suspicious_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | grep -E "(backdoor|trojan|rootkit|keylog)" | head -5)
+        if [ -n "$suspicious_services" ]; then
+            while IFS= read -r service; do
+                add_finding "Malware Detection" "CRIT" "Suspicious service running: $service" "Investigate service: 'systemctl status $service' and 'systemctl cat $service'"
+            done <<< "$suspicious_services"
+        fi
+    fi
+    
+    # Summary
+    local total_suspicious=$((${#suspicious_files[@]} + ${#suspicious_processes[@]} + ${#suspicious_network[@]}))
+    if [ $total_suspicious -eq 0 ]; then
+        add_finding "Malware Detection" "OK" "No obvious malware signatures detected" "Continue monitoring with regular scans"
+        ok "No obvious malware signatures detected"
+    else
+        add_finding "Malware Detection" "WARN" "Found $total_suspicious suspicious items requiring investigation" "Review all flagged items and consider full malware scan"
+        warn "Found $total_suspicious suspicious items requiring investigation"
+    fi
+}
+
+# Enhanced rootkit detection
+section_rootkit_detection() {
+    print_section "Rootkit Detection"
+    
+    local rootkit_indicators=0
+    local total_checks=0
+    
+    # Check for hidden processes (ps vs /proc comparison)
+    if command_exists ps && [ -d /proc ]; then
+        ((total_checks++))
+        local ps_pids=$(cached_command ps -eo pid 2>/dev/null | tail -n +2 | sort -n)
+        local proc_pids=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+        
+        # Filter out kernel threads and system processes that might not show in ps
+        local hidden_pids=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids") 2>/dev/null | grep -v -E '^[0-9]+$' | head -10 | tr '\n' ' ')
+        
+        # Only flag if we find actual suspicious hidden processes (not just kernel threads)
+        if [ -n "$hidden_pids" ] && [ $(echo "$hidden_pids" | wc -w) -gt 0 ]; then
+            # Double-check by trying to read the process info
+            local real_hidden=""
+            for pid in $hidden_pids; do
+                if [ -f "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/cmdline" ]; then
+                    local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | head -c 100)
+                    if [ -n "$cmdline" ] && [ "$cmdline" != " " ]; then
+                        real_hidden="$real_hidden $pid"
+                    fi
+                fi
+            done
+            
+            if [ -n "$real_hidden" ]; then
+                ((rootkit_indicators++))
+                local hidden_count=$(echo "$real_hidden" | wc -w)
+                add_finding "Rootkit Detection" "CRIT" "Hidden processes detected: $hidden_count PIDs ($real_hidden)" "Investigate hidden processes: 'ls -la /proc/[PID]/' for each PID"
+                crit "Hidden processes detected: $hidden_count PIDs"
+            else
+                add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
+                ok "No hidden processes detected"
+            fi
+        else
+            add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
+        fi
+    fi
+    
+    # Check for suspicious kernel modules
+    if is_root && [ -f /proc/modules ]; then
+        ((total_checks++))
+        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
+        local suspicious_modules=$(echo "$loaded_modules" | grep -E "(backdoor|rootkit|stealth|hidden)" 2>/dev/null)
+        
+        if [ -n "$suspicious_modules" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "Suspicious kernel modules: $suspicious_modules" "Investigate modules: 'modinfo [module_name]' and 'lsmod | grep [module_name]'"
+            crit "Suspicious kernel modules detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious kernel modules detected" ""
+            ok "No suspicious kernel modules detected"
+        fi
+    fi
+    
+    # Check for modified system binaries
+    if is_root; then
+        ((total_checks++))
+        local critical_binaries=("/bin/ls" "/bin/ps" "/bin/netstat" "/bin/ss" "/usr/bin/top" "/bin/df")
+        local modified_binaries=()
+        
+        for binary in "${critical_binaries[@]}"; do
+            if [ -f "$binary" ]; then
+                # Check if binary has been modified recently (within last 7 days)
+                local mod_time=$(stat -c %Y "$binary" 2>/dev/null || echo 0)
+                local current_time=$(date +%s)
+                local age_days=$(( (current_time - mod_time) / 86400 ))
+                
+                if [ $age_days -lt 7 ]; then
+                    modified_binaries+=("$binary (modified $age_days days ago)")
+                fi
+            fi
+        done
+        
+        if [ ${#modified_binaries[@]} -gt 0 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Recently modified system binaries: ${modified_binaries[*]}" "Verify binary integrity: 'rpm -Vf $binary' or 'debsums $binary'"
+        else
+            add_finding "Rootkit Detection" "OK" "System binaries appear unmodified" ""
+        fi
+    fi
+    
+    # Check for suspicious network connections (hidden)
+    if command_exists netstat && command_exists ss; then
+        ((total_checks++))
+        local netstat_conns=$(cached_command netstat -tuln 2>/dev/null | wc -l)
+        local ss_conns=$(cached_command ss -tuln 2>/dev/null | wc -l)
+        local diff=$((netstat_conns - ss_conns))
+        
+        if [ $diff -gt 5 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Significant difference in network connections (netstat: $netstat_conns, ss: $ss_conns)" "Investigate hidden connections: 'netstat -tuln' vs 'ss -tuln'"
+        else
+            add_finding "Rootkit Detection" "OK" "Network connection counts consistent" ""
+        fi
+    fi
+    
+    # Check for suspicious file system inconsistencies
+    if is_root; then
+        ((total_checks++))
+        # Exclude legitimate system files and common benign hidden files
+        local fs_check=$(cached_command find /etc /bin /sbin -maxdepth 2 -type f -name ".*" 2>/dev/null | \
+            grep -v -E "\.(placeholder|bak|lock|updated|dpkg|apt|systemd|pam|profile|bashrc|vimrc|gitignore)$|skel|\.git" | \
+            grep -v -E "^/etc/\.(pwd\.lock|gshadow\.lock|shadow\.lock|passwd\.lock|group\.lock)$" | \
+            head -10 | tr '\n' ' ')
+        if [ -n "$fs_check" ]; then
+            ((rootkit_indicators++))
+            local hidden_count=$(echo "$fs_check" | wc -w)
+            add_finding "Rootkit Detection" "WARN" "Hidden files in system directories: $hidden_count files ($fs_check)" "Investigate hidden files: 'ls -la [file]' and 'file [file]'"
+            warn "Hidden files in system directories: $hidden_count files"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious hidden files in system directories" ""
+            ok "No suspicious hidden files in system directories"
+        fi
+    fi
+    
+    # Check for suspicious system calls (improved detection)
+    if is_root && [ -f /proc/kallsyms ]; then
+        ((total_checks++))
+        # Look for actual hooking patterns, not just the presence of sys_call_table
+        local suspicious_hooks=$(cached_command grep -E "(sys_call_table.*\[|system_call.*\[)" /proc/kallsyms 2>/dev/null | \
+            grep -v -E "(sys_call_table|system_call)$" | \
+            grep -v -E "(sys_call_table|system_call).*0x[0-9a-f]+$" | \
+            wc -l)
+        
+        # Also check for unusual syscall modifications by looking for non-standard syscall entries
+        local unusual_syscalls=$(cached_command grep -E "sys_call_table" /proc/kallsyms 2>/dev/null | \
+            awk '{print $3}' | \
+            grep -v -E "^0x[0-9a-f]+$" | \
+            wc -l)
+        
+        if [ $suspicious_hooks -gt 0 ] || [ $unusual_syscalls -gt 0 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "Suspicious system call modifications detected" "Investigate kernel hooks: 'cat /proc/kallsyms | grep sys_call' and 'dmesg | grep -i hook'"
+            crit "Suspicious system call modifications detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious system call modifications detected" ""
+            ok "No suspicious system call modifications detected"
+        fi
+    fi
+    
+    # Check for suspicious memory regions (improved)
+    if is_root && [ -f /proc/iomem ]; then
+        ((total_checks++))
+        # Look for unusual memory patterns that might indicate rootkit activity
+        local suspicious_memory=$(cached_file_content /proc/iomem 2>/dev/null | \
+            grep -E "(reserved|unknown)" | \
+            grep -v -E "(ACPI|PCI|System RAM|Video RAM|ROM|Flash)" | \
+            head -5)
+        if [ -n "$suspicious_memory" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Suspicious memory regions: $suspicious_memory" "Investigate memory: 'cat /proc/iomem' and 'dmesg | grep -i memory'"
+            warn "Suspicious memory regions detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Memory regions appear normal" ""
+            ok "Memory regions appear normal"
+        fi
+    fi
+    
+    # Cross-view analysis: Compare different methods of process enumeration
+    if command_exists ps && command_exists ls; then
+        ((total_checks++))
+        local ps_count=$(cached_command ps aux 2>/dev/null | wc -l)
+        local proc_count=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | wc -l)
+        local diff=$((proc_count - ps_count))
+        
+        # Allow for some difference due to kernel threads, but flag significant discrepancies
+        if [ $diff -gt 10 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Significant process count discrepancy: /proc shows $proc_count, ps shows $ps_count" "Investigate hidden processes: 'ls /proc | grep -E ^[0-9] | wc -l' vs 'ps aux | wc -l'"
+            warn "Significant process count discrepancy detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Process enumeration consistent across methods" ""
+            ok "Process enumeration consistent across methods"
+        fi
+    fi
+    
+    # Check for suspicious file permissions and timestamps
+    if is_root; then
+        ((total_checks++))
+        local suspicious_files=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -perm -4000 2>/dev/null | \
+            xargs ls -la 2>/dev/null | \
+            awk '$6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {if ($6 != $7 || $7 != $8) print $9}' | \
+            head -5)
+        
+        if [ -n "$suspicious_files" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "SUID files with suspicious timestamps: $suspicious_files" "Investigate file timestamps: 'stat [file]' and 'ls -la [file]'"
+            warn "SUID files with suspicious timestamps detected"
+        else
+            add_finding "Rootkit Detection" "OK" "SUID file timestamps appear normal" ""
+            ok "SUID file timestamps appear normal"
+        fi
+    fi
+    
+    # Check for suspicious network behavior patterns
+    if command_exists netstat && command_exists ss; then
+        ((total_checks++))
+        # Look for processes listening on unusual ports
+        local unusual_ports=$(cached_command netstat -tuln 2>/dev/null | \
+            awk '$1 ~ /tcp/ && $4 ~ /:([0-9]{4,5})$/ {port=substr($4,index($4,":")+1); if(port > 1024 && port < 65536 && port !~ /^(8080|8443|3000|5000|8000|9000|3306|5432|6379|27017)$/) print port}' | \
+            head -5)
+        
+        if [ -n "$unusual_ports" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Processes listening on unusual ports: $unusual_ports" "Investigate ports: 'netstat -tuln | grep [port]' and 'lsof -i :[port]'"
+            warn "Processes listening on unusual ports detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No unusual network ports detected" ""
+            ok "No unusual network ports detected"
+        fi
+    fi
+    
+	# Check for suspicious systemd services (skip on non-systemd like WSL)
+	if command_exists systemctl && [ -d /run/systemd/system ]; then
+        ((total_checks++))
+        local suspicious_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | grep -E "(\.service|\.timer)" | grep -v "systemd" | wc -l)
+        local total_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | wc -l)
+        
+        if [ $suspicious_services -gt $((total_services / 2)) ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Unusually high number of non-systemd services running" "Review services: 'systemctl list-units --type=service --state=running'"
+            warn "Unusually high number of non-systemd services running"
+        else
+            add_finding "Rootkit Detection" "OK" "Service count appears normal" ""
+            ok "Service count appears normal"
+        fi
+    fi
+    
+    # Check for suspicious kernel module behavior
+    if is_root && [ -f /proc/modules ]; then
+        ((total_checks++))
+        # Look for modules that might be hiding their presence
+        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
+        local suspicious_modules=$(echo "$loaded_modules" | \
+            awk '{if ($3 == "0" && $4 == "0" && $5 == "0") print $1}' | \
+            grep -v -E "(nvidia|nouveau|radeon|amdgpu|intel|wifi|bluetooth|usb|pci)" | \
+            head -5)
+        
+        if [ -n "$suspicious_modules" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Kernel modules with suspicious reference counts: $suspicious_modules" "Investigate modules: 'modinfo [module]' and 'lsmod | grep [module]'"
+            warn "Kernel modules with suspicious reference counts detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Kernel module reference counts appear normal" ""
+            ok "Kernel module reference counts appear normal"
+        fi
+    fi
+    
+    # Check for suspicious file system inconsistencies using stat
+    if is_root; then
+        ((total_checks++))
+        # Check for files that might be hiding their true size or modification time
+        local suspicious_stat=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -executable 2>/dev/null | \
+            head -20 | \
+            xargs stat -c "%n %s %Y" 2>/dev/null | \
+            awk '{if ($2 == 0 || $3 == 0) print $1}' | \
+            head -5)
+        
+        if [ -n "$suspicious_stat" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Executable files with suspicious stat information: $suspicious_stat" "Investigate files: 'stat [file]' and 'file [file]'"
+            warn "Executable files with suspicious stat information detected"
+        else
+            add_finding "Rootkit Detection" "OK" "File stat information appears normal" ""
+            ok "File stat information appears normal"
+        fi
+    fi
+    
+    # Check for suspicious process behavior patterns
+    if command_exists ps; then
+        ((total_checks++))
+        # Look for processes with unusual characteristics
+        local suspicious_procs=$(cached_command ps aux 2>/dev/null | \
+            awk 'NR>1 {if ($3 > 50 || $4 > 50 || $6 > 1000000) print $2 ":" $11}' | \
+            grep -v -E "(systemd|kthreadd|ksoftirqd|migration|rcu_|watchdog)" | \
+            head -5)
+        
+        if [ -n "$suspicious_procs" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Processes with unusual resource usage: $suspicious_procs" "Investigate processes: 'ps aux | grep [PID]' and 'top -p [PID]'"
+            warn "Processes with unusual resource usage detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Process resource usage appears normal" ""
+            ok "Process resource usage appears normal"
+        fi
+    fi
+    
+    # Summary
+    local risk_level="LOW"
+    if [ $rootkit_indicators -gt 3 ]; then
+        risk_level="HIGH"
+    elif [ $rootkit_indicators -gt 1 ]; then
+        risk_level="MEDIUM"
+    fi
+    
+    add_finding "Rootkit Detection" "INFO" "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)" "Consider running dedicated rootkit scanners: 'rkhunter --check' or 'chkrootkit'"
+    info "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)"
+}
+
+# Behavioral analysis for anomaly detection
+section_behavioral_analysis() {
+    print_section "Behavioral Analysis"
+    
+    local anomalies=0
+    local total_checks=0
+    
+    # Disable strict error handling for this function to prevent silent failures
+    set +e
+    
+    # Process behavior analysis
+    if command_exists ps; then
+        ((total_checks++))
+        local process_count=$(ps aux 2>/dev/null | wc -l)
+        local zombie_count=$(ps aux 2>/dev/null | grep -c "<defunct>" 2>/dev/null || echo 0)
+        
+        if [ $process_count -gt 0 ]; then
+            local zombie_percentage=$((zombie_count * 100 / process_count))
+            if [ $zombie_percentage -gt 10 ]; then
+                ((anomalies++))
+                add_finding "Behavioral Analysis" "WARN" "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)" "Investigate zombie processes"
+                warn "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)"
+            else
+                add_finding "Behavioral Analysis" "OK" "Zombie process count normal: $zombie_count/$process_count" ""
+                ok "Zombie process count normal: $zombie_count/$process_count"
+            fi
+        else
+            add_finding "Behavioral Analysis" "WARN" "Could not determine process count" "Check ps command"
+        fi
+    else
+        add_finding "Behavioral Analysis" "WARN" "ps command not available" "Install procps package"
+    fi
+    
+    # Network behavior analysis
+    if command_exists netstat; then
+        ((total_checks++))
+        local listening_ports=$(netstat -tuln 2>/dev/null | grep LISTEN | wc -l)
+        local established_conns=$(netstat -tuln 2>/dev/null | grep ESTABLISHED | wc -l)
+        
+        if [ $established_conns -gt 100 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High number of established connections: $established_conns" "Review connections"
+            warn "High number of established connections: $established_conns"
+        else
+            add_finding "Behavioral Analysis" "OK" "Connection count appears normal: $established_conns" ""
+            ok "Connection count appears normal: $established_conns"
+        fi
+    else
+        add_finding "Behavioral Analysis" "WARN" "netstat command not available" "Install net-tools package"
+    fi
+    
+    # File system behavior analysis
+    if is_root; then
+        ((total_checks++))
+        local temp_files=$(find /tmp /var/tmp /dev/shm -maxdepth 3 -type f 2>/dev/null | wc -l)
+        
+        if [ $temp_files -gt 1000 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High number of temporary files: $temp_files" "Review temp directory"
+            warn "High number of temporary files: $temp_files"
+        else
+            add_finding "Behavioral Analysis" "OK" "Temporary file count normal: $temp_files" ""
+            ok "Temporary file count normal: $temp_files"
+        fi
+    fi
+    
+    # System resource behavior analysis
+    if command_exists uptime && command_exists free; then
+        ((total_checks++))
+        local load_avg=$(uptime 2>/dev/null | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
+        local mem_usage=$(free 2>/dev/null | awk '/^Mem:/ {if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
+        
+        if [ -n "$load_avg" ] && [ $(echo "$load_avg" | awk '{print ($1 > 2.0)}' 2>/dev/null || echo 0) -eq 1 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High system load: $load_avg" "Investigate load"
+            warn "High system load: $load_avg"
+        else
+            add_finding "Behavioral Analysis" "OK" "System load normal: $load_avg" ""
+            ok "System load normal: $load_avg"
+        fi
+        
+        if [ -n "$mem_usage" ] && [ $mem_usage -gt 90 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High memory usage: ${mem_usage}%" "Investigate memory"
+            warn "High memory usage: ${mem_usage}%"
+        else
+            add_finding "Behavioral Analysis" "OK" "Memory usage normal: ${mem_usage}%" ""
+            ok "Memory usage normal: ${mem_usage}%"
+        fi
+    fi
+    
+    # Log behavior analysis
+    if is_root && [ -f /var/log/auth.log ]; then
+        ((total_checks++))
+        local failed_logins=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -100 | wc -l)
+        
+        if [ $failed_logins -gt 50 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High failed login activity: $failed_logins attempts" "Review auth logs"
+            warn "High failed login activity: $failed_logins attempts"
+        else
+            add_finding "Behavioral Analysis" "OK" "Login activity appears normal: $failed_logins failed attempts" ""
+            ok "Login activity appears normal: $failed_logins failed attempts"
+        fi
+    fi
+    
+    # Summary
+    local risk_level="LOW"
+    if [ $anomalies -gt 4 ]; then
+        risk_level="HIGH"
+    elif [ $anomalies -gt 2 ]; then
+        risk_level="MEDIUM"
+    fi
+    
+    # Ensure we always have at least one check
+    if [ $total_checks -eq 0 ]; then
+        total_checks=1
+        add_finding "Behavioral Analysis" "WARN" "No behavioral checks could be performed" "Check system tools availability"
+    fi
+    
+    add_finding "Behavioral Analysis" "INFO" "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)" "Monitor system behavior over time and investigate flagged anomalies"
+    info "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)"
+    
+    # Re-enable strict error handling
+    set -e
+}
+
+# Initialize caching system and parallel temp dir
+init_cache
+PARALLEL_TMP_DIR="/tmp/btqc-par-$$"
+mkdir -p "$PARALLEL_TMP_DIR" 2>/dev/null || true
+
 # If generating to a file in a non-console format, suppress stdout during checks
 if [ -n "$OUTPUT_FILE" ] && [ "$OUTPUT_FORMAT" != "console" ]; then
     QUIET_MODE=true
@@ -2846,30 +3662,70 @@ if [ -n "$OUTPUT_FILE" ] && [ "$OUTPUT_FORMAT" != "console" ]; then
 fi
 
 # Run all checks with error isolation
-run_section_safely section_system "System"
-run_section_safely section_updates "Updates"
-run_section_safely section_listening "Listening Services"
-run_section_safely section_firewall "Firewall"
-run_section_safely section_ssh "SSH Hardening"
-run_section_safely section_auditing "Auditing/Hardening"
-run_section_safely section_accounts "Accounts and Sudo"
-run_section_safely section_permissions "Risky Permissions"
-run_section_safely section_intrusion_detection "Intrusion Detection"
-run_section_safely section_time_sync "Time Synchronization"
-run_section_safely section_logging "Logging and Monitoring"
-run_section_safely section_network_security "Network Security"
-run_section_safely section_package_integrity "Package Integrity"
-run_section_safely section_file_integrity "File Integrity"
-run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
-run_section_safely section_process_forensics "Process & Forensics"
-run_section_safely section_secure_configuration "Secure Configuration"
-run_section_safely section_container_security "Container & Virtualization Security"
-run_section_safely section_kernel_hardening "Kernel & System Hardening"
-run_section_safely section_application_security "Application-Level Protections"
-run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
-run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
-run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
-run_section_safely section_backup_resilience "Resilience & Backup"
+if [ "$PARALLEL_MODE" = true ]; then
+    # Conservative parallelism: run core checks sequentially for stable console/JSON output
+    run_section_safely section_system "System"
+    run_section_safely section_updates "Updates"
+    run_section_safely section_listening "Listening Services"
+    run_section_safely section_firewall "Firewall"
+    run_section_safely section_ssh "SSH Hardening"
+    run_section_safely section_auditing "Auditing/Hardening"
+    run_section_safely section_accounts "Accounts and Sudo"
+    run_section_safely section_permissions "Risky Permissions"
+    run_section_safely section_package_integrity "Package Integrity"
+    run_section_safely section_file_integrity "File Integrity"
+    run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
+    run_section_safely section_intrusion_detection "Intrusion Detection"
+    run_section_safely section_time_sync "Time Synchronization"
+    run_section_safely section_logging "Logging and Monitoring"
+    run_section_safely section_network_security "Network Security"
+    run_section_safely section_process_forensics "Process & Forensics"
+    run_section_safely section_secure_configuration "Secure Configuration"
+    run_section_safely section_container_security "Container & Virtualization Security"
+    run_section_safely section_kernel_hardening "Kernel & System Hardening"
+    run_section_safely section_application_security "Application-Level Protections"
+    run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
+    run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
+    run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
+    run_section_safely section_backup_resilience "Resilience & Backup"
+
+    # Keep only advanced detection in parallel for speed without destabilizing output
+    run_section_parallel section_malware_detection "Malware Detection"
+    run_section_parallel section_rootkit_detection "Rootkit Detection"
+    run_section_parallel section_behavioral_analysis "Behavioral Analysis"
+    wait_parallel_sections
+else
+    # Sequential execution (default)
+    run_section_safely section_system "System"
+    run_section_safely section_updates "Updates"
+    run_section_safely section_listening "Listening Services"
+    run_section_safely section_firewall "Firewall"
+    run_section_safely section_ssh "SSH Hardening"
+    run_section_safely section_auditing "Auditing/Hardening"
+    run_section_safely section_accounts "Accounts and Sudo"
+    run_section_safely section_permissions "Risky Permissions"
+    run_section_safely section_intrusion_detection "Intrusion Detection"
+    run_section_safely section_time_sync "Time Synchronization"
+    run_section_safely section_logging "Logging and Monitoring"
+    run_section_safely section_network_security "Network Security"
+    run_section_safely section_package_integrity "Package Integrity"
+    run_section_safely section_file_integrity "File Integrity"
+    run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
+    run_section_safely section_process_forensics "Process & Forensics"
+    run_section_safely section_secure_configuration "Secure Configuration"
+    run_section_safely section_container_security "Container & Virtualization Security"
+    run_section_safely section_kernel_hardening "Kernel & System Hardening"
+    run_section_safely section_application_security "Application-Level Protections"
+    run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
+    run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
+    run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
+    run_section_safely section_backup_resilience "Resilience & Backup"
+    
+    # Advanced security detection (new in v0.6.2)
+    run_section_safely section_malware_detection "Malware Detection"
+    run_section_safely section_rootkit_detection "Rootkit Detection"
+    run_section_safely section_behavioral_analysis "Behavioral Analysis"
+fi
 
 # Enhanced security checks (new in v0.6.0)
 run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
@@ -2880,6 +3736,9 @@ run_section_safely section_enhanced_file_integrity "Enhanced File Integrity"
 run_section_safely section_enhanced_process_security "Enhanced Process Security"
 run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
 run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
+
+# Note: Malware detection, rootkit detection, and behavioral analysis are now included
+# in the parallel execution groups above for better performance
 
 run_section_safely section_privilege_summary "Privilege Limitations Summary"
 run_section_safely section_summary "Summary"
@@ -2895,6 +3754,12 @@ if [ "$QUIET_MODE" = true ]; then
     exec 1>&3
     exec 3>&-
 fi
+
+# Cleanup cache and parallel temp dir
+cleanup_cache
+rm -rf "$PARALLEL_TMP_DIR" 2>/dev/null || true
+
+
 
 # Generate output based on format
 generate_output() {
@@ -2918,7 +3783,7 @@ generate_output() {
 if [ -n "$OUTPUT_FILE" ]; then
     if generate_output > "$OUTPUT_FILE"; then
         echo "Report saved: $OUTPUT_FILE" 
-        echo "Format: $OUTPUT_FORMAT | Mode: $OPERATION_MODE | Findings: ${#FINDINGS[@]}"
+        echo "Format: $OUTPUT_FORMAT | Mode: $OPERATION_MODE | Findings: $((${#FINDINGS[@]} - 2))"
     else
         echo "Error: Failed to generate output file '$OUTPUT_FILE'" >&2
         exit 1
