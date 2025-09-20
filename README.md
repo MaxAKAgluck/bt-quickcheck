@@ -16,16 +16,18 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 - [Project status](#project-status)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Sudo Requirements](#sudo-requirements)
+- [Operation Modes](#operation-modes)
 - [Security Assessment Categories](#security-assessment-categories)
 - [Output Formats](#output-formats)
-- [Operation Modes](#operation-modes)
-- [Security & Safety](#security--safety)
-- [Examples](#examples)
 - [Implementation Progress](#implementation-progress)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- [Enhanced Input Validation & Security Features](#enhanced-input-validation--security-features)
 - [References](#references)
+- [Contributing](#contributing)
 - [License](#license)
+- [Contact & Support](#contact--support)
+- [Acknowledgments](#acknowledgments)
+- [Enterprise Compliance & Industry Standards](#enterprise-compliance--industry-standards)
 
 ## Features
 
