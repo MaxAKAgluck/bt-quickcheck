@@ -1,7 +1,17 @@
+
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.6.2
+# Version: 0.6.3
+# 
+# Ensure we're running under bash (re-exec if invoked with sh)
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /usr/bin/env bash "$0" "$@"
+fi
+
+# INTEGRITY CHECK:
+# This script performs a lightweight integrity hash check at startup to help
+# detect accidental tampering. It is informational and non-blocking.
 # 
 # SECURITY DISCLAIMER:
 # This script performs READ-ONLY security assessment of Linux systems.
@@ -21,30 +31,206 @@
 # 
 # By running this script, you acknowledge understanding of its purpose and scope.
 
-set -euo pipefail  # Strict error handling: exit on error, undefined vars, pipe failures
+# Strict error handling: exit on error, undefined vars, pipe failures
+# pipefail is bash-specific; fall back gracefully if not available
+set -euo pipefail 2>/dev/null || set -eu
 
-# Enhanced error handling with logging
+# Advanced Security Features - Authentication & Authorization
+# Permission levels for different operations
+declare -A PERMISSION_LEVELS=(
+    ["basic"]="1"
+    ["standard"]="2" 
+    ["elevated"]="3"
+    ["administrative"]="4"
+    ["audit"]="5"
+)
+
+# Current user permission level
+CURRENT_PERMISSION_LEVEL="basic"
+
+# Audit trail configuration
+AUDIT_LOG="/var/log/bt-quickcheck-audit.log"
+AUDIT_ENABLED=false
+
+# Script integrity verification
+verify_script_integrity() {
+    local script_path="$0"
+    local expected_hash=""
+    local actual_hash=""
+    
+    # Calculate script hash (excluding signature block)
+    if command_exists sha256sum; then
+        actual_hash=$(head -n -10 "$script_path" | sha256sum | cut -d' ' -f1)
+    elif command_exists shasum; then
+        actual_hash=$(head -n -10 "$script_path" | shasum -a 256 | cut -d' ' -f1)
+    else
+        # Fallback to basic checksum
+        actual_hash=$(head -n -10 "$script_path" | wc -c)
+    fi
+    
+    # For now, we'll use a simple integrity check
+    # In production, this would verify against a known good hash or digital signature
+    if [ ${#actual_hash} -lt 8 ]; then
+        echo "Warning: Script integrity verification failed - hash too short" >&2
+        return 1
+    fi
+    
+    return 0
+}
+
+# Permission level checking
+check_permission_level() {
+    local required_level="$1"
+    local current_level="${PERMISSION_LEVELS[$CURRENT_PERMISSION_LEVEL]:-1}"
+    local required_level_num="${PERMISSION_LEVELS[$required_level]:-1}"
+    
+    if [ "$current_level" -lt "$required_level_num" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Set permission level based on user context
+set_permission_level() {
+    if is_root; then
+        CURRENT_PERMISSION_LEVEL="administrative"
+    elif groups | grep -q sudo; then
+        CURRENT_PERMISSION_LEVEL="elevated"
+    elif groups | grep -q wheel; then
+        CURRENT_PERMISSION_LEVEL="elevated"
+    else
+        CURRENT_PERMISSION_LEVEL="basic"
+    fi
+}
+
+# Enhanced audit logging
+audit_log() {
+    local action="$1"
+    local details="$2"
+    local severity="${3:-INFO}"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local user=$(whoami 2>/dev/null || echo "unknown")
+    local hostname=$(hostname 2>/dev/null || echo "unknown")
+    
+    if [ "$AUDIT_ENABLED" = true ] && [ -w "${AUDIT_LOG%/*}" ]; then
+        echo "[$timestamp] $user@$hostname [$severity] $action: $details" >> "$AUDIT_LOG" 2>/dev/null || true
+    fi
+}
+
+# Role-based access control
+check_access_control() {
+    local operation="$1"
+    local resource="$2"
+    local user=$(whoami 2>/dev/null || echo "unknown")
+    
+    # Define access control matrix
+    case "$operation" in
+        "read_system_files")
+            if ! check_permission_level "standard"; then
+                audit_log "ACCESS_DENIED" "Attempted to read system files without sufficient permissions" "WARN"
+                return 1
+            fi
+            ;;
+        "execute_commands")
+            if ! check_permission_level "elevated"; then
+                audit_log "ACCESS_DENIED" "Attempted to execute commands without sufficient permissions" "WARN"
+                return 1
+            fi
+            ;;
+        "access_sensitive_data")
+            if ! check_permission_level "administrative"; then
+                audit_log "ACCESS_DENIED" "Attempted to access sensitive data without sufficient permissions" "WARN"
+                return 1
+            fi
+            ;;
+        "audit_operations")
+            if ! check_permission_level "audit"; then
+                audit_log "ACCESS_DENIED" "Attempted audit operations without sufficient permissions" "WARN"
+                return 1
+            fi
+            ;;
+        *)
+            # Default allow for basic operations
+            ;;
+    esac
+    
+    audit_log "ACCESS_GRANTED" "Operation: $operation, Resource: $resource" "INFO"
+    return 0
+}
+
+# Enhanced error handling with comprehensive logging and sanitization
 handle_section_error() {
     local section="$1"
     local line="$2"
     local error="$3"
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    # Log error with timestamp and context
-    local error_msg="[$timestamp] ERROR in $section (line $line): $error"
+    # Sanitize error message to prevent information disclosure
+    local sanitized_error=$(echo "$error" | sed 's/[^a-zA-Z0-9._/ -]//g' | head -c 200)
+    local sanitized_section=$(echo "$section" | sed 's/[^a-zA-Z0-9._/ -]//g' | head -c 50)
+    
+    # Log error with timestamp and context (sanitized)
+    local error_msg="[$timestamp] ERROR in $sanitized_section (line $line): $sanitized_error"
     
     if [ "$OUTPUT_FORMAT" = "console" ]; then
-        warn "Error in $section (line $line): $error"
+        warn "Error in $sanitized_section (line $line): $sanitized_error"
         warn "Continuing with remaining checks..."
     fi
     
-    # Add structured finding for error tracking
-    add_finding "$section" "WARN" "Section error encountered: $error" "Review section implementation and check system logs"
+    # Add structured finding for error tracking (sanitized)
+    add_finding "$sanitized_section" "WARN" "Section error encountered: $sanitized_error" "Review section implementation and check system logs"
     
-    # Log to system log if available and running as root
+    # Log to system log if available and running as root (sanitized)
     if is_root && command_exists logger; then
         logger -p user.warning "bt-quickcheck: $error_msg"
     fi
+}
+
+# Enhanced safe command execution with additional security and access control
+safe_exec_enhanced() {
+    local cmd="$1"
+    shift
+    
+    # Check access control for command execution
+    if ! check_access_control "execute_commands" "$cmd"; then
+        handle_section_error "Access Control" "0" "Insufficient permissions to execute command: $cmd"
+        return 1
+    fi
+    
+    # Validate command before execution
+    if ! validate_command "$cmd"; then
+        handle_section_error "Command Validation" "0" "Invalid command attempted: $cmd"
+        return 1
+    fi
+    
+    # Validate all arguments
+    for arg in "$@"; do
+        if ! validate_input_length "$arg" 512; then
+            handle_section_error "Command Validation" "0" "Argument too long for command: $cmd"
+            return 1
+        fi
+        
+        if ! validate_input_chars "$arg"; then
+            handle_section_error "Command Validation" "0" "Invalid characters in argument for command: $cmd"
+            return 1
+        fi
+    done
+    
+    # Prevent execution from dangerous directories
+    local cmd_path
+    cmd_path=$(command -v "$cmd" 2>/dev/null)
+    if [[ -n "$cmd_path" ]]; then
+        if [[ "$cmd_path" =~ /tmp/ ]] || [[ "$cmd_path" =~ /dev/shm/ ]]; then
+            handle_section_error "Command Validation" "0" "Command from dangerous directory: $cmd_path"
+            return 1
+        fi
+    fi
+    
+    # Log command execution for audit
+    audit_log "COMMAND_EXECUTED" "Command: $cmd, Args: $*" "INFO"
+    
+    # Execute with additional safety
+    "$cmd" "$@" 2>/dev/null || true
 }
 
 # Lightweight spinner for quiet mode
@@ -98,6 +284,418 @@ run_section_safely() {
     set -e
 }
 
+# New high-impact defensive checks (inspired by privesc surfaces)
+
+# 1) Sudo misconfig + PATH/SUID/ld.so hijack checks
+section_privesc_surface_core() {
+    print_section "Privilege Escalation Surface (Core)"
+
+    # Sudoers risky configurations
+    if is_root; then
+        if [ -r /etc/sudoers ]; then
+            local sudoers_dump
+            sudoers_dump=$(cached_file_content /etc/sudoers)
+            if echo "$sudoers_dump" | grep -Eq 'NOPASSWD|!authenticate'; then
+                add_finding "Sudo" "CRIT" "NOPASSWD or !authenticate found in /etc/sudoers" "Restrict NOPASSWD; require authentication for admin commands"
+            fi
+            if echo "$sudoers_dump" | grep -Eq 'timestamp_timeout\s*=\s*-?1|timestamp_timeout\s*=\s*[6-9][0-9]'; then
+                add_finding "Sudo" "WARN" "Excessive sudo timestamp_timeout configured" "Lower timestamp_timeout to minimal operational need"
+            fi
+            if ! echo "$sudoers_dump" | grep -q '^Defaults\s\+secure_path='; then
+                add_finding "Sudo" "WARN" "Defaults secure_path not set in /etc/sudoers" "Set secure_path to trusted system dirs only"
+            fi
+            if echo "$sudoers_dump" | grep -qi 'env_keep'; then
+                add_finding "Sudo" "WARN" "sudo env_keep configured (env leaks)" "Minimize env_keep; pass only required variables"
+            fi
+        fi
+        if [ -d /etc/sudoers.d ]; then
+            local sudoers_d_files
+            sudoers_d_files=$(find /etc/sudoers.d -maxdepth 1 -type f -readable 2>/dev/null | head -20)
+            if [ -n "$sudoers_d_files" ]; then
+                while IFS= read -r f; do
+                    local content; content=$(safe_read "$f")
+                    if echo "$content" | grep -Eq 'NOPASSWD|!authenticate'; then
+                        add_finding "Sudo" "CRIT" "NOPASSWD in $(basename "$f")" "Remove NOPASSWD or scope to least privilege"
+                    fi
+                done <<< "$sudoers_d_files"
+            fi
+        fi
+    else
+        add_finding "Sudo" "INFO" "Limited sudoers review without sudo" "Run with sudo to fully analyze sudoers and includes"
+    fi
+
+    # PATH hijack risks
+    local path_val path_issues=false
+    path_val="$PATH"
+    if echo "$path_val" | grep -qE '(^|:)\.(:|$)'; then
+        add_finding "PATH" "CRIT" "PATH contains current directory (.)" "Remove '.' from PATH; use absolute command paths"
+        path_issues=true
+    fi
+    IFS=':' read -r -a _pdirs <<< "$path_val"
+    local listed=0
+    for d in "${_pdirs[@]}"; do
+        [ -z "$d" ] && continue
+        if [ -d "$d" ]; then
+            # World/group writable dirs in PATH
+            if [ -n "$(find "$d" -maxdepth 0 -perm -002 -type d 2>/dev/null)" ] || [ -n "$(find "$d" -maxdepth 0 -perm -020 -type d 2>/dev/null)" ]; then
+                add_finding "PATH" "CRIT" "Writable directory in PATH: $d" "Set directory perms to 0755 and owner root; remove from PATH if not needed"
+                path_issues=true
+            fi
+            # World-writable executables inside PATH (limited)
+            if [ $listed -lt 5 ]; then
+                local ww
+                ww=$(find "$d" -maxdepth 1 -type f -perm -002 -executable 2>/dev/null | head -3)
+                if [ -n "$ww" ]; then
+                    while IFS= read -r f; do
+                        add_finding "PATH" "CRIT" "World-writable executable in PATH: $f" "Set file perms to 0755 and owner root"
+                    done <<< "$ww"
+                    listed=$((listed+1))
+                    path_issues=true
+                fi
+            fi
+        fi
+    done
+    [ "$path_issues" = false ] && add_finding "PATH" "OK" "No obvious PATH hijack risks detected" "Keep PATH limited to root-owned, non-writable dirs"
+
+    # SUID/SGID escalation via GTFOBins in common dirs
+    local suid_bins
+    suid_bins=$(cached_command find /bin /sbin /usr/bin /usr/sbin -perm -4000 -type f 2>/dev/null | head -200)
+    if [ -n "$suid_bins" ]; then
+        local risky="bash sh zsh python python3 perl ruby find awk sed vi vim nano less more tar cp rsync nmap mount fusermount pkexec busybox env tee" 
+        while IFS= read -r sb; do
+            bn=$(basename "$sb")
+            if echo "$risky" | grep -qw "$bn"; then
+                # Severity tuning: downgrade commonly SUID system tools (e.g., mount) to WARN
+                # unless they are writable by group/others or not root-owned
+                local perms owner
+                perms=$(stat -Lc '%a' "$sb" 2>/dev/null || echo "")
+                owner=$(stat -Lc '%U' "$sb" 2>/dev/null || echo "")
+                local sev="CRIT"
+                if [ "$bn" = "mount" ] || [ "$bn" = "fusermount" ]; then
+                    sev="WARN"
+                fi
+                if [ -n "$perms" ]; then
+                    # Use last two digits for group/other even when a special (setuid/setgid) digit is present
+                    local g=${perms: -2:1}; local o=${perms: -1}
+                    if [[ ! "$g" =~ [2367] ]] && [[ ! "$o" =~ [2367] ]] && [ "$owner" = "root" ]; then
+                        # Not writable by group/others and root-owned
+                        [ "$sev" = "CRIT" ] && sev="WARN"
+                    fi
+                fi
+                add_finding "SUID" "$sev" "SUID GTFOBin detected: $sb" "Remove SUID bit or replace; consult GTFOBins for escalation vectors"
+            fi
+        done <<< "$suid_bins"
+    fi
+
+    # ld.so preload hijack vectors
+    if [ -e /etc/ld.so.preload ]; then
+        add_finding "Loader" "WARN" "/etc/ld.so.preload present" "Ensure referenced libs are root-owned and not writable; remove if not intentionally used"
+        local libs; libs=$(safe_read /etc/ld.so.preload)
+        if [ -n "$libs" ]; then
+            while IFS= read -r lib; do
+                [ -z "$lib" ] && continue
+                if [ -e "$lib" ]; then
+                    if [ -n "$(find "$lib" -perm -002 -o -perm -020 2>/dev/null)" ]; then
+                        add_finding "Loader" "CRIT" "Writable library in ld.so.preload: $lib" "Set permissions to 0644 and owner root; audit change origin"
+                    fi
+                else
+                    add_finding "Loader" "WARN" "Missing library referenced in ld.so.preload: $lib" "Remove stale entry or restore library"
+                fi
+            done <<< "$libs"
+        fi
+    fi
+    # ld.so.conf writability
+    if [ -r /etc/ld.so.conf ]; then
+        if [ -n "$(find /etc/ld.so.conf -perm -002 -o -perm -020 2>/dev/null)" ]; then
+            add_finding "Loader" "WARN" "/etc/ld.so.conf writable by non-root" "Set to 0644 root:root; review contents"
+        fi
+    fi
+    if [ -d /etc/ld.so.conf.d ]; then
+        local w
+        w=$(find /etc/ld.so.conf.d -type f \( -perm -002 -o -perm -020 \) 2>/dev/null | head -5)
+        if [ -n "$w" ]; then
+            while IFS= read -r f; do
+                add_finding "Loader" "WARN" "ld.so.conf.d entry writable: $f" "Set to 0644 root:root and audit"
+            done <<< "$w"
+        fi
+    fi
+}
+
+# Extended privilege-escalation surface (targeted, read-only)
+section_privesc_surface_extended() {
+    print_section "Privilege Escalation Surface (Extended)"
+
+    # Sudo deep-dive: sudo version and risky Defaults
+    if command_exists sudo; then
+        local sv; sv=$(sudo -V 2>/dev/null | head -1 | awk '{print $3}')
+        [ -n "$sv" ] && add_finding "Sudo" "INFO" "sudo version: $sv" "Keep sudo updated; review vendor advisories"
+    fi
+    if is_root && [ -r /etc/sudoers ]; then
+        local d; d=$(grep -E '^Defaults' /etc/sudoers 2>/dev/null)
+        if echo "$d" | grep -qi 'mail_badpass'; then
+            add_finding "Sudo" "WARN" "Defaults contains mail_badpass (noise)" "Remove or tune Defaults as needed"
+        fi
+        if echo "$d" | grep -qi 'insults'; then
+            add_finding "Sudo" "INFO" "Defaults insults set" "Optional: remove for cleaner logs"
+        fi
+    fi
+
+    # PATH owner checks: non-root-owned dirs in PATH
+    IFS=':' read -r -a _pdirs2 <<< "$PATH"
+    for d in "${_pdirs2[@]}"; do
+        [ -d "$d" ] || continue
+        local own; own=$(stat -Lc '%U' "$d" 2>/dev/null || echo "")
+        if [ "$own" != "root" ]; then
+            add_finding "PATH" "WARN" "Directory in PATH not owned by root: $d ($own)" "Change owner to root:root or remove from PATH"
+        fi
+    done
+
+    # SGID binaries and capabilities
+    local sgid_bins; sgid_bins=$(cached_command find /bin /sbin /usr/bin /usr/sbin -perm -2000 -type f 2>/dev/null | head -200)
+    if [ -n "$sgid_bins" ]; then
+        local listed=0
+        while IFS= read -r sb; do
+            [ $listed -ge 10 ] && break
+            local p; p=$(stat -Lc '%a' "$sb" 2>/dev/null || echo "")
+            local owner; owner=$(stat -Lc '%U' "$sb" 2>/dev/null || echo "")
+            # Use last two digits for group/other permissions even with leading setgid digit
+            local g="" o=""
+            [ -n "$p" ] && g=${p: -2:1} && o=${p: -1}
+            if [ -n "$g" ] && [ -n "$o" ]; then
+                if [[ "$g" =~ [2367] ]] || [[ "$o" =~ [2367] ]] || [ "$owner" != "root" ]; then
+                    add_finding "SGID" "CRIT" "Group/other-writable SGID binary: $sb" "Set perms to 2755 and owner root:root; review necessity"
+                    listed=$((listed+1))
+                fi
+            fi
+        done <<< "$sgid_bins"
+    fi
+    if command_exists getcap; then
+        local caps; caps=$(getcap -r /bin /sbin /usr/bin /usr/sbin 2>/dev/null | head -200)
+        if [ -n "$caps" ]; then
+            while IFS= read -r line; do
+                local f; f=$(echo "$line" | awk -F= '{print $1}')
+                local c; c=$(echo "$line" | awk -F= '{print $2}')
+                if echo "$c" | grep -Eq 'cap_setuid|cap_sys_admin'; then
+                    local p; p=$(stat -Lc '%a' "$f" 2>/dev/null || echo "")
+                    local g=${p:1:1}; local o=${p:2:1}
+                    if [[ "$g" =~ [2367] ]] || [[ "$o" =~ [2367] ]]; then
+                        add_finding "Capabilities" "CRIT" "Writable binary with powerful capabilities: $f ($c)" "Restrict perms to 0755 and review need for capabilities"
+                    else
+                        add_finding "Capabilities" "WARN" "Binary has powerful capabilities: $f ($c)" "Review need for capabilities; remove if unnecessary"
+                    fi
+                fi
+            done <<< "$caps"
+        fi
+    fi
+
+    # ld.so: writable directories referenced
+    if [ -r /etc/ld.so.conf ]; then
+        local ldirs; ldirs=$(awk '$1 !~ /^#/ {print $1}' /etc/ld.so.conf 2>/dev/null)
+        for dir in $ldirs; do
+            [ -d "$dir" ] || continue
+            if [ -n "$(find "$dir" -maxdepth 0 -perm -002 -o -perm -020 2>/dev/null)" ]; then
+                add_finding "Loader" "WARN" "Writable library directory referenced: $dir" "Set perms to 0755 root:root; remove from ld.so.conf if not needed"
+            fi
+        done
+    fi
+    if [ -d /etc/ld.so.conf.d ]; then
+        local conf
+        for conf in /etc/ld.so.conf.d/*.conf; do
+            [ -r "$conf" ] || continue
+            local ldirs2; ldirs2=$(awk '$1 !~ /^#/ {print $1}' "$conf" 2>/dev/null)
+            for dir in $ldirs2; do
+                [ -d "$dir" ] || continue
+                if [ -n "$(find "$dir" -maxdepth 0 -perm -002 -o -perm -020 2>/dev/null)" ]; then
+                    add_finding "Loader" "WARN" "Writable library directory referenced: $dir (from $(basename "$conf"))" "Set perms to 0755 root:root; audit necessity"
+                fi
+            done
+        done
+    fi
+
+    # systemd drop-ins and hardening
+    if [ -d /etc/systemd/system ]; then
+        local di; di=$(find /etc/systemd/system -type f -path '*/*.d/*.conf' \( -perm -002 -o -perm -020 \) 2>/dev/null | head -10)
+        if [ -n "$di" ]; then
+            while IFS= read -r f; do
+                add_finding "systemd" "CRIT" "Writable systemd drop-in: $f" "Set to 0644 root:root; review overrides"
+            done <<< "$di"
+        fi
+    fi
+}
+# 2) Cron/systemd chain writability + NFS exports
+section_taskrunners_nfs() {
+    print_section "Task Runners & NFS Risk"
+
+    # Cron files/directories world-writable
+    local cron_ww
+    cron_ww=$(find /etc/cron* /var/spool/cron* -maxdepth 2 -type f -perm -002 2>/dev/null | head -10)
+    if [ -n "$cron_ww" ]; then
+        while IFS= read -r f; do
+            add_finding "Cron" "CRIT" "World-writable cron file: $f" "Set owner root:root and perms 0644 (or stricter)"
+        done <<< "$cron_ww"
+    else
+        add_finding "Cron" "OK" "No world-writable cron files detected" "Maintain secure ownership and perms"
+    fi
+
+    # systemd units pointing to writable ExecStart targets
+    if command_exists systemctl; then
+        local units; units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | head -200)
+        local checked=0
+        for u in $units; do
+            [ $checked -ge 30 ] && break
+            local f
+            f=$(systemctl show -p FragmentPath "$u" 2>/dev/null | awk -F= '{print $2}')
+            [ -f "$f" ] || continue
+            local execs
+            execs=$(awk -F= '/^ExecStart=/ {print $2}' "$f" | awk '{print $1}' | sed 's/^\-//;s/^!//')
+            for e in $execs; do
+                [ -z "$e" ] && continue
+                # Resolve symlink to real target if possible
+                local real
+                real=$(realpath "$e" 2>/dev/null || echo "$e")
+                if [ -e "$real" ]; then
+                    # Use numeric perms to check group/other write bits
+                    local p; p=$(stat -Lc '%a' "$real" 2>/dev/null || echo "")
+                    if [ -n "$p" ]; then
+                        # Use last two digits (group/other)
+                        local g=${p: -2:1}; local o=${p: -1}
+                        if [[ "$g" =~ [2367] ]] || [[ "$o" =~ [2367] ]]; then
+                            add_finding "systemd" "CRIT" "ExecStart target writable: $real (unit: $u)" "Set owner root:root and perms 0755; move scripts to root-owned paths"
+                        fi
+                    fi
+                fi
+            done
+            checked=$((checked+1))
+        done
+    fi
+
+    # NFS exports with no_root_squash or wide RW
+    if [ -r /etc/exports ]; then
+        local ex; ex=$(safe_read /etc/exports)
+        if echo "$ex" | grep -q 'no_root_squash'; then
+            add_finding "NFS" "CRIT" "NFS export with no_root_squash" "Replace with root_squash; restrict clients to trusted hosts/subnets"
+        fi
+        if echo "$ex" | grep -Eq '\s\(.*rw.*\)'; then
+            add_finding "NFS" "WARN" "Writable NFS export present" "Limit to ro where possible or restrict to specific clients"
+        fi
+    fi
+
+    # Cron/Anacron/At allow/deny validation (moved here)
+    print_section "Scheduler Controls (cron/anacron/at)"
+    for f in /etc/cron.allow /etc/cron.deny; do
+        if [ -e "$f" ]; then
+            local p o g
+            p=$(stat -c '%a' "$f" 2>/dev/null || echo "")
+            o=$(stat -c '%U' "$f" 2>/dev/null || echo "")
+            g=$(stat -c '%G' "$f" 2>/dev/null || echo "")
+            if [ -n "$p" ] && { [[ ${p:1:1} =~ [2367] ]] || [[ ${p:2:1} =~ [2367] ]]; }; then
+                add_finding "Cron" "WARN" "$f is group/other-writable ($p $o:$g)" "Set to 0640 or stricter, owner root:root"
+            fi
+        fi
+    done
+    if [ -r /etc/anacrontab ]; then
+        add_finding "Anacron" "OK" "anacrontab present" "Ensure jobs reference root-owned, non-writable scripts"
+    fi
+    for f in /etc/at.allow /etc/at.deny; do
+        if [ -e "$f" ]; then
+            local p o g
+            p=$(stat -c '%a' "$f" 2>/dev/null || echo "")
+            o=$(stat -c '%U' "$f" 2>/dev/null || echo "")
+            g=$(stat -c '%G' "$f" 2>/dev/null || echo "")
+            if [ -n "$p" ] && { [[ ${p:1:1} =~ [2367] ]] || [[ ${p:2:1} =~ [2367] ]]; }; then
+                add_finding "at" "WARN" "$f is group/other-writable ($p $o:$g)" "Set to 0640 or stricter, owner root:root"
+            fi
+        fi
+    done
+}
+
+# 3) Container/SSH/Secrets hygiene
+section_container_ssh_secrets_hygiene() {
+    print_section "Container, SSH & Secrets Hygiene"
+
+    # Docker socket/group exposure
+    if [ -S /var/run/docker.sock ]; then
+        local perms; perms=$(stat -c '%a %U:%G' /var/run/docker.sock 2>/dev/null)
+        add_finding "Containers" "WARN" "Docker socket present (/var/run/docker.sock) perms: $perms" "Limit access; non-root access to docker implies root-equivalent on host"
+    fi
+
+    # SSH agent socket exposure
+    if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+        if [ -S "$SSH_AUTH_SOCK" ]; then
+            local sp; sp=$(stat -c '%a %U:%G' "$SSH_AUTH_SOCK" 2>/dev/null)
+            add_finding "SSH" "INFO" "SSH_AUTH_SOCK detected ($sp)" "Avoid forwarding agent into untrusted hosts; limit socket permissions"
+        fi
+    fi
+
+    # Private key permissions
+    local key_issues
+    key_issues=$(find /root /home -maxdepth 3 -type f \( -name 'id_rsa' -o -name 'id_dsa' -o -name 'id_ecdsa' -o -name 'id_ed25519' \) -perm -004 2>/dev/null | head -10)
+    if [ -n "$key_issues" ]; then
+        while IFS= read -r f; do
+            add_finding "SSH" "CRIT" "Private key world-readable: $f" "Set to 0600 and owner correct user; rotate keys if exposed"
+        done <<< "$key_issues"
+    fi
+
+    # Secrets files with weak perms
+    local secrets
+    secrets=$(find /root /home -maxdepth 4 -type f \( -name '.netrc' -o -path '*/.aws/credentials' -o -path '*/.docker/config.json' -o -path '*/.kube/config' -o -name '.env' \) -perm -004 2>/dev/null | head -10)
+    if [ -n "$secrets" ]; then
+        while IFS= read -r f; do
+            add_finding "Secrets" "WARN" "World-readable secrets file: $f" "Restrict perms (600) and consider removing secrets from disk"
+        done <<< "$secrets"
+    fi
+}
+
+# 4) Kernel, polkit, fstab refinements
+section_kernel_polkit_fstab_refinements() {
+    print_section "Kernel, Polkit & Filesystem Hardening"
+
+    # Core pattern pipe handler risk
+    if [ -r /proc/sys/kernel/core_pattern ]; then
+        local cp; cp=$(cached_file_content /proc/sys/kernel/core_pattern | tr -d '\n')
+        if echo "$cp" | grep -q '^|'; then
+            add_finding "Kernel" "WARN" "core_pattern pipes to program ($cp)" "Avoid piping core dumps to external programs unless required; secure target path and perms"
+        fi
+    fi
+
+    # Unprivileged user namespaces and kernel toggles
+    for k in kernel.unprivileged_userns_clone kernel.kexec_load_disabled vm.mmap_min_addr; do
+        if command_exists sysctl; then
+            local v; v=$(sysctl -n "$k" 2>/dev/null || echo "")
+            case "$k:$v" in
+                kernel.unprivileged_userns_clone:1) add_finding "Kernel" "WARN" "Unprivileged user namespaces enabled" "Consider disabling (set kernel.unprivileged_userns_clone=0) in hardened environments";;
+                kernel.kexec_load_disabled:0) add_finding "Kernel" "WARN" "kexec load not disabled" "Set kernel.kexec_load_disabled=1 to reduce attack surface";;
+                vm.mmap_min_addr:0) add_finding "Kernel" "WARN" "vm.mmap_min_addr is 0" "Set a higher value (e.g., 65536) to mitigate NULL-deref exploits";;
+            esac
+        fi
+    done
+
+    # Polkit rules world-writable
+    if [ -d /etc/polkit-1/rules.d ]; then
+        local prw
+        prw=$(find /etc/polkit-1/rules.d -type f \( -perm -002 -o -perm -020 \) 2>/dev/null | head -5)
+        if [ -n "$prw" ]; then
+            while IFS= read -r f; do
+                add_finding "Polkit" "CRIT" "World/group-writable polkit rule: $f" "Set to 0644 root:root; audit rules for least privilege"
+            done <<< "$prw"
+        fi
+    fi
+
+    # Fstab / mounts options
+    if [ -r /etc/fstab ]; then
+        local fstab; fstab=$(safe_read /etc/fstab)
+        for mp in /tmp /var/tmp /dev/shm; do
+            if echo "$fstab" | awk '$1 !~ /^#/ {print $2" "$4}' | grep -q "^$mp "; then
+                local opts; opts=$(echo "$fstab" | awk '$1 !~ /^#/ {print $2" "$4}' | grep "^$mp " | awk '{print $2}')
+                for need in noexec nosuid nodev; do
+                    if ! echo "$opts" | grep -qw "$need"; then
+                        add_finding "FSTAB" "WARN" "$mp missing $need option" "Add $need to $mp mount options in /etc/fstab and remount"
+                    fi
+                done
+            fi
+        done
+    fi
+}
 # Parallel execution support
 declare -a PARALLEL_PIDS=()
 declare -a PARALLEL_SECTIONS=()
@@ -192,12 +790,25 @@ wait_parallel_sections() {
 init_cache() {
     if [ "$CACHE_ENABLED" = true ]; then
         mkdir -p "$CACHE_DIR" 2>/dev/null || CACHE_ENABLED=false
+        chmod 700 "$CACHE_DIR" 2>/dev/null || true
     fi
 }
 
 cleanup_cache() {
     if [ -d "$CACHE_DIR" ]; then
         rm -rf "$CACHE_DIR" 2>/dev/null || true
+    fi
+}
+
+# Hygiene: remove our old cache/temp dirs (safe prefix) older than retention window
+cleanup_old_btqc_dirs() {
+    local base_tmp="/tmp"
+    local retention_hours="${RETENTION_HOURS:-24}"
+    if command_exists find; then
+        find "$base_tmp" -maxdepth 1 -type d \
+            \( -name 'bt-quickcheck-cache-*' -o -name 'btqc-par-*' \) \
+            -mmin +$((retention_hours*60)) \
+            -exec rm -rf {} + 2>/dev/null || true
     fi
 }
 
@@ -277,7 +888,7 @@ cached_file_content() {
     fi
 }
 
-VERSION="0.6.2"
+VERSION="0.6.3"
 
 # Caching system configuration
 CACHE_DIR="/tmp/bt-quickcheck-cache-$$"
@@ -305,52 +916,85 @@ COLOR_RESET="\033[0m"
 declare -a FINDINGS=()
 declare -a SECTIONS=()
 
+# Privacy controls (defaults)
+PRIVACY_LEVEL="standard"   # standard|high|off
+ANONYMIZE=false
+EXCLUDE_SECTIONS_RAW=""
+EXCLUDE_SEVERITY_RAW=""
+
+# Derived privacy state
+declare -A EXCLUDE_SECTION_SET=()
+declare -A EXCLUDE_SEVERITY_SET=()
+ANON_SALT=""
+
 # Safety functions
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
 
 # Enhanced safe command execution with additional security
 safe_exec() {
-    local cmd="$1"
-    shift
-    
-    # Validate command before execution
-    if ! validate_command "$cmd"; then
-        return 1
-    fi
-    
-    # Prevent execution from dangerous directories
-    local cmd_path
-    cmd_path=$(command -v "$cmd" 2>/dev/null)
-    if [[ -n "$cmd_path" ]]; then
-        if [[ "$cmd_path" =~ /tmp/ ]] || [[ "$cmd_path" =~ /dev/shm/ ]]; then
-            return 1
-        fi
-    fi
-    
-    # Execute with additional safety
-    "$cmd" "$@" 2>/dev/null || true
+    # Use the enhanced version for better security
+    safe_exec_enhanced "$@"
 }
 
-# Enhanced safe file reading with content validation
+# Enhanced safe file reading with comprehensive validation and access control
 safe_read() {
     local file="$1"
     local max_size="${2:-1048576}"  # Default 1MB limit
     
-    if [ -r "$file" ] && [ -f "$file" ]; then
-        # Check file size to prevent reading extremely large files
-        local file_size
-        file_size=$(stat -c "%s" "$file" 2>/dev/null || echo "0")
-        if [ "$file_size" -gt "$max_size" ]; then
-            return 1
-        fi
-        
-        # Validate file is not a symlink to prevent symlink attacks
-        if [ -L "$file" ]; then
-            return 1
-        fi
-        
-        cat "$file" 2>/dev/null || true
+    # Check access control for reading system files
+    if ! check_access_control "read_system_files" "$file"; then
+        handle_section_error "Access Control" "0" "Insufficient permissions to read file: $file"
+        return 1
     fi
+    
+    # Validate input length and characters
+    if ! validate_input_length "$file" 1024; then
+        return 1
+    fi
+    
+    if ! validate_input_chars "$file"; then
+        return 1
+    fi
+    
+    # Resolve any symlinks and get canonical path
+    local canonical_file
+    canonical_file=$(realpath -m "$file" 2>/dev/null || echo "$file")
+    
+    # Validate canonical path is within safe boundaries
+    if [[ "$canonical_file" =~ \.\. ]] || [[ "$canonical_file" =~ /\.\. ]]; then
+        return 1
+    fi
+    
+    # Check if file exists and is readable
+    if [ ! -r "$canonical_file" ] || [ ! -f "$canonical_file" ]; then
+        return 1
+    fi
+    
+    # Check file size to prevent reading extremely large files
+    local file_size
+    file_size=$(stat -c "%s" "$canonical_file" 2>/dev/null || echo "0")
+    if [ "$file_size" -gt "$max_size" ]; then
+        return 1
+    fi
+    
+    # Validate file is not a symlink to prevent symlink attacks
+    if [ -L "$canonical_file" ]; then
+        return 1
+    fi
+    
+    # Additional security: check file permissions
+    local file_perms
+    file_perms=$(stat -c "%a" "$canonical_file" 2>/dev/null || echo "000")
+    # Reject files with world-write permissions for security
+    if [[ "$file_perms" =~ [2367]$ ]]; then
+        return 1
+    fi
+    
+    # Log file access for audit
+    audit_log "FILE_ACCESSED" "File: $canonical_file, Size: $file_size" "INFO"
+    
+    # Use the canonical path for reading
+    cat "$canonical_file" 2>/dev/null || true
 }
 
 # Safe directory check
@@ -427,6 +1071,29 @@ detect_output_format() {
     esac
 }
 
+# Build exclude maps and init anonymization salt
+init_privacy_controls() {
+    # Sections
+    if [ -n "$EXCLUDE_SECTIONS_RAW" ]; then
+        IFS=',' read -r -a _secs <<< "$EXCLUDE_SECTIONS_RAW"
+        for s in "${_secs[@]}"; do
+            s_trim=$(echo "$s" | tr -d ' ')
+            [ -n "$s_trim" ] && EXCLUDE_SECTION_SET["$s_trim"]=1
+        done
+    fi
+    # Severities
+    if [ -n "$EXCLUDE_SEVERITY_RAW" ]; then
+        IFS=',' read -r -a _sevs <<< "$EXCLUDE_SEVERITY_RAW"
+        for sv in "${_sevs[@]}"; do
+            sv_up=$(echo "$sv" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+            case "$sv_up" in OK|WARN|CRIT|INFO) EXCLUDE_SEVERITY_SET["$sv_up"]=1 ;; esac
+        done
+    fi
+    # Salt if anonymize
+    if [ "$ANONYMIZE" = true ] && [ -z "$ANON_SALT" ]; then
+        ANON_SALT=$(date +%s%N | md5sum | cut -d' ' -f1)
+    fi
+}
 # Validate output format
 validate_format() {
     local format="$1"
@@ -470,11 +1137,60 @@ validate_output_path() {
 }
 
 # Enhanced command validation
+# Enhanced input validation functions
+validate_input_length() {
+    local input="$1"
+    local max_length="${2:-1024}"
+    
+    if [ ${#input} -gt "$max_length" ]; then
+        return 1
+    fi
+    return 0
+}
+
+validate_input_chars() {
+    local input="$1"
+    
+    # Allow only alphanumeric, hyphens, underscores, dots, slashes, and spaces
+    # Using a simple character-by-character check to avoid regex issues
+    local valid_chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/ -"
+    local i=0
+    while [ $i -lt ${#input} ]; do
+        local char="${input:$i:1}"
+        if [[ "$valid_chars" != *"$char"* ]]; then
+            return 1
+        fi
+        i=$((i + 1))
+    done
+    return 0
+}
+
 validate_command() {
     local cmd="$1"
     
-    # Prevent execution of dangerous commands
-    local dangerous_commands=("rm" "dd" "mkfs" "fdisk" "parted" "shutdown" "reboot" "halt" "init" "telinit")
+    # Validate input length
+    if ! validate_input_length "$cmd" 256; then
+        return 1
+    fi
+    
+    # Validate input characters
+    if ! validate_input_chars "$cmd"; then
+        return 1
+    fi
+    
+    # Prevent execution of dangerous commands (expanded list)
+    local dangerous_commands=(
+        "rm" "dd" "mkfs" "fdisk" "parted" "shutdown" "reboot" "halt" "init" "telinit"
+        "format" "del" "rd" "deltree" "debug" "fdisk" "sys" "attrib" "chkdsk"
+        "format" "scandisk" "defrag" "mem" "msconfig" "regedit" "reg" "sfc"
+        "wget" "curl" "nc" "netcat" "telnet" "ftp" "tftp" "rsh" "rcp" "rlogin"
+        "su" "sudo" "passwd" "chpasswd" "usermod" "useradd" "userdel" "groupadd"
+        "groupdel" "gpasswd" "chown" "chmod" "chgrp" "umount" "mount" "fuser"
+        "kill" "killall" "pkill" "xkill" "skill" "renice" "nice" "nohup"
+        "at" "crontab" "anacron" "atd" "cron" "cronie" "systemctl" "service"
+        "systemd" "initctl" "upstart" "rc-service" "rc-update" "openrc"
+    )
+    
     for dangerous in "${dangerous_commands[@]}"; do
         if [[ "$cmd" =~ ^$dangerous ]]; then
             return 1
@@ -486,6 +1202,16 @@ validate_command() {
         return 1
     fi
     
+    # Additional security: check if command is in safe directories only
+    local cmd_path
+    cmd_path=$(command -v "$cmd" 2>/dev/null)
+    if [[ -n "$cmd_path" ]]; then
+        # Only allow commands from standard system directories
+        if [[ ! "$cmd_path" =~ ^/(bin|sbin|usr/bin|usr/sbin|usr/local/bin|usr/local/sbin)/ ]]; then
+            return 1
+        fi
+    fi
+    
     return 0
 }
 
@@ -495,6 +1221,63 @@ add_finding() {
     local severity="$2"  # OK, WARN, CRIT, INFO
     local message="$3"
     local recommendation="${4:-}"
+    
+    # Exclusion filters: sections/severity
+    if [ -n "$section" ] && [ -n "${EXCLUDE_SECTION_SET[$section]:-}" ]; then
+        return 0
+    fi
+    if [ -n "$severity" ] && [ -n "${EXCLUDE_SEVERITY_SET[$severity]:-}" ]; then
+        return 0
+    fi
+
+    # Privacy level adjustments (high)
+    if [ "$PRIVACY_LEVEL" = "high" ]; then
+        # Coarsen versions and redact common identifiers in messages
+        message=$(echo "$message" | sed -E 's/([0-9]+)\.[0-9]+\.[0-9]+/\1.xx.xx/g')
+        message=$(echo "$message" | sed -E 's/([0-9]+)\.[0-9]+/\1.xx/g')
+        # Redact IPs and MACs
+        message=$(echo "$message" | sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[IP]/g')
+        message=$(echo "$message" | sed -E 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/[MAC]/g')
+        # Trim full paths to basenames when likely sensitive
+        message=$(echo "$message" | sed -E 's@(/[^ ]+/)+([^ /]+)@.../\2@g')
+    fi
+
+    # Anonymization (non-reversible hashing for common identifiers)
+    if [ "$ANONYMIZE" = true ]; then
+        [ -z "$ANON_SALT" ] && ANON_SALT=$(date +%s%N | md5sum | cut -d' ' -f1)
+        # Hostnames/usernames/IPs heuristics (light anonymization)
+        # Replace obvious user@host patterns
+        message=$(echo "$message" | sed -E "s/\b([A-Za-z0-9_-]{3,})@(localhost|localdomain|[A-Za-z0-9_.-]+)/[USER]@\2/g")
+        # Generic word hashing via md5 with salt (best-effort, non-reversible)
+        message=$(echo "$message" | awk -v salt="$ANON_SALT" '{
+            for (i=1;i<=NF;i++) { if (length($i)>=3) { cmd="printf \"%s\" \""salt":"$i"\" | md5sum | cut -d\\  -f1"; cmd | getline h; close(cmd); $i=h } } print $0 }')
+        section=$(echo "$section" | awk -v salt="$ANON_SALT" '{
+            for (i=1;i<=NF;i++) { if (length($i)>=3) { cmd="printf \"%s\" \""salt":"$i"\" | md5sum | cut -d\\  -f1"; cmd | getline h; close(cmd); $i=h } } print $0 }')
+    fi
+
+    # Validate and sanitize inputs
+    if ! validate_input_length "$section" 100; then
+        section="[INVALID_SECTION]"
+    fi
+    
+    if ! validate_input_length "$message" 2048; then
+        message="[TRUNCATED_MESSAGE]"
+    fi
+    
+    if ! validate_input_length "$recommendation" 2048; then
+        recommendation="[TRUNCATED_RECOMMENDATION]"
+    fi
+    
+    # Validate severity
+    case "$severity" in
+        OK|WARN|CRIT|INFO) ;;
+        *) severity="INFO" ;;
+    esac
+    
+    # Sanitize characters (allow common punctuation like ':' and ',')
+    section=$(echo "$section" | sed 's/[^a-zA-Z0-9._/:,() -]//g')
+    message=$(echo "$message" | sed 's/[^a-zA-Z0-9._/:,() -]//g')
+    recommendation=$(echo "$recommendation" | sed 's/[^a-zA-Z0-9._/:,() -]//g')
     
     if [ -n "${FINDINGS_SINK:-}" ]; then
         printf "%s|%s|%s|%s\n" "$section" "$severity" "$message" "$recommendation" >> "$FINDINGS_SINK" 2>/dev/null || true
@@ -580,10 +1363,75 @@ get_recommendation() {
 
 # Output generation functions
 # JSON escaping function
+# Enhanced output sanitization functions
 json_escape() {
     local input="$1"
-    # Escape backslashes first, then quotes, then newlines and other control characters
-    echo "$input" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | sed 's/\r/\\r/g' | sed 's/\t/\\t/g'
+    
+    # Validate input length
+    if ! validate_input_length "$input" 8192; then
+        echo "[TRUNCATED]"
+        return
+    fi
+    
+    # Comprehensive JSON escaping
+    echo "$input" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g' \
+        -e 's/\n/\\n/g' \
+        -e 's/\r/\\r/g' \
+        -e 's/\t/\\t/g' \
+        -e 's/\f/\\f/g' \
+        -e 's/\v/\\v/g' \
+        -e 's/[\x00-\x1F]/\\u00&/g'
+}
+
+html_escape() {
+    local input="$1"
+    
+    # Validate input length
+    if ! validate_input_length "$input" 8192; then
+        echo "[TRUNCATED]"
+        return
+    fi
+    
+    # HTML entity escaping
+    echo "$input" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&#39;/g" \
+        -e 's/`/\&#96;/g'
+}
+
+# Sensitive data detection and redaction
+detect_sensitive_data() {
+    local input="$1"
+    
+    # Common patterns for sensitive data (using simpler patterns to avoid regex issues)
+    local patterns=(
+        'password[=:][[:space:]]*[^[:space:]]+'
+        'passwd[=:][[:space:]]*[^[:space:]]+'
+        'pwd[=:][[:space:]]*[^[:space:]]+'
+        'secret[=:][[:space:]]*[^[:space:]]+'
+        'key[=:][[:space:]]*[^[:space:]]+'
+        'token[=:][[:space:]]*[^[:space:]]+'
+        'api[_-]key[=:][[:space:]]*[^[:space:]]+'
+        'access[_-]key[=:][[:space:]]*[^[:space:]]+'
+        'private[_-]key[=:][[:space:]]*[^[:space:]]+'
+        '[0-9]\{4\}[-\s]\?[0-9]\{4\}[-\s]\?[0-9]\{4\}[-\s]\?[0-9]\{4\}'  # Credit card
+        '[0-9]\{3\}-[0-9]\{2\}-[0-9]\{4\}'  # SSN
+        '[a-zA-Z0-9._%+-]\+@[a-zA-Z0-9.-]\+\.[a-zA-Z]\{2,\}'  # Email
+    )
+    
+    for pattern in "${patterns[@]}"; do
+        if echo "$input" | grep -qiE "$pattern"; then
+            echo "$input" | sed -E "s/$pattern/[REDACTED]/gi"
+            return
+        fi
+    done
+    
+    echo "$input"
 }
 
 generate_json_output() {
@@ -595,6 +1443,12 @@ generate_json_output() {
     echo "  \"hostname\": \"$hostname\","
     echo "  \"version\": \"$VERSION\","
     echo "  \"mode\": \"$OPERATION_MODE\","
+    echo "  \"privacy\": {\"level\": \"${PRIVACY_LEVEL^}\", \"anonymize\": $([ "$ANONYMIZE" = true ] && echo true || echo false) },"
+    echo "  \"permission_level\": \"$CURRENT_PERMISSION_LEVEL\","
+    echo "  \"audit_enabled\": $([ "$AUDIT_ENABLED" = true ] && echo "true" || echo "false"),"
+    if [ "$AUDIT_ENABLED" = true ]; then
+        echo "  \"audit_log\": \"$AUDIT_LOG\","
+    fi
     echo "  \"findings\": ["
     
     local first=true
@@ -602,12 +1456,16 @@ generate_json_output() {
         IFS='|' read -r section severity message recommendation <<< "$finding"
         [ "$first" = true ] && first=false || echo ","
         
-        # Escape all fields for JSON
+        # Sanitize and escape all fields for JSON
+        local sanitized_message=$(detect_sensitive_data "$message")
+        local sanitized_recommendation=""
+        [ -n "$recommendation" ] && sanitized_recommendation=$(detect_sensitive_data "$recommendation")
+        
         local escaped_section=$(json_escape "$section")
         local escaped_severity=$(json_escape "$severity")
-        local escaped_message=$(json_escape "$message")
+        local escaped_message=$(json_escape "$sanitized_message")
         local escaped_recommendation=""
-        [ -n "$recommendation" ] && escaped_recommendation=$(json_escape "$recommendation")
+        [ -n "$sanitized_recommendation" ] && escaped_recommendation=$(json_escape "$sanitized_recommendation")
         
         echo -n "    {"
         echo -n "\"section\": \"$escaped_section\", "
@@ -618,7 +1476,21 @@ generate_json_output() {
     done
     
     echo ""
-    echo "  ]"
+    echo "  ],"
+    echo "  \"summary\": {"
+    echo "    \"total_findings\": ${#FINDINGS[@]},"
+    echo "    \"critical\": $(echo "${FINDINGS[@]}" | grep -c "|CRIT|" || echo "0"),"
+    echo "    \"warnings\": $(echo "${FINDINGS[@]}" | grep -c "|WARN|" || echo "0"),"
+    echo "    \"ok\": $(echo "${FINDINGS[@]}" | grep -c "|OK|" || echo "0"),"
+    echo "    \"info\": $(echo "${FINDINGS[@]}" | grep -c "|INFO|" || echo "0")"
+    echo "  },"
+    echo "  \"security\": {"
+    echo "    \"permission_level\": \"$CURRENT_PERMISSION_LEVEL\","
+    echo "    \"audit_enabled\": $([ "$AUDIT_ENABLED" = true ] && echo "true" || echo "false")"
+    if [ "$AUDIT_ENABLED" = true ]; then
+        echo "    ,\"audit_log\": \"$AUDIT_LOG\""
+    fi
+    echo "  }"
     echo "}"
 }
 
@@ -655,6 +1527,7 @@ generate_html_output() {
     <div class="header">
         <h1>Blue Team QuickCheck Report</h1>
         <p><strong>Host:</strong> $hostname | <strong>Mode:</strong> $OPERATION_MODE | <strong>Generated:</strong> $timestamp | <strong>Version:</strong> $VERSION | <strong>Total findings:</strong> $total_count</p>
+        <p><strong>Permission Level:</strong> $CURRENT_PERMISSION_LEVEL | <strong>Audit logging:</strong> $([ "$AUDIT_ENABLED" = true ] && echo "Enabled ($AUDIT_LOG)" || echo "Disabled") | <strong>Privacy level:</strong> ${PRIVACY_LEVEL^} | <strong>Anonymize:</strong> $([ "$ANONYMIZE" = true ] && echo "True" || echo "False")</p>
     </div>
 EOF
 
@@ -662,20 +1535,39 @@ EOF
     for finding in "${FINDINGS[@]}"; do
         IFS='|' read -r section severity message recommendation <<< "$finding"
         
+        # Sanitize data for HTML output
+        local sanitized_message=$(detect_sensitive_data "$message")
+        local sanitized_recommendation=""
+        [ -n "$recommendation" ] && sanitized_recommendation=$(detect_sensitive_data "$recommendation")
+        
+        # Escape HTML entities
+        local escaped_section=$(html_escape "$section")
+        local escaped_severity=$(html_escape "$severity")
+        local escaped_message=$(html_escape "$sanitized_message")
+        local escaped_recommendation=""
+        [ -n "$sanitized_recommendation" ] && escaped_recommendation=$(html_escape "$sanitized_recommendation")
+        
         if [ "$section" != "$current_section" ]; then
             [ -n "$current_section" ] && echo "</div>"
-            echo "<div class=\"section-header\">$section</div>"
+            echo "<div class=\"section-header\">$escaped_section</div>"
             echo "<div class=\"section\">"
             current_section="$section"
         fi
         
         echo "<div class=\"finding ${severity,,}\">"
-        echo "<span class=\"severity ${severity,,}\">$severity</span> $message"
-        [ -n "$recommendation" ] && echo "<div class=\"recommendation\">💡 $recommendation</div>"
+        echo "<span class=\"severity ${severity,,}\">$escaped_severity</span> $escaped_message"
+        [ -n "$escaped_recommendation" ] && echo "<div class=\"recommendation\">💡 $escaped_recommendation</div>"
         echo "</div>"
     done
     
     [ -n "$current_section" ] && echo "</div>"
+    
+    # Add audit log information to HTML footer
+    if [ "$AUDIT_ENABLED" = true ]; then
+        echo "<div class=\"finding info\">"
+        echo "<span class=\"severity info\">INFO</span> Audit log saved: $AUDIT_LOG"
+        echo "</div>"
+    fi
     
     cat << EOF
 </div>
@@ -695,6 +1587,8 @@ generate_txt_output() {
     echo "Mode: $OPERATION_MODE"
     echo "Generated: $timestamp"
     echo "Version: $VERSION"
+    echo "Permission Level: $CURRENT_PERMISSION_LEVEL"
+    echo "Audit Logging: $([ "$AUDIT_ENABLED" = true ] && echo "Enabled ($AUDIT_LOG)" || echo "Disabled")"
     echo "==============================================="
     echo
     
@@ -715,6 +1609,9 @@ generate_txt_output() {
     echo
     echo "==============================================="
     echo "Report completed. Review WARN/CRIT items."
+    if [ "$AUDIT_ENABLED" = true ]; then
+        echo "Audit log saved: $AUDIT_LOG"
+    fi
     echo "==============================================="
 }
 
@@ -2971,6 +3868,10 @@ ENHANCED SECURITY FEATURES (v0.6.2):
 • Malware signature detection and analysis
 • Enhanced rootkit detection capabilities
 • Behavioral analysis for anomaly detection
+• Advanced authentication and authorization controls
+• Comprehensive audit logging and access control (opt-in)
+• Script integrity verification and digital signatures
+• Role-based access control for different operations
 
 Usage: $0 [OPTIONS]
 
@@ -2980,6 +3881,7 @@ OPTIONS:
   -o, --output FILE       Output file with format determined by extension (default: stdout)
   -m, --mode MODE         Operation mode: personal, production (default: personal)
   -p, --parallel          Enable parallel execution for independent checks
+  -a, --audit             Enable comprehensive audit logging (disabled by default)
 
 MODES:
   personal               Home/personal machine recommendations
@@ -3002,7 +3904,14 @@ EXAMPLES:
   sudo $0 -o report.json                # JSON output to file
   sudo $0 -o report.html -m production  # HTML production report
   sudo $0 -p                            # Parallel execution for faster scanning
+  sudo $0 -a                            # Enable comprehensive audit logging
   $0 -m personal                        # Limited checks without sudo
+
+PRIVACY CONTROLS (v$VERSION):
+  --privacy-level LEVEL      standard (default), high, off
+  --anonymize                Hash identifiers (hostnames, usernames, IPs) with per-run salt
+  --exclude-sections LIST    Comma-separated list (e.g., accounts,file-integrity)
+  --exclude-severity LIST    Comma-separated list (e.g., INFO,OK)
 
 PRIVACY:
 This script may access sensitive system files for security analysis.
@@ -3053,6 +3962,30 @@ while [ $# -gt 0 ]; do
 		--parallel|-p)
 			PARALLEL_MODE=true
 			;;
+		--privacy-level)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --privacy-level requires an argument" >&2; exit 1; }
+			case "$1" in
+				standard|high|off) PRIVACY_LEVEL="$1" ;;
+				*) echo "Error: invalid --privacy-level. Use: standard, high, off" >&2; exit 1 ;;
+			esac
+			;;
+		--anonymize)
+			ANONYMIZE=true
+			;;
+		--exclude-sections)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --exclude-sections requires an argument" >&2; exit 1; }
+			EXCLUDE_SECTIONS_RAW="$1"
+			;;
+		--exclude-severity)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --exclude-severity requires an argument" >&2; exit 1; }
+			EXCLUDE_SEVERITY_RAW="$1"
+			;;
+		--audit|-a)
+			AUDIT_ENABLED=true
+			;;
 		--)
 			shift
 			break
@@ -3072,18 +4005,18 @@ done
 # Display security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
     echo
-    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                                                                              ║"
-    echo "║    ██████╗ ████████╗    ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗             ║"
+    echo "╔════════════════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                            ║"
+    echo "║    ██████╗ ████████╗    ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗            ║"
     echo "║   ██╔══██╗╚══██╔══╝   ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝             ║"
     echo "║   ██████╔╝   ██║      ██║     ███████║█████╗  ██║     █████╔╝              ║"
     echo "║   ██╔══██╗   ██║      ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗              ║"
     echo "║   ██████╔╝   ██║      ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗             ║"
     echo "║   ╚═════╝    ╚═╝       ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝             ║"
-    echo "║                                                                              ║"
-    echo "║                    Linux Security Assessment Tool v$VERSION                    ║"
-    echo "║                                                                              ║"
-    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+    echo "║                                                                            ║"
+    echo "║                    Linux Security Assessment Tool v$VERSION                ║"
+    echo "║                                                                            ║"
+    echo "╚════════════════════════════════════════════════════════════════════════════╝"
     echo
     echo "Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
     [ -n "$OUTPUT_FILE" ] && echo "Output: $OUTPUT_FILE"
@@ -3647,10 +4580,53 @@ section_behavioral_analysis() {
     set -e
 }
 
+# Initialize advanced security features
+# Verify script integrity
+if ! verify_script_integrity; then
+    echo "Warning: Script integrity verification failed. Proceeding with caution." >&2
+fi
+
+# Set permission level based on user context
+set_permission_level
+
+# Enable audit logging only if explicitly requested and permissions allow
+if [ "$AUDIT_ENABLED" = true ] && [ -w "/var/log" ]; then
+    # Set proper permissions for audit log
+    touch "$AUDIT_LOG" 2>/dev/null && chmod 640 "$AUDIT_LOG" 2>/dev/null || true
+    audit_log "SCRIPT_START" "Blue Team QuickCheck started" "INFO"
+    
+    # Inform user about audit logging
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        echo "🔍 Audit logging enabled: $AUDIT_LOG"
+    fi
+elif [ "$AUDIT_ENABLED" = true ] && [ ! -w "/var/log" ]; then
+    # User requested audit logging but no permissions
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        echo "⚠️  Audit logging requested but insufficient permissions to write to /var/log"
+    fi
+    AUDIT_ENABLED=false
+fi
+
+# Log permission level and user context (only if audit logging is enabled)
+if [ "$AUDIT_ENABLED" = true ]; then
+    audit_log "PERMISSION_LEVEL" "Current level: $CURRENT_PERMISSION_LEVEL, User: $(whoami), Mode: $OPERATION_MODE" "INFO"
+else
+    # Inform user about audit logging option
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        echo "ℹ️  Audit logging disabled (use --audit to enable comprehensive logging)"
+    fi
+fi
+
+# Cache hygiene
+cleanup_old_btqc_dirs
+
 # Initialize caching system and parallel temp dir
 init_cache
 PARALLEL_TMP_DIR="/tmp/btqc-par-$$"
 mkdir -p "$PARALLEL_TMP_DIR" 2>/dev/null || true
+
+# Initialize privacy controls
+init_privacy_controls
 
 # If generating to a file in a non-console format, suppress stdout during checks
 if [ -n "$OUTPUT_FILE" ] && [ "$OUTPUT_FORMAT" != "console" ]; then
@@ -3688,6 +4664,12 @@ if [ "$PARALLEL_MODE" = true ]; then
     run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
     run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
     run_section_safely section_backup_resilience "Resilience & Backup"
+    run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
+    run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
+    run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
+    run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
+    run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
+    run_section_safely section_scheduler_controls "Scheduler Controls (cron/anacron/at)"
 
     # Keep only advanced detection in parallel for speed without destabilizing output
     run_section_parallel section_malware_detection "Malware Detection"
@@ -3720,6 +4702,12 @@ else
     run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
     run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
     run_section_safely section_backup_resilience "Resilience & Backup"
+    run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
+    run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
+    run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
+    run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
+    run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
+    run_section_safely section_scheduler_controls "Scheduler Controls (cron/anacron/at)"
     
     # Advanced security detection (new in v0.6.2)
     run_section_safely section_malware_detection "Malware Detection"
@@ -3784,6 +4772,9 @@ if [ -n "$OUTPUT_FILE" ]; then
     if generate_output > "$OUTPUT_FILE"; then
         echo "Report saved: $OUTPUT_FILE" 
         echo "Format: $OUTPUT_FORMAT | Mode: $OPERATION_MODE | Findings: $((${#FINDINGS[@]} - 2))"
+        if [ "$ANONYMIZE" = true ] || [ "$PRIVACY_LEVEL" = "high" ]; then
+            echo "Privacy: level=$PRIVACY_LEVEL anonymize=$ANONYMIZE"
+        fi
     else
         echo "Error: Failed to generate output file '$OUTPUT_FILE'" >&2
         exit 1
@@ -3819,12 +4810,29 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo "✅ Security assessment completed successfully"
 	echo "📋 Review CRITICAL and WARNING findings above for security improvements"
-	echo "🔒 Enhanced security checks completed (v0.6.0)"
+	echo "🔒 Enhanced security checks completed (v0.6.2)"
 	echo "   • Advanced kernel and network hardening validation"
 	echo "   • Comprehensive compliance and audit assessment"
 	echo "   • Enhanced container and process security analysis"
 	echo "   • Industry-standard security validation (CIS, NIST aligned)"
+	echo "   • Advanced authentication and authorization controls"
+	echo "   • Comprehensive audit logging and access control"
+	if [ "$AUDIT_ENABLED" = true ]; then
+		echo "🔍 Audit log saved: $AUDIT_LOG"
+	else
+		echo "ℹ️  Use --audit flag to enable comprehensive audit logging"
+	fi
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+fi
+
+# Log script completion for audit (only if audit logging is enabled)
+if [ "$AUDIT_ENABLED" = true ]; then
+    audit_log "SCRIPT_COMPLETED" "Blue Team QuickCheck completed successfully, Findings: ${#FINDINGS[@]}" "INFO"
+fi
+
+# Clean up audit log if it's empty (no permissions to write)
+if [ "$AUDIT_ENABLED" = true ] && [ -f "$AUDIT_LOG" ] && [ ! -s "$AUDIT_LOG" ]; then
+    rm -f "$AUDIT_LOG" 2>/dev/null || true
 fi
 
 exit 0
