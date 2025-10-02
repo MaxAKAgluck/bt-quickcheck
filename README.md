@@ -136,6 +136,11 @@ OPTIONS:
   -o, --output FILE       Output file with format determined by extension (default: stdout)
   -m, --mode MODE         Operation mode: personal, production (default: personal)
   -p, --parallel          Enable parallel execution for independent checks
+  -a, --audit             Enable comprehensive audit logging (disabled by default)
+      --privacy-level L   standard (default), high, off
+      --anonymize         Hash identifiers (hostnames, usernames, IPs) with per-run salt
+      --exclude-sections  Comma-separated list (e.g., accounts,file-integrity)
+      --exclude-severity  Comma-separated list (e.g., INFO,OK)
 
 OUTPUT FORMATS (determined by file extension):
   .json                  JSON structured output for automation/SIEM
@@ -143,6 +148,20 @@ OUTPUT FORMATS (determined by file extension):
   .txt                   Plain text report
   (no extension)         Colored console output (default)
 ```
+
+### Saving Reports to Current Directory
+
+You can save reports directly in the directory where you run the script. Relative paths are allowed and validated safely.
+
+Examples:
+
+```bash
+sudo ./bt-quickcheck.sh -m personal --anonymize -o report.json
+sudo ./bt-quickcheck.sh -o ./report.html
+sudo ./bt-quickcheck.sh -o results/report.txt
+```
+
+Allowed locations include your current working directory, your home directory, and standard temporary directories (`/tmp`, `/var/tmp`). Paths are canonicalized to prevent traversal attacks.
 
 ## Sudo Requirements
 
@@ -307,6 +326,7 @@ sudo ./bt-quickcheck.sh -o security-report.json
 - Structured data for automation
 - SIEM integration ready
 - Machine-parseable format
+ - Includes privacy header: `{ "privacy": { "level": "standard|high|off", "anonymize": true|false } }`
 
 ### HTML Report
 ```bash
@@ -315,6 +335,7 @@ sudo ./bt-quickcheck.sh -o security-report.html
 - Professional styled report
 - Executive summary ready
 - Easy sharing and archiving
+ - Header shows privacy and anonymization state
 
 ### Plain Text
 ```bash
@@ -323,6 +344,24 @@ sudo ./bt-quickcheck.sh -o security-report.txt
 - Simple text format
 - Email-friendly output
 - Legacy system compatible
+
+## Optional: Encrypt your report
+
+bt-quickcheck is dependency-light and does not embed encryption. To encrypt your outputs, use standard tools you already trust:
+
+```bash
+# OpenSSL (AES-256-GCM)
+openssl enc -aes-256-gcm -salt -pbkdf2 -iter 250000 \
+  -in security-report.json -out security-report.json.enc
+
+# GPG symmetric (AES256)
+gpg --symmetric --cipher-algo AES256 security-report.json
+
+# Age (if installed)
+age -p -o security-report.json.age security-report.json
+```
+
+Recommended: store keys securely, avoid keeping plaintext after verifying the encrypted file, and follow your organization’s data handling standards.
 
 ## Implementation Progress
 
@@ -400,6 +439,15 @@ ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 - Avoid executing from `/tmp/` or `/dev/shm/`
 - Parameter sanitization
 - Wrapped execution with error handling
+
+### New Security Hardening Features
+- Regex-based input validation for safe character sets
+- Hardened output path validation with canonicalization
+- Combined argument-length limit for command execution safety
+- Expanded dangerous command blocklist (interpreters, editors, archive tools), blocking `eval`, `source`, and `bash|sh -c`
+- Disabled shell function inheritance and `BASH_ENV` to prevent injection
+- Sensitive-data redaction applied to JSON/HTML/TXT outputs
+- Secure temp directories via `mktemp -d` with 0700 permissions
 
 ## References
 
