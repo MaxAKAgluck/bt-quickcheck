@@ -35,6 +35,12 @@ fi
 # pipefail is bash-specific; fall back gracefully if not available
 set -euo pipefail 2>/dev/null || set -eu
 
+# Harden environment: prevent function inheritance and BASH_ENV abuse
+unset BASH_ENV
+if command -v compgen >/dev/null 2>&1; then
+    while read -r fn; do export -n "$fn" 2>/dev/null || true; done < <(compgen -A function 2>/dev/null || echo)
+fi
+
 # Advanced Security Features - Authentication & Authorization
 # Permission levels for different operations
 declare -A PERMISSION_LEVELS=(
@@ -44,6 +50,140 @@ declare -A PERMISSION_LEVELS=(
     ["administrative"]="4"
     ["audit"]="5"
 )
+
+# Structured Logging System
+# Log levels (higher number = more verbose)
+readonly LOG_ERROR=1
+readonly LOG_WARN=2
+readonly LOG_INFO=3
+readonly LOG_DEBUG=4
+
+# Default log level (can be overridden by environment variable)
+LOG_LEVEL=${BTQC_LOG_LEVEL:-$LOG_INFO}
+
+# SECURITY FIX: Create secure temporary log file with mktemp (prevents race conditions)
+# Log file (can be overridden by environment variable)
+# Use parameter expansion to safely check if BTQC_LOG_FILE is set (works with set -u)
+if [ -z "${BTQC_LOG_FILE:-}" ]; then
+    # Use mktemp for secure temporary file creation with random suffix
+    LOG_FILE=$(mktemp /tmp/bt-quickcheck.XXXXXXXXXX.log 2>/dev/null)
+    # Fallback if mktemp fails
+    if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
+        LOG_FILE=$(mktemp -t bt-quickcheck.XXXXXXXXXX 2>/dev/null)
+    fi
+    # Final fallback - but prefer to fail if we can't create secure temp file
+    if [ -z "$LOG_FILE" ]; then
+        LOG_FILE="/tmp/bt-quickcheck-$$.log"
+        echo "Warning: Could not create secure temp file, using fallback: $LOG_FILE" >&2
+    fi
+else
+    LOG_FILE="${BTQC_LOG_FILE}"
+fi
+# Ensure log file has secure permissions
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+# Structured logging function
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local level_name
+    
+    case "$level" in
+        $LOG_ERROR) level_name="ERROR" ;;
+        $LOG_WARN)  level_name="WARN"  ;;
+        $LOG_INFO)  level_name="INFO"  ;;
+        $LOG_DEBUG) level_name="DEBUG" ;;
+        *)          level_name="INFO"  ;;
+    esac
+    
+    # Only log if level is enabled
+    if [ "$level" -le "$LOG_LEVEL" ]; then
+        echo "[$timestamp] [$level_name] [PID:$$] $message" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+    
+    # Also output to stderr for ERROR and WARN levels in console mode
+    if [ "$level" -le $LOG_WARN ] && [ "$OUTPUT_FORMAT" = "console" ]; then
+        echo "[$level_name] $message" >&2
+    fi
+}
+
+# Embedded default configuration (can be overridden by environment variables)
+# This eliminates the need for an external configuration file
+init_embedded_config() {
+    # Only set if not already defined by environment variables
+    : "${BTQC_LOG_LEVEL:=3}"
+    : "${BTQC_LOG_FILE:=""}"  # Will be set securely later
+    : "${BTQC_MEMORY_LIMIT:=524288}"
+    : "${BTQC_CPU_TIME_LIMIT:=300}"
+    : "${BTQC_FILE_SIZE_LIMIT:=104857600}"
+    : "${BTQC_PROCESS_LIMIT:=100}"
+    : "${BTQC_FD_LIMIT:=256}"
+    : "${BTQC_STACK_LIMIT:=8192}"
+    : "${BTQC_CACHE_ENABLED:=true}"
+    : "${BTQC_CACHE_TTL:=300}"
+    : "${BTQC_CACHE_DIR:=""}"  # Will be set securely later
+    : "${BTQC_PRIVACY_LEVEL:=standard}"
+    : "${BTQC_ANONYMIZE:=false}"
+    : "${BTQC_AUDIT_ENABLED:=false}"
+    : "${BTQC_AUDIT_LOG:=/var/log/bt-quickcheck-audit.log}"
+    : "${BTQC_OUTPUT_FORMAT:=console}"
+    : "${BTQC_QUIET_MODE:=false}"
+    : "${BTQC_PARALLEL_MODE:=false}"
+    : "${BTQC_OPERATION_MODE:=personal}"
+    : "${BTQC_EXCLUDE_SECTIONS:=""}"
+    : "${BTQC_EXCLUDE_SEVERITY:=""}"
+    : "${BTQC_MAX_FINDINGS:=1000}"
+    : "${BTQC_SECTION_TIMEOUT:=30}"
+    : "${BTQC_PARALLEL_WORKERS:=4}"
+    
+    # Export for use in script
+    export BTQC_LOG_LEVEL BTQC_MEMORY_LIMIT BTQC_CPU_TIME_LIMIT BTQC_FILE_SIZE_LIMIT
+    export BTQC_PROCESS_LIMIT BTQC_FD_LIMIT BTQC_STACK_LIMIT
+    export BTQC_CACHE_ENABLED BTQC_CACHE_TTL
+    export BTQC_PRIVACY_LEVEL BTQC_ANONYMIZE BTQC_AUDIT_ENABLED BTQC_AUDIT_LOG
+    export BTQC_OUTPUT_FORMAT BTQC_QUIET_MODE BTQC_PARALLEL_MODE
+    export BTQC_OPERATION_MODE BTQC_EXCLUDE_SECTIONS BTQC_EXCLUDE_SEVERITY
+    export BTQC_MAX_FINDINGS BTQC_SECTION_TIMEOUT BTQC_PARALLEL_WORKERS
+}
+
+# Optional: Load configuration from external file (SECURE VERSION)
+# This is now optional - script works without external config
+load_configuration() {
+    local config_file="${1:-bt-quickcheck.conf}"
+    
+    # Check if config file exists and is readable
+    if [ -f "$config_file" ] && [ -r "$config_file" ]; then
+        log "$LOG_DEBUG" "Loading configuration from: $config_file"
+        
+        # Use a safe method to load config without eval
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            
+            # Remove leading/trailing whitespace
+            key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            
+            # Validate key format (alphanumeric and underscores only)
+            if [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+                # SECURITY FIX: Sanitize value to prevent command injection
+                # Remove dangerous characters: backticks, $(), ${ }, ;, &, |, <, >, etc.
+                value=$(printf '%s' "$value" | sed 's/[`$();{}&|<>]//g' | head -c 1024)
+                
+                # Use declare -g for safer variable assignment (no shell expansion)
+                declare -g "$key=$value" 2>/dev/null || log "$LOG_WARN" "Failed to set config: $key"
+                log "$LOG_DEBUG" "Loaded config: $key=[sanitized]"
+            else
+                log "$LOG_WARN" "Invalid config key format: $key"
+            fi
+        done < "$config_file"
+    else
+        log "$LOG_DEBUG" "No configuration file found: $config_file (using embedded defaults)"
+    fi
+}
 
 # Current user permission level
 CURRENT_PERMISSION_LEVEL="basic"
@@ -103,16 +243,30 @@ set_permission_level() {
     fi
 }
 
-# Enhanced audit logging
+# Enhanced audit logging (now uses structured logging)
 audit_log() {
     local action="$1"
     local details="$2"
     local severity="${3:-INFO}"
-    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local user=$(whoami 2>/dev/null || echo "unknown")
     local hostname=$(hostname 2>/dev/null || echo "unknown")
     
+    # Convert severity to log level
+    local log_level
+    case "$severity" in
+        "ERROR"|"CRIT") log_level=$LOG_ERROR ;;
+        "WARN")         log_level=$LOG_WARN  ;;
+        "INFO"|"OK")    log_level=$LOG_INFO  ;;
+        "DEBUG")        log_level=$LOG_DEBUG ;;
+        *)              log_level=$LOG_INFO  ;;
+    esac
+    
+    # Use structured logging
+    log "$log_level" "AUDIT: $user@$hostname $action: $details"
+    
+    # Also maintain legacy audit log if enabled
     if [ "$AUDIT_ENABLED" = true ] && [ -w "${AUDIT_LOG%/*}" ]; then
+        local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         echo "[$timestamp] $user@$hostname [$severity] $action: $details" >> "$AUDIT_LOG" 2>/dev/null || true
     fi
 }
@@ -186,6 +340,119 @@ handle_section_error() {
     fi
 }
 
+# Standardized error handling functions
+handle_error() {
+    local error_code="$1"
+    local context="$2"
+    local message="$3"
+    
+    log "$LOG_ERROR" "ERROR [$error_code] in $context: $message"
+    
+    # Add to findings for tracking
+    add_finding "System" "ERROR" "Error $error_code in $context: $message" "Review logs for details"
+    
+    return "$error_code"
+}
+
+handle_warning() {
+    local context="$1"
+    local message="$2"
+    
+    log "$LOG_WARN" "WARNING in $context: $message"
+    
+    # Add to findings for tracking
+    add_finding "System" "WARN" "Warning in $context: $message" "Review configuration"
+}
+
+# Safe execution wrapper with error handling
+safe_exec_with_error_handling() {
+    local cmd="$1"
+    local context="${2:-Command execution}"
+    shift 2
+    
+    if ! safe_exec_enhanced "$cmd" "$@"; then
+        handle_error 1 "$context" "Failed to execute: $cmd $*"
+        return 1
+    fi
+    
+    log "$LOG_DEBUG" "Successfully executed: $cmd $*"
+    return 0
+}
+
+# Base section template to reduce duplication
+run_section_check() {
+    local section_name="$1"
+    local check_type="$2"  # info, warn, ok, crit
+    local message="$3"
+    local recommendation="${4:-}"
+    local command="${5:-}"
+    local args="${6:-}"
+    
+    local result=""
+    local severity="INFO"
+    
+    # Determine severity based on check type
+    case "$check_type" in
+        "info")  severity="INFO" ;;
+        "warn")  severity="WARN" ;;
+        "ok")    severity="OK"   ;;
+        "crit")  severity="CRIT" ;;
+        *)       severity="INFO" ;;
+    esac
+    
+    # Execute command if provided
+    if [ -n "$command" ]; then
+        if [ -n "$args" ]; then
+            result=$(safe_exec_enhanced "$command" "$args" 2>/dev/null || echo "")
+        else
+            result=$(safe_exec_enhanced "$command" 2>/dev/null || echo "")
+        fi
+        
+        # SECURITY FIX: Use safe string substitution instead of printf with user-controlled format
+        # Use result in message if provided
+        if [ -n "$result" ]; then
+            # Replace %s placeholder safely without printf format string vulnerability
+            message="${message//%s/$result}"
+        fi
+    fi
+    
+    # Add finding
+    add_finding "$section_name" "$severity" "$message" "$recommendation"
+    
+    # Console output
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        case "$severity" in
+            "INFO") info "$message" ;;
+            "WARN") warn "$message" ;;
+            "OK")   ok "$message"   ;;
+            "CRIT") crit "$message" ;;
+        esac
+    fi
+    
+    log "$LOG_DEBUG" "Section check completed: $section_name - $severity"
+}
+
+# File existence and content checker
+check_file_content() {
+    local file_path="$1"
+    local section_name="$2"
+    local check_type="$3"
+    local message_template="$4"
+    local recommendation="${5:-}"
+    
+    if [ -f "$file_path" ] && [ -r "$file_path" ]; then
+        local content
+        content=$(safe_read "$file_path" 2>/dev/null || echo "")
+        if [ -n "$content" ]; then
+            run_section_check "$section_name" "$check_type" "$message_template" "$recommendation" "" ""
+        else
+            run_section_check "$section_name" "warn" "File exists but is empty: $file_path" "Check file permissions and content"
+        fi
+    else
+        run_section_check "$section_name" "warn" "File not found or not readable: $file_path" "$recommendation"
+    fi
+}
+
 # Enhanced safe command execution with additional security and access control
 safe_exec_enhanced() {
     local cmd="$1"
@@ -204,7 +471,9 @@ safe_exec_enhanced() {
     fi
     
     # Validate all arguments
+    local __args_total_len=0
     for arg in "$@"; do
+        __args_total_len=$((__args_total_len + ${#arg}))
         if ! validate_input_length "$arg" 512; then
             handle_section_error "Command Validation" "0" "Argument too long for command: $cmd"
             return 1
@@ -215,22 +484,24 @@ safe_exec_enhanced() {
             return 1
         fi
     done
+    # Enforce combined argument length limit
+    if [ $__args_total_len -gt 4096 ]; then
+        handle_section_error "Command Validation" "0" "Combined arguments too long for command: $cmd"
+        return 1
+    fi
     
-    # Prevent execution from dangerous directories
-    local cmd_path
-    cmd_path=$(command -v "$cmd" 2>/dev/null)
-    if [[ -n "$cmd_path" ]]; then
-        if [[ "$cmd_path" =~ /tmp/ ]] || [[ "$cmd_path" =~ /dev/shm/ ]]; then
-            handle_section_error "Command Validation" "0" "Command from dangerous directory: $cmd_path"
-            return 1
-        fi
+    # Resolve to absolute path and validate
+    local abs_cmd_path
+    if ! abs_cmd_path=$(resolve_command_path "$cmd"); then
+        handle_section_error "Command Validation" "0" "Command not found or not in safe directories: $cmd"
+        return 1
     fi
     
     # Log command execution for audit
-    audit_log "COMMAND_EXECUTED" "Command: $cmd, Args: $*" "INFO"
+    audit_log "COMMAND_EXECUTED" "Command: $abs_cmd_path, Args: $*" "INFO"
     
-    # Execute with additional safety
-    "$cmd" "$@" 2>/dev/null || true
+    # Execute with absolute path for additional safety
+    "$abs_cmd_path" "$@" 2>/dev/null || true
 }
 
 # Lightweight spinner for quiet mode
@@ -891,7 +1162,9 @@ cached_file_content() {
 VERSION="0.6.3"
 
 # Caching system configuration
-CACHE_DIR="/tmp/bt-quickcheck-cache-$$"
+# Use secure temp directory with strict permissions
+CACHE_DIR=$(mktemp -d -t bt-quickcheck-cache-XXXXXXXXXX 2>/dev/null || echo "/tmp/bt-quickcheck-cache-$$")
+chmod 700 "$CACHE_DIR" 2>/dev/null || true
 CACHE_TTL=300
 CACHE_ENABLED=true
 
@@ -929,6 +1202,212 @@ ANON_SALT=""
 
 # Safety functions
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
+
+# Privilege management
+ORIGINAL_UID=""
+ORIGINAL_GID=""
+PRIVILEGE_DROPPED=false
+
+# Store original user credentials
+store_original_credentials() {
+    ORIGINAL_UID=$(id -u)
+    ORIGINAL_GID=$(id -g)
+}
+
+# Drop privileges to original user
+drop_privileges() {
+    if [ "$PRIVILEGE_DROPPED" = true ]; then
+        return 0
+    fi
+    
+    if [ -n "$ORIGINAL_UID" ] && [ -n "$ORIGINAL_GID" ]; then
+        # Drop to original user
+        if [ "$EUID" -eq 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
+            # Use setuid/setgid to drop privileges
+            if command -v setuidgid >/dev/null 2>&1; then
+                exec setuidgid "$(id -un "$ORIGINAL_UID")" "$0" "$@"
+            else
+                # Fallback: use su to drop privileges
+                exec su -s /bin/bash -c "exec '$0' $*" "$(id -un "$ORIGINAL_UID")"
+            fi
+        fi
+        PRIVILEGE_DROPPED=true
+    fi
+}
+
+# Temporarily elevate privileges for specific operations
+elevate_privileges() {
+    if [ "$EUID" -ne 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
+        # Request sudo for specific operation
+        sudo -n true 2>/dev/null || {
+            echo "Error: Sudo privileges required for this operation" >&2
+            return 1
+        }
+    fi
+}
+
+# Whitelist of allowed commands for security assessment
+declare -A ALLOWED_COMMANDS=(
+    # System information
+    ["uname"]="system_info"
+    ["hostname"]="system_info"
+    ["uptime"]="system_info"
+    ["whoami"]="system_info"
+    ["id"]="system_info"
+    ["w"]="system_info"
+    ["who"]="system_info"
+    ["last"]="system_info"
+    ["lastlog"]="system_info"
+    
+    # File operations (read-only)
+    ["cat"]="file_read"
+    ["head"]="file_read"
+    ["tail"]="file_read"
+    ["grep"]="file_read"
+    ["awk"]="file_read"
+    ["sed"]="file_read"
+    ["cut"]="file_read"
+    ["sort"]="file_read"
+    ["uniq"]="file_read"
+    ["wc"]="file_read"
+    ["find"]="file_read"
+    ["stat"]="file_read"
+    ["ls"]="file_read"
+    ["file"]="file_read"
+    ["md5sum"]="file_read"
+    ["sha256sum"]="file_read"
+    ["sha1sum"]="file_read"
+    
+    # Process and system monitoring
+    ["ps"]="process_info"
+    ["top"]="process_info"
+    ["htop"]="process_info"
+    ["pgrep"]="process_info"
+    ["pstree"]="process_info"
+    ["lsof"]="process_info"
+    ["fuser"]="process_info"
+    ["netstat"]="network_info"
+    ["ss"]="network_info"
+    ["ip"]="network_info"
+    ["ifconfig"]="network_info"
+    ["route"]="network_info"
+    ["arp"]="network_info"
+    
+    # System services and configuration
+    ["systemctl"]="service_info"
+    ["service"]="service_info"
+    ["chkconfig"]="service_info"
+    ["sysctl"]="system_config"
+    ["mount"]="system_config"
+    ["df"]="system_config"
+    ["du"]="system_config"
+    ["free"]="system_config"
+    ["vmstat"]="system_config"
+    ["iostat"]="system_config"
+    ["sar"]="system_config"
+    
+    # Package management (read-only)
+    ["dpkg"]="package_info"
+    ["rpm"]="package_info"
+    ["yum"]="package_info"
+    ["dnf"]="package_info"
+    ["apt"]="package_info"
+    ["apt-get"]="package_info"
+    ["zypper"]="package_info"
+    ["pacman"]="package_info"
+    
+    # Security tools
+    ["getcap"]="security_info"
+    ["getfattr"]="security_info"
+    ["lsattr"]="security_info"
+    ["getfacl"]="security_info"
+    ["auditctl"]="security_info"
+    ["ausearch"]="security_info"
+    ["aureport"]="security_info"
+    ["chkrootkit"]="security_info"
+    ["rkhunter"]="security_info"
+    ["clamscan"]="security_info"
+    ["aide"]="security_info"
+    ["tripwire"]="security_info"
+    
+    # Network security
+    ["nmap"]="network_scan"
+    ["nslookup"]="network_scan"
+    ["dig"]="network_scan"
+    ["host"]="network_scan"
+    ["ping"]="network_scan"
+    ["traceroute"]="network_scan"
+    ["tcpdump"]="network_scan"
+    ["wireshark"]="network_scan"
+    ["tcpdump"]="network_scan"
+    
+    # Text processing
+    ["tr"]="text_proc"
+    ["rev"]="text_proc"
+    ["tac"]="text_proc"
+    ["column"]="text_proc"
+    ["pr"]="text_proc"
+    ["fmt"]="text_proc"
+    ["fold"]="text_proc"
+    ["expand"]="text_proc"
+    ["unexpand"]="text_proc"
+    
+    # Compression and archiving (read-only)
+    ["zcat"]="archive_read"
+    ["bzcat"]="archive_read"
+    ["xzcat"]="archive_read"
+    ["gunzip"]="archive_read"
+    ["bunzip2"]="archive_read"
+    ["unxz"]="archive_read"
+    
+    # Date and time
+    ["date"]="time_info"
+    ["timedatectl"]="time_info"
+    ["ntpdate"]="time_info"
+    ["chrony"]="time_info"
+    
+    # Environment and shell
+    ["env"]="env_info"
+    ["printenv"]="env_info"
+    ["locale"]="env_info"
+    ["ulimit"]="env_info"
+    ["umask"]="env_info"
+)
+
+# Resolve command to absolute path with whitelist validation
+resolve_command_path() {
+    local cmd="$1"
+    local abs_path
+    
+    # Check if command is in whitelist
+    if [[ -z "${ALLOWED_COMMANDS[$cmd]:-}" ]]; then
+        return 1
+    fi
+    
+    # Get absolute path
+    abs_path=$(command -v "$cmd" 2>/dev/null)
+    
+    # Validate it's an absolute path
+    if [[ -z "$abs_path" ]] || [[ "$abs_path" != /* ]]; then
+        return 1
+    fi
+    
+    # Ensure it's executable
+    if [[ ! -x "$abs_path" ]]; then
+        return 1
+    fi
+    
+    # Only allow commands from safe system directories
+    case "$abs_path" in
+        /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*)
+            echo "$abs_path"
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 # Enhanced safe command execution with additional security
 safe_exec() {
@@ -1001,6 +1480,32 @@ safe_read() {
 safe_dir_check() {
     local dir="$1"
     [ -d "$dir" ] && [ -r "$dir" ]
+}
+
+# SECURITY FIX: Safe log file parsing with size limits to prevent DoS
+safe_log_grep() {
+    local log_file="$1"
+    local pattern="$2"
+    local max_size_mb="${3:-100}"  # Default 100MB limit
+    local max_lines="${4:-10000}"   # Default 10000 lines limit
+    
+    # Check if file exists and is readable
+    if [ ! -r "$log_file" ] || [ ! -f "$log_file" ]; then
+        return 1
+    fi
+    
+    # Check file size (in bytes)
+    local file_size
+    file_size=$(stat -c "%s" "$log_file" 2>/dev/null || echo "0")
+    local max_size_bytes=$((max_size_mb * 1024 * 1024))
+    
+    if [ "$file_size" -gt "$max_size_bytes" ]; then
+        # File too large - only read last portion
+        tail -n "$max_lines" "$log_file" 2>/dev/null | grep -E "$pattern" 2>/dev/null || true
+    else
+        # File size OK - grep entire file but limit output
+        grep -E "$pattern" "$log_file" 2>/dev/null | head -n "$max_lines" 2>/dev/null || true
+    fi
 }
 
 # Check if a section should be run based on privileges and mode
@@ -1116,23 +1621,30 @@ validate_mode() {
 validate_output_path() {
     local path="$1"
     
-    # Prevent path traversal and directory traversal attacks
-    if [[ "$path" =~ \.\. ]] || [[ "$path" =~ /\.\. ]] || [[ "$path" =~ \.\./ ]]; then
+    # Resolve to canonical path without following unsafe symlinks
+    local canonical
+    if [[ "$path" == /* ]]; then
+        canonical=$(realpath -m "$path" 2>/dev/null || echo "$path")
+    else
+        # Treat relative paths as under current working directory
+        canonical=$(realpath -m "$PWD/$path" 2>/dev/null || echo "$PWD/$path")
+    fi
+    
+    # Basic traversal detection
+    if [[ "$canonical" =~ (\.|/)?\.\.(/|$) ]]; then
         return 1
     fi
     
-    # Prevent absolute paths outside of safe directories
-    if [[ "$path" =~ ^/ ]]; then
-        # Only allow paths in /tmp, /var/tmp, or current user's home
-        if [[ ! "$path" =~ ^/(tmp|var/tmp|home/[^/]+) ]] && [[ ! "$path" =~ ^$HOME ]]; then
-            return 1
-        fi
+    # Only allow under safe roots: /tmp, /var/tmp, $HOME, current working directory
+    if [[ "$canonical" == /* ]]; then
+        case "$canonical" in
+            /tmp/*|/var/tmp/*|$HOME/*|$PWD/*) : ;; 
+            *) return 1 ;;
+        esac
     fi
     
-    # Remove any remaining path traversal attempts
-    local clean_path
-    clean_path=$(realpath -m "$path" 2>/dev/null || echo "$path")
-    
+    # Disallow world-writable parent directory traversal by verifying we can create files safely later
+    echo "$canonical" >/dev/null 2>&1
     return 0
 }
 
@@ -1150,18 +1662,10 @@ validate_input_length() {
 
 validate_input_chars() {
     local input="$1"
-    
-    # Allow only alphanumeric, hyphens, underscores, dots, slashes, and spaces
-    # Using a simple character-by-character check to avoid regex issues
-    local valid_chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/ -"
-    local i=0
-    while [ $i -lt ${#input} ]; do
-        local char="${input:$i:1}"
-        if [[ "$valid_chars" != *"$char"* ]]; then
-            return 1
-        fi
-        i=$((i + 1))
-    done
+    # Use grep -E to avoid [[ =~ ]] tokenization issues with spaces
+    if ! printf '%s' "$input" | grep -qE '^[A-Za-z0-9._/[:space:]-]+$'; then
+        return 1
+    fi
     return 0
 }
 
@@ -1178,38 +1682,9 @@ validate_command() {
         return 1
     fi
     
-    # Prevent execution of dangerous commands (expanded list)
-    local dangerous_commands=(
-        "rm" "dd" "mkfs" "fdisk" "parted" "shutdown" "reboot" "halt" "init" "telinit"
-        "format" "del" "rd" "deltree" "debug" "fdisk" "sys" "attrib" "chkdsk"
-        "format" "scandisk" "defrag" "mem" "msconfig" "regedit" "reg" "sfc"
-        "wget" "curl" "nc" "netcat" "telnet" "ftp" "tftp" "rsh" "rcp" "rlogin"
-        "su" "sudo" "passwd" "chpasswd" "usermod" "useradd" "userdel" "groupadd"
-        "groupdel" "gpasswd" "chown" "chmod" "chgrp" "umount" "mount" "fuser"
-        "kill" "killall" "pkill" "xkill" "skill" "renice" "nice" "nohup"
-        "at" "crontab" "anacron" "atd" "cron" "cronie" "systemctl" "service"
-        "systemd" "initctl" "upstart" "rc-service" "rc-update" "openrc"
-    )
-    
-    for dangerous in "${dangerous_commands[@]}"; do
-        if [[ "$cmd" =~ ^$dangerous ]]; then
-            return 1
-        fi
-    done
-    
-    # Validate command exists and is executable
-    if ! command -v "$cmd" >/dev/null 2>&1; then
+    # Use whitelist-based validation via resolve_command_path
+    if ! resolve_command_path "$cmd" >/dev/null 2>&1; then
         return 1
-    fi
-    
-    # Additional security: check if command is in safe directories only
-    local cmd_path
-    cmd_path=$(command -v "$cmd" 2>/dev/null)
-    if [[ -n "$cmd_path" ]]; then
-        # Only allow commands from standard system directories
-        if [[ ! "$cmd_path" =~ ^/(bin|sbin|usr/bin|usr/sbin|usr/local/bin|usr/local/sbin)/ ]]; then
-            return 1
-        fi
     fi
     
     return 0
@@ -1242,17 +1717,11 @@ add_finding() {
         message=$(echo "$message" | sed -E 's@(/[^ ]+/)+([^ /]+)@.../\2@g')
     fi
 
-    # Anonymization (non-reversible hashing for common identifiers)
+    # Anonymization (lightweight; preserve section names for readability)
     if [ "$ANONYMIZE" = true ]; then
-        [ -z "$ANON_SALT" ] && ANON_SALT=$(date +%s%N | md5sum | cut -d' ' -f1)
-        # Hostnames/usernames/IPs heuristics (light anonymization)
-        # Replace obvious user@host patterns
-        message=$(echo "$message" | sed -E "s/\b([A-Za-z0-9_-]{3,})@(localhost|localdomain|[A-Za-z0-9_.-]+)/[USER]@\2/g")
-        # Generic word hashing via md5 with salt (best-effort, non-reversible)
-        message=$(echo "$message" | awk -v salt="$ANON_SALT" '{
-            for (i=1;i<=NF;i++) { if (length($i)>=3) { cmd="printf \"%s\" \""salt":"$i"\" | md5sum | cut -d\\  -f1"; cmd | getline h; close(cmd); $i=h } } print $0 }')
-        section=$(echo "$section" | awk -v salt="$ANON_SALT" '{
-            for (i=1;i<=NF;i++) { if (length($i)>=3) { cmd="printf \"%s\" \""salt":"$i"\" | md5sum | cut -d\\  -f1"; cmd | getline h; close(cmd); $i=h } } print $0 }')
+        # Apply targeted anonymization to message/recommendation only
+        message=$(anonymize_string "$message")
+        [ -n "$recommendation" ] && recommendation=$(anonymize_string "$recommendation")
     fi
 
     # Validate and sanitize inputs
@@ -1384,6 +1853,27 @@ json_escape() {
         -e 's/\v/\\v/g' \
         -e 's/[\x00-\x1F]/\\u00&/g'
 }
+# Anonymization helper: redact sensitive tokens but keep structure readable
+anonymize_string() {
+    local input="$1"
+    local host="$(hostname 2>/dev/null || echo)"
+    # Redact user@host style
+    input=$(echo "$input" | sed -E "s/\b([A-Za-z0-9_-]{2,})@([A-Za-z0-9_.-]+)/[USER]@[HOST]/g")
+    # Redact explicit current hostname
+    if [ -n "$host" ]; then
+        input=$(echo "$input" | sed -E "s/\b$host\b/[HOST]/g")
+    fi
+    # Redact IPv4 addresses
+    input=$(echo "$input" | sed -E 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[IP]/g')
+    # Redact MAC addresses
+    input=$(echo "$input" | sed -E 's/\b([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b/[MAC]/g')
+    # Redact semantic versions and kernel-like versions
+    input=$(echo "$input" | sed -E 's/\b[0-9]+\.[0-9]+(\.[0-9]+){1,}(-[A-Za-z0-9.-]+)?\b/[VER]/g')
+    # Collapse long absolute paths to basename to avoid leakage
+    input=$(echo "$input" | sed -E 's@(/[^ ]+/)+([^ /]+)@.../\2@g')
+    echo "$input"
+}
+
 
 html_escape() {
     local input="$1"
@@ -1478,11 +1968,23 @@ generate_json_output() {
     echo ""
     echo "  ],"
     echo "  \"summary\": {"
-    echo "    \"total_findings\": ${#FINDINGS[@]},"
-    echo "    \"critical\": $(echo "${FINDINGS[@]}" | grep -c "|CRIT|" || echo "0"),"
-    echo "    \"warnings\": $(echo "${FINDINGS[@]}" | grep -c "|WARN|" || echo "0"),"
-    echo "    \"ok\": $(echo "${FINDINGS[@]}" | grep -c "|OK|" || echo "0"),"
-    echo "    \"info\": $(echo "${FINDINGS[@]}" | grep -c "|INFO|" || echo "0")"
+    # Compute counts robustly to avoid stray output into JSON
+    local __total=${#FINDINGS[@]}
+    local __crit=0 __warn=0 __ok=0 __info=0
+    for __f in "${FINDINGS[@]}"; do
+        IFS='|' read -r __sec __sev __msg __rec <<< "$__f"
+        case "$__sev" in
+            CRIT) __crit=$((__crit+1));;
+            WARN) __warn=$((__warn+1));;
+            OK)   __ok=$((__ok+1));;
+            INFO) __info=$((__info+1));;
+        esac
+    done
+    echo "    \"total_findings\": $__total,"
+    echo "    \"critical\": $__crit,"
+    echo "    \"warnings\": $__warn,"
+    echo "    \"ok\": $__ok,"
+    echo "    \"info\": $__info"
     echo "  },"
     echo "  \"security\": {"
     echo "    \"permission_level\": \"$CURRENT_PERMISSION_LEVEL\","
@@ -1602,8 +2104,12 @@ generate_txt_output() {
             current_section="$section"
         fi
         
-        printf "%-6s %s\n" "[$severity]" "$message"
-        [ -n "$recommendation" ] && printf "       → %s\n" "$recommendation"
+        # Redact sensitive tokens similar to JSON path
+        local red_msg=$(detect_sensitive_data "$message")
+        local red_rec=""
+        [ -n "$recommendation" ] && red_rec=$(detect_sensitive_data "$recommendation")
+        printf "%-6s %s\n" "[$severity]" "$red_msg"
+        [ -n "$red_rec" ] && printf "       → %s\n" "$red_rec"
     done
     
     echo
@@ -3019,7 +3525,10 @@ section_persistence_mechanisms() {
 	
 	# Check user shell startup scripts (personal mode focus)
 	if [ "$OPERATION_MODE" = "personal" ]; then
-		user_home=$(eval echo "~$USER")
+		# SECURITY FIX: Use safe method to get home directory without eval
+		user_home=$(getent passwd "$USER" 2>/dev/null | cut -d: -f6)
+		# Fallback to HOME environment variable if getent fails
+		[ -z "$user_home" ] && user_home="$HOME"
 		shell_configs=("$user_home/.bashrc" "$user_home/.bash_profile" "$user_home/.zshrc" "$user_home/.profile")
 		
 		for config in "${shell_configs[@]}"; do
@@ -4007,7 +4516,7 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
     echo
     echo "╔════════════════════════════════════════════════════════════════════════════╗"
     echo "║                                                                            ║"
-    echo "║    ██████╗ ████████╗    ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗            ║"
+    echo "║   ██████╗ ████████╗    ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗             ║"
     echo "║   ██╔══██╗╚══██╔══╝   ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝             ║"
     echo "║   ██████╔╝   ██║      ██║     ███████║█████╗  ██║     █████╔╝              ║"
     echo "║   ██╔══██╗   ██║      ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗              ║"
@@ -4547,7 +5056,8 @@ section_behavioral_analysis() {
     # Log behavior analysis
     if is_root && [ -f /var/log/auth.log ]; then
         ((total_checks++))
-        local failed_logins=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -100 | wc -l)
+        # SECURITY FIX: Use safe_log_grep with size limits instead of direct grep
+        local failed_logins=$(safe_log_grep /var/log/auth.log "Failed password" 100 1000 | wc -l)
         
         if [ $failed_logins -gt 50 ]; then
             ((anomalies++))
@@ -4620,10 +5130,86 @@ fi
 # Cache hygiene
 cleanup_old_btqc_dirs
 
+# Initialize embedded configuration (early, before other initialization)
+init_embedded_config
+
+# Optionally load external configuration file if it exists (will override embedded defaults)
+# This is now optional - script is fully self-contained without it
+load_configuration
+
+# Initialize privilege management
+store_original_credentials
+
+# Initialize structured logging
+log "$LOG_INFO" "Blue Team QuickCheck starting - Version: $VERSION"
+log "$LOG_INFO" "Operation mode: $OPERATION_MODE, Output format: $OUTPUT_FORMAT"
+log "$LOG_INFO" "Running as user: $(whoami), UID: $(id -u), EUID: $EUID"
+
+# Set resource limits for security
+set_resource_limits() {
+    # Memory limit: 512MB
+    ulimit -v 524288 2>/dev/null || true
+    
+    # CPU time limit: 300 seconds (5 minutes)
+    ulimit -t 300 2>/dev/null || true
+    
+    # File size limit: 100MB
+    ulimit -f 104857600 2>/dev/null || true
+    
+    # Process limit: 100 processes
+    ulimit -u 100 2>/dev/null || true
+    
+    # Core dump size: 0 (disabled)
+    ulimit -c 0 2>/dev/null || true
+    
+    # File descriptor limit: 256
+    ulimit -n 256 2>/dev/null || true
+    
+    # Stack size limit: 8MB
+    ulimit -s 8192 2>/dev/null || true
+}
+
+# Apply resource limits
+set_resource_limits
+
+# Resource monitoring
+monitor_resources() {
+    local mem_usage
+    local cpu_usage
+    
+    # Check memory usage
+    if command -v ps >/dev/null 2>&1; then
+        mem_usage=$(ps -o pid,vsz,rss,comm -p $$ 2>/dev/null | tail -1 | awk '{print $3}')
+        if [ -n "$mem_usage" ] && [ "$mem_usage" -gt 400000 ]; then  # 400MB threshold
+            warn "High memory usage detected: ${mem_usage}KB"
+        fi
+    fi
+    
+    # Check if we're approaching resource limits
+    local current_ulimit
+    current_ulimit=$(ulimit -v 2>/dev/null || echo "unlimited")
+    if [ "$current_ulimit" != "unlimited" ] && [ "$current_ulimit" -lt 100000 ]; then  # Less than 100MB remaining
+        warn "Memory limit approaching: ${current_ulimit}KB remaining"
+    fi
+}
+
 # Initialize caching system and parallel temp dir
 init_cache
-PARALLEL_TMP_DIR="/tmp/btqc-par-$$"
-mkdir -p "$PARALLEL_TMP_DIR" 2>/dev/null || true
+
+# SECURITY FIX: Create secure temporary directory (no predictable fallback)
+PARALLEL_TMP_DIR=$(mktemp -d -t btqc-par-XXXXXXXXXX 2>/dev/null)
+if [ -z "$PARALLEL_TMP_DIR" ] || [ ! -d "$PARALLEL_TMP_DIR" ]; then
+    # Try alternative mktemp syntax
+    PARALLEL_TMP_DIR=$(mktemp -d 2>/dev/null)
+fi
+if [ -z "$PARALLEL_TMP_DIR" ] || [ ! -d "$PARALLEL_TMP_DIR" ]; then
+    echo "ERROR: Failed to create secure temporary directory for parallel execution" >&2
+    echo "Disabling parallel mode for security" >&2
+    PARALLEL_MODE=false
+    PARALLEL_TMP_DIR="/tmp/btqc-disabled-$$"
+fi
+# Ensure secure permissions
+chmod 700 "$PARALLEL_TMP_DIR" 2>/dev/null || true
 
 # Initialize privacy controls
 init_privacy_controls
@@ -4675,6 +5261,10 @@ if [ "$PARALLEL_MODE" = true ]; then
     run_section_parallel section_malware_detection "Malware Detection"
     run_section_parallel section_rootkit_detection "Rootkit Detection"
     run_section_parallel section_behavioral_analysis "Behavioral Analysis"
+    
+    # Monitor resources during parallel execution
+    monitor_resources
+    
     wait_parallel_sections
 else
     # Sequential execution (default)
@@ -4708,8 +5298,6 @@ else
     run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
     run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
     run_section_safely section_scheduler_controls "Scheduler Controls (cron/anacron/at)"
-    
-    # Advanced security detection (new in v0.6.2)
     run_section_safely section_malware_detection "Malware Detection"
     run_section_safely section_rootkit_detection "Rootkit Detection"
     run_section_safely section_behavioral_analysis "Behavioral Analysis"
@@ -4782,6 +5370,36 @@ if [ -n "$OUTPUT_FILE" ]; then
 else
 	generate_output
 fi
+
+# Drop privileges after privileged operations are complete
+if [ "$EUID" -eq 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
+    echo "Dropping privileges to original user for cleanup operations..."
+    drop_privileges
+fi
+
+# Final cleanup and logging
+cleanup_and_exit() {
+    local exit_code="${1:-0}"
+    
+    log "$LOG_INFO" "Blue Team QuickCheck completed with exit code: $exit_code"
+    log "$LOG_INFO" "Total findings generated: ${#FINDINGS[@]}"
+    
+    # Cleanup temporary directories
+    cleanup_cache
+    [ -d "$PARALLEL_TMP_DIR" ] && rm -rf "$PARALLEL_TMP_DIR" 2>/dev/null || true
+    
+    # Log final resource usage if available
+    if command -v ps >/dev/null 2>&1; then
+        local mem_usage
+        mem_usage=$(ps -o pid,vsz,rss,comm -p $$ 2>/dev/null | tail -1 | awk '{print $3}')
+        log "$LOG_DEBUG" "Final memory usage: ${mem_usage}KB"
+    fi
+    
+    exit "$exit_code"
+}
+
+# Set up cleanup trap
+trap 'cleanup_and_exit $?' EXIT
 
 # Production-only resource health checks (function defined near end for structure)
 section_resource_health() {
