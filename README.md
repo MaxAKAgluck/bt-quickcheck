@@ -31,21 +31,32 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 
 ## Features
 
-- Comprehensive baseline: 30+ categories and many targeted checks
-- Fast and lightweight: single script, no install, minimal system impact
-- Blue team focused: defensive posture checks rather than privilege escalation
-- Read-only by design: does not change system state
-- Multiple outputs: console, JSON, HTML, and plain text (format determined by file extension)
-- Personal and production modes with contextual recommendations
-- Actionable results with severity levels and next steps
-- One-liner friendly for quick remote use
-- Alignment with common guidance (CIS/NIST)
-- Parallel execution for improved performance (30-50% faster with `-p` flag)
-- Intelligent caching system for expensive operations
-- Advanced malware signature detection and analysis
-- Enhanced rootkit detection with cross-view analysis
-- Behavioral analysis for anomaly detection
-- Simplified command-line interface (no format flag needed)
+### Core Features
+- **🔒 Security Hardened**: All critical security vulnerabilities patched (v0.6.3)
+- **📦 Fully Self-Contained**: No external configuration files required - works out of the box
+- **⚡ Zero Dependencies**: Single Bash script with embedded defaults, runs anywhere
+- **🎯 Blue Team Focused**: Defensive posture checks rather than privilege escalation
+- **✅ Read-Only by Design**: Does not change system state, safe for production
+- **🚀 One-Liner Friendly**: Quick remote deployment like LinPEAS for blue teams
+
+### Assessment Capabilities
+- **Comprehensive baseline**: 30+ security categories with hundreds of targeted checks
+- **Multiple output formats**: Console, JSON, HTML, and plain text (auto-detected by file extension)
+- **Personal and production modes**: Context-aware recommendations for different environments
+- **Actionable results**: Severity levels (OK/WARN/CRIT/INFO) with clear next steps
+- **CIS/NIST aligned**: Checks aligned with common security guidance frameworks
+
+### Performance & Reliability
+- **Parallel execution**: 30-50% faster scanning with `-p` flag
+- **Intelligent caching**: Smart caching system for expensive operations (5-min TTL)
+- **Timeout protection**: Section-level timeouts prevent hangs
+- **Graceful degradation**: Continues assessment even if individual checks fail
+
+### Advanced Detection
+- **Malware detection**: Signature-based detection of common malware patterns
+- **Rootkit detection**: Advanced detection with cross-view analysis and hidden process checks
+- **Behavioral analysis**: Anomaly detection and risk assessment based on system behavior
+- **Intrusion indicators**: Failed login attempts, suspicious activity patterns
 
 ## Quick Start
 
@@ -365,6 +376,18 @@ Recommended: store keys securely, avoid keeping plaintext after verifying the en
 
 ## Implementation Progress
 
+v0.6.3 (Latest - Security Hardened)
+- **🔒 Critical Security Fixes**: 
+  - Fixed configuration file command injection vulnerability (CVE-worthy)
+  - Eliminated temporary file race conditions with secure `mktemp` implementation
+  - Resolved unsafe printf format string vulnerability
+  - Fixed unquoted variable expansion (word splitting prevention)
+  - Added rate limiting and size checks for log parsing (DoS prevention)
+- **📦 Self-Contained**: Embedded configuration directly in script - no external `.conf` file needed
+- **🛡️ Enhanced Security**: Script now runs with all defaults embedded, fully self-contained like LinPEAS
+- **🔐 Safe Configuration**: Optional external config file support with sanitized, validated inputs
+- **✅ Hardened Variables**: All variables properly quoted and sanitized for `set -u` strict mode
+
 v0.6.2
 - **Performance**: Parallel execution with `-p` flag for 30-50% faster scanning
 - **Caching**: Intelligent caching system for expensive operations with 5-minute TTL
@@ -409,7 +432,102 @@ v0.3.0
 v0.2.0
 - Core baseline: SSH hardening, firewall status, user account analysis, updates, permissions
 
+## Configuration
+
+### Embedded Configuration (v0.6.3+)
+The script is **fully self-contained** with embedded default configuration. No external configuration file is required!
+
+```bash
+# Works out of the box - no setup needed
+sudo ./bt-quickcheck.sh
+```
+
+### Environment Variable Overrides
+You can override any default setting using environment variables:
+
+```bash
+# Override log level (1=ERROR, 2=WARN, 3=INFO, 4=DEBUG)
+BTQC_LOG_LEVEL=4 sudo ./bt-quickcheck.sh
+
+# Override output format
+BTQC_OUTPUT_FORMAT=json sudo ./bt-quickcheck.sh -o report.json
+
+# Enable parallel mode and increase workers
+BTQC_PARALLEL_MODE=true BTQC_PARALLEL_WORKERS=8 sudo ./bt-quickcheck.sh -p
+
+# Disable caching
+BTQC_CACHE_ENABLED=false sudo ./bt-quickcheck.sh
+```
+
+### Available Configuration Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BTQC_LOG_LEVEL` | `3` (INFO) | Logging verbosity: 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG |
+| `BTQC_MEMORY_LIMIT` | `524288` | Memory limit in KB (512MB) |
+| `BTQC_CPU_TIME_LIMIT` | `300` | CPU time limit in seconds (5 minutes) |
+| `BTQC_FILE_SIZE_LIMIT` | `104857600` | File size limit in bytes (100MB) |
+| `BTQC_PROCESS_LIMIT` | `100` | Maximum number of processes |
+| `BTQC_CACHE_ENABLED` | `true` | Enable/disable caching system |
+| `BTQC_CACHE_TTL` | `300` | Cache time-to-live in seconds |
+| `BTQC_PRIVACY_LEVEL` | `standard` | Privacy level: standard, high, off |
+| `BTQC_ANONYMIZE` | `false` | Anonymize hostnames, usernames, IPs |
+| `BTQC_AUDIT_ENABLED` | `false` | Enable comprehensive audit logging |
+| `BTQC_PARALLEL_MODE` | `false` | Enable parallel execution (same as `-p` flag) |
+| `BTQC_OPERATION_MODE` | `personal` | Operation mode: personal, production |
+| `BTQC_MAX_FINDINGS` | `1000` | Maximum findings to record |
+| `BTQC_SECTION_TIMEOUT` | `30` | Timeout per section in seconds |
+
+### Optional External Configuration File
+For advanced users, you can still use an external configuration file:
+
+```bash
+# Create bt-quickcheck.conf with your custom settings
+cat > bt-quickcheck.conf << 'EOF'
+BTQC_LOG_LEVEL=4
+BTQC_PARALLEL_MODE=true
+BTQC_PRIVACY_LEVEL=high
+EOF
+
+# Script will automatically load it if present
+sudo ./bt-quickcheck.sh
+```
+
+**Note:** External config values are sanitized for security and override embedded defaults.
+
 ## Enhanced Input Validation & Security Features
+
+### v0.6.3 Security Hardening (Latest)
+
+#### **Critical Vulnerability Fixes**
+
+1. **Configuration Command Injection (CRITICAL)**
+   - **Fixed**: All external configuration values are sanitized to remove dangerous shell metacharacters
+   - **Protection**: Removed backticks, command substitution `$()`, semicolons, pipes, redirections
+   - **Safe Assignment**: Uses `declare -g` instead of unsafe `export` with user-controlled values
+   - **Impact**: Prevents arbitrary code execution via malicious configuration files
+
+2. **Temporary File Race Conditions (HIGH)**
+   - **Fixed**: Replaced all predictable temp paths with secure `mktemp` calls
+   - **Protection**: Random suffixes (XXXXXXXXXX) prevent symlink attacks
+   - **Permissions**: Automatic `chmod 600` for log files, `chmod 700` for directories
+   - **Impact**: Prevents symlink attacks, information disclosure, privilege escalation
+
+3. **Format String Vulnerability (MEDIUM)**
+   - **Fixed**: Replaced `printf "$message" "$result"` with safe string substitution
+   - **Protection**: Uses bash parameter expansion `${message//%s/$result}`
+   - **Impact**: Prevents DoS and potential information disclosure
+
+4. **Word Splitting & Glob Expansion (MEDIUM)**
+   - **Fixed**: All variables in command execution are now properly quoted
+   - **Protection**: Replaced `eval echo "~$USER"` with safe `getent passwd` lookup
+   - **Impact**: Prevents argument injection and unintended command execution
+
+5. **Log Parsing DoS (LOW-MEDIUM)**
+   - **Fixed**: New `safe_log_grep()` function with size and line limits
+   - **Protection**: 100MB file size limit, 10,000 line output limit
+   - **Smart Handling**: Auto-uses `tail` for large files
+   - **Impact**: Prevents resource exhaustion from parsing massive log files
 
 ### Advanced command validation
 The script includes command validation to prevent execution of dangerous system commands:
@@ -440,7 +558,7 @@ ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 - Parameter sanitization
 - Wrapped execution with error handling
 
-### New Security Hardening Features
+### Additional Security Hardening Features
 - Regex-based input validation for safe character sets
 - Hardened output path validation with canonicalization
 - Combined argument-length limit for command execution safety
@@ -448,6 +566,7 @@ ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
 - Disabled shell function inheritance and `BASH_ENV` to prevent injection
 - Sensitive-data redaction applied to JSON/HTML/TXT outputs
 - Secure temp directories via `mktemp -d` with 0700 permissions
+- All variables use safe parameter expansion compatible with `set -u` strict mode
 
 ## References
 
