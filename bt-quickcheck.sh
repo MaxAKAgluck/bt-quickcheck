@@ -690,16 +690,120 @@ section_privesc_surface_core() {
             done <<< "$w"
         fi
     fi
+    
+    # NEW CHECK 1: Sudo version vulnerabilities (CVE-2023-22809, CVE-2021-3156 Baron Samedit)
+    if command_exists sudo; then
+        local sudo_ver=$(sudo -V 2>/dev/null | head -1 | awk '{print $3}')
+        if [ -n "$sudo_ver" ]; then
+            # Parse version components
+            local major=$(echo "$sudo_ver" | cut -d. -f1)
+            local minor=$(echo "$sudo_ver" | cut -d. -f2)
+            local patch=$(echo "$sudo_ver" | cut -d. -f3 | cut -dp -f1)
+            local patchlevel=$(echo "$sudo_ver" | grep -oP 'p\K[0-9]+' || echo "0")
+            
+            # Check for CVE-2023-22809 (1.8.0 - 1.9.12p1)
+            # Vulnerable: 1.8.x or 1.9.0-1.9.12p1
+            if [ "$major" = "1" ]; then
+                if [ "$minor" = "8" ]; then
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2023-22809)" "Update sudo to 1.9.12p2 or later immediately"
+                elif [ "$minor" = "9" ] && [ "$patch" -lt 12 ]; then
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2023-22809)" "Update sudo to 1.9.12p2 or later immediately"
+                elif [ "$minor" = "9" ] && [ "$patch" = "12" ] && [ "$patchlevel" -le 1 ]; then
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2023-22809)" "Update sudo to 1.9.12p2 or later immediately"
+                fi
+            fi
+            
+            # Check for Baron Samedit CVE-2021-3156 (before 1.9.5p2)
+            # Vulnerable: < 1.9.5p2 (1.0.x-1.8.x, 1.9.0-1.9.4, 1.9.5p0, 1.9.5p1)
+            if [ "$major" = "1" ]; then
+                if [ "$minor" -lt 9 ]; then
+                    # All 1.0.x - 1.8.x are vulnerable
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2021-3156 Baron Samedit)" "Update sudo to 1.9.5p2 or later immediately - heap overflow vulnerability"
+                elif [ "$minor" = "9" ] && [ "$patch" -lt 5 ]; then
+                    # 1.9.0 - 1.9.4 are vulnerable
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2021-3156 Baron Samedit)" "Update sudo to 1.9.5p2 or later immediately - heap overflow vulnerability"
+                elif [ "$minor" = "9" ] && [ "$patch" = "5" ] && [ "$patchlevel" -lt 2 ]; then
+                    # 1.9.5p0 and 1.9.5p1 are vulnerable
+                    add_finding "Sudo" "CRIT" "Vulnerable sudo version: $sudo_ver (CVE-2021-3156 Baron Samedit)" "Update sudo to 1.9.5p2 or later immediately - heap overflow vulnerability"
+                fi
+            fi
+            
+            # Check for pwfeedback vulnerability (CVE-2019-18634)
+            if is_root && [ -r /etc/sudoers ]; then
+                if grep -qi 'pwfeedback' /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+                    add_finding "Sudo" "CRIT" "pwfeedback option enabled (CVE-2019-18634)" "Remove 'Defaults pwfeedback' from sudoers configuration"
+                fi
+            fi
+        fi
+    fi
+    
+    # NEW CHECK 2: PolKit/pkexec vulnerabilities (PwnKit CVE-2021-4034)
+    if command_exists pkexec; then
+        local pkexec_path=$(command -v pkexec)
+        if [ -f "$pkexec_path" ]; then
+            local pkexec_perms=$(stat -Lc '%a' "$pkexec_path" 2>/dev/null || echo "")
+            # Check if pkexec is SUID (should start with 4)
+            if [[ "$pkexec_perms" =~ ^4 ]]; then
+                # Try to get polkit version
+                if command_exists pkaction; then
+                    local polkit_ver=$(pkaction --version 2>/dev/null | grep -oP 'version \K[0-9.]+' | head -1)
+                    if [ -n "$polkit_ver" ]; then
+                        # Vulnerable versions: 0.105-0.119
+                        local ver_major=$(echo "$polkit_ver" | cut -d. -f1)
+                        local ver_minor=$(echo "$polkit_ver" | cut -d. -f2)
+                        if [ "$ver_major" -eq 0 ] && [ "$ver_minor" -lt 120 ]; then
+                            add_finding "PolKit" "CRIT" "Vulnerable pkexec/polkit: $polkit_ver (CVE-2021-4034 PwnKit)" "Update polkit to 0.120+ immediately - local privilege escalation"
+                        fi
+                    else
+                        add_finding "PolKit" "WARN" "pkexec is SUID but version unknown" "Verify polkit version; update to 0.120+ if vulnerable to PwnKit"
+                    fi
+                else
+                    add_finding "PolKit" "WARN" "pkexec is SUID but polkit version cannot be determined" "Check polkit version manually; ensure 0.120+ to avoid PwnKit"
+                fi
+            fi
+        fi
+    fi
+    
+    # NEW CHECK 3: Docker socket exposure (root-equivalent access)
+    if [ -S /var/run/docker.sock ]; then
+        local docker_sock_perms=$(stat -c '%a %U:%G' /var/run/docker.sock 2>/dev/null)
+        if [ -w /var/run/docker.sock ] && ! is_root; then
+            add_finding "Docker" "CRIT" "Non-root write access to /var/run/docker.sock (root equivalent)" "Restrict Docker socket permissions; use rootless Docker or user namespaces"
+        fi
+        # Check if docker group has too many members
+        if command_exists getent; then
+            local docker_group=$(getent group docker 2>/dev/null | cut -d: -f4)
+            if [ -n "$docker_group" ]; then
+                local member_count=$(echo "$docker_group" | tr ',' '\n' | wc -l)
+                if [ "$member_count" -gt 3 ]; then
+                    add_finding "Docker" "WARN" "Docker group has $member_count members (root-equivalent access)" "Review docker group membership; use rootless mode or least privilege"
+                fi
+            fi
+        fi
+    fi
+    
+    # NEW CHECK 4: Dangerous capabilities on binaries
+    if command_exists getcap; then
+        local dangerous_caps=$(getcap -r /usr/bin /usr/sbin /bin /sbin 2>/dev/null | \
+            grep -E 'cap_setuid|cap_setgid|cap_dac_override|cap_dac_read_search|cap_sys_admin|cap_sys_ptrace' | head -10)
+        if [ -n "$dangerous_caps" ]; then
+            while IFS= read -r cap_line; do
+                local cap_file=$(echo "$cap_line" | awk '{print $1}')
+                local cap_list=$(echo "$cap_line" | awk '{print $3}')
+                add_finding "Capabilities" "CRIT" "Dangerous capability on $cap_file: $cap_list" "Review necessity; remove cap if not required or restrict binary access"
+            done <<< "$dangerous_caps"
+        fi
+    fi
 }
 
 # Extended privilege-escalation surface (targeted, read-only)
 section_privesc_surface_extended() {
     print_section "Privilege Escalation Surface (Extended)"
 
-    # Sudo deep-dive: sudo version and risky Defaults
+    # Sudo version reporting (detailed CVE analysis in Core section)
     if command_exists sudo; then
         local sv; sv=$(sudo -V 2>/dev/null | head -1 | awk '{print $3}')
-        [ -n "$sv" ] && add_finding "Sudo" "INFO" "sudo version: $sv" "Keep sudo updated; review vendor advisories"
+        [ -n "$sv" ] && add_finding "Sudo" "INFO" "sudo version: $sv" "See 'Privilege Escalation Surface (Core)' for CVE vulnerability analysis"
     fi
     if is_root && [ -r /etc/sudoers ]; then
         local d; d=$(grep -E '^Defaults' /etc/sudoers 2>/dev/null)
@@ -792,6 +896,60 @@ section_privesc_surface_extended() {
             done <<< "$di"
         fi
     fi
+    
+    # NEW CHECK 1: PAM module backdoor detection (authentication hijacking)
+    if is_root; then
+        local writable_pam=$(find /lib*/security /usr/lib*/security -name 'pam_*.so' \( -perm -002 -o -perm -020 \) 2>/dev/null | head -10)
+        if [ -n "$writable_pam" ]; then
+            while IFS= read -r pam; do
+                add_finding "PAM" "CRIT" "Writable PAM module: $pam" "Set to 0644 root:root immediately; audit for backdoors and verify integrity"
+            done <<< "$writable_pam"
+        fi
+    fi
+    
+    # NEW CHECK 2: Systemd timer hijacking (scheduled task tampering)
+    if [ -d /etc/systemd/system ]; then
+        # Only check actual timer files, not symlinks (symlinks are normal in timers.target.wants/)
+        # Check for world-writable or group-writable timer files
+        local writable_timers=$(find /etc/systemd/system -type f -name '*.timer' -exec sh -c '
+            for file; do
+                perms=$(stat -Lc "%a" "$file" 2>/dev/null)
+                owner=$(stat -Lc "%U" "$file" 2>/dev/null)
+                # Flag if world-writable, or group-writable and not owned by root
+                if [ "${perms: -1}" != "0" ] && [ "${perms: -1}" != "4" ]; then
+                    echo "$file"
+                elif [ "${perms: -2:1}" != "0" ] && [ "${perms: -2:1}" != "4" ] && [ "$owner" != "root" ]; then
+                    echo "$file"
+                fi
+            done
+        ' sh {} + 2>/dev/null | head -10)
+        
+        if [ -n "$writable_timers" ]; then
+            while IFS= read -r timer; do
+                add_finding "Systemd" "CRIT" "Writable systemd timer: $timer" "Set to 0644 root:root; review timer configuration and target service"
+            done <<< "$writable_timers"
+        fi
+    fi
+    
+    # NEW CHECK 3: Python library path hijacking (sys.path manipulation)
+    if command_exists python3; then
+        local py_paths=$(python3 -c "import sys; print('\n'.join([p for p in sys.path if p.startswith('/') and p]))" 2>/dev/null | head -10)
+        if [ -n "$py_paths" ]; then
+            while IFS= read -r ppath; do
+                [ -z "$ppath" ] && continue
+                [ ! -d "$ppath" ] && continue
+                # Check if world-writable or group-writable by non-root
+                if [ -n "$(find "$ppath" -maxdepth 0 -perm -002 2>/dev/null)" ]; then
+                    add_finding "Python" "CRIT" "World-writable Python library path: $ppath" "Set to 0755 root:root; prevents library injection attacks"
+                elif [ -n "$(find "$ppath" -maxdepth 0 -perm -020 2>/dev/null)" ]; then
+                    local ppath_owner=$(stat -Lc '%U' "$ppath" 2>/dev/null || echo "")
+                    if [ "$ppath_owner" != "root" ]; then
+                        add_finding "Python" "WARN" "Group-writable Python path by non-root: $ppath" "Review ownership; set to root:root with 0755"
+                    fi
+                fi
+            done <<< "$py_paths"
+        fi
+    fi
 }
 # 2) Cron/systemd chain writability + NFS exports
 section_taskrunners_nfs() {
@@ -806,6 +964,24 @@ section_taskrunners_nfs() {
         done <<< "$cron_ww"
     else
         add_finding "Cron" "OK" "No world-writable cron files detected" "Maintain secure ownership and perms"
+    fi
+    
+    # NEW CHECK: Cron command injection vulnerabilities
+    if is_root; then
+        # Check for potentially dangerous patterns in cron files
+        local suspicious_patterns=$(grep -r -E "(\$\(|\`|wget.*\$|curl.*\$)" /etc/cron* /var/spool/cron 2>/dev/null | \
+            grep -v ".bak" | grep -v "^Binary" | head -10)
+        if [ -n "$suspicious_patterns" ]; then
+            local count=$(echo "$suspicious_patterns" | wc -l)
+            add_finding "Cron" "WARN" "Suspicious patterns in cron files ($count occurrences)" "Review for command injection; use absolute paths and validate inputs"
+        fi
+        
+        # Check for cron jobs downloading/executing remote content
+        local remote_exec=$(grep -r -E "(wget|curl|fetch).*\|(bash|sh|python)" /etc/cron* /var/spool/cron 2>/dev/null | \
+            grep -v ".bak" | grep -v "^Binary" | head -5)
+        if [ -n "$remote_exec" ]; then
+            add_finding "Cron" "CRIT" "Cron jobs executing remote content detected" "Remove or verify legitimacy; use local scripts with integrity checks"
+        fi
     fi
 
     # systemd units pointing to writable ExecStart targets
@@ -884,10 +1060,11 @@ section_taskrunners_nfs() {
 section_container_ssh_secrets_hygiene() {
     print_section "Container, SSH & Secrets Hygiene"
 
-    # Docker socket/group exposure
+    # NOTE: Comprehensive Docker socket security analysis in 'Privilege Escalation Surface (Core)' section
+    # This provides a quick reference only
     if [ -S /var/run/docker.sock ]; then
         local perms; perms=$(stat -c '%a %U:%G' /var/run/docker.sock 2>/dev/null)
-        add_finding "Containers" "WARN" "Docker socket present (/var/run/docker.sock) perms: $perms" "Limit access; non-root access to docker implies root-equivalent on host"
+        add_finding "Containers" "INFO" "Docker socket detected: $perms" "See 'Privilege Escalation Surface (Core)' for detailed security analysis"
     fi
 
     # SSH agent socket exposure
@@ -965,6 +1142,44 @@ section_kernel_polkit_fstab_refinements() {
                 done
             fi
         done
+    fi
+    
+    # NEW CHECK 1: Additional kernel hardening parameters (2024 standards)
+    if command_exists sysctl; then
+        # ptrace scope (prevents process injection)
+        local ptrace_val=$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null || echo "")
+        if [ "$ptrace_val" = "0" ]; then
+            add_finding "Kernel" "WARN" "ptrace not restricted (kernel.yama.ptrace_scope=0)" "Set kernel.yama.ptrace_scope=1 or 2 to prevent process injection"
+        fi
+        
+        # dmesg restriction (prevents kernel info disclosure)
+        local dmesg_val=$(sysctl -n kernel.dmesg_restrict 2>/dev/null || echo "")
+        if [ "$dmesg_val" = "0" ]; then
+            add_finding "Kernel" "WARN" "dmesg accessible to all users" "Set kernel.dmesg_restrict=1 to restrict kernel logs"
+        fi
+        
+        # Protected hardlinks (prevents hardlink-based attacks)
+        local hardlink_val=$(sysctl -n fs.protected_hardlinks 2>/dev/null || echo "")
+        if [ "$hardlink_val" = "0" ]; then
+            add_finding "Kernel" "WARN" "Hardlink protection disabled" "Set fs.protected_hardlinks=1 to prevent hardlink attacks"
+        fi
+        
+        # Protected symlinks (prevents symlink-based attacks)
+        local symlink_val=$(sysctl -n fs.protected_symlinks 2>/dev/null || echo "")
+        if [ "$symlink_val" = "0" ]; then
+            add_finding "Kernel" "WARN" "Symlink protection disabled" "Set fs.protected_symlinks=1 to prevent symlink attacks"
+        fi
+    fi
+    
+    # NEW CHECK 2: Active tmpfs mounts with exec permission (runtime check)
+    if command_exists mount; then
+        local tmpfs_exec=$(mount | grep -E "^tmpfs on /(tmp|dev/shm|run/shm)" | grep -v "noexec")
+        if [ -n "$tmpfs_exec" ]; then
+            while IFS= read -r mount_line; do
+                local mount_point=$(echo "$mount_line" | awk '{print $3}')
+                add_finding "FSTAB" "CRIT" "$mount_point mounted with exec permission" "Remount with noexec: mount -o remount,noexec $mount_point"
+            done <<< "$tmpfs_exec"
+        fi
     fi
 }
 # Parallel execution support
@@ -2133,9 +2348,9 @@ detect_pkg_mgr() {
 section_enhanced_kernel_security() {
 	print_section "Enhanced Kernel Security"
 	
+	# NOTE: ptrace_scope, protected_hardlinks, protected_symlinks checked in 'Kernel, Polkit & Filesystem Hardening'
 	# Check for additional kernel hardening parameters
 	enhanced_hardening_checks=(
-		"kernel.yama.ptrace_scope:1:PTRACE scope restriction"
 		"kernel.core_uses_pid:1:Core dump PID inclusion"
 		"fs.suid_dumpable:0:SUID core dump prevention"
 		"net.ipv4.conf.all.rp_filter:1:Reverse path filtering"
@@ -2173,6 +2388,39 @@ section_enhanced_kernel_security() {
 	else
 		add_finding "Enhanced Kernel Security" "INFO" "No kernel hardening parameters accessible" ""
 		info "No kernel hardening parameters accessible"
+	fi
+	
+	# NEW CHECK: Kernel version and known vulnerabilities
+	if command_exists uname; then
+		local kernel_full=$(uname -r)
+		local kernel_ver=$(echo "$kernel_full" | cut -d- -f1)
+		local major=$(echo "$kernel_ver" | cut -d. -f1)
+		local minor=$(echo "$kernel_ver" | cut -d. -f2 2>/dev/null || echo "0")
+		
+		add_finding "Enhanced Kernel Security" "INFO" "Running kernel version: $kernel_full" ""
+		
+		# Check for EOL/vulnerable kernel versions
+		if [ "$major" -lt 4 ]; then
+			add_finding "Enhanced Kernel Security" "CRIT" "Running EOL kernel $kernel_ver (< 4.x)" "Update to kernel 5.10+ LTS immediately - critical security vulnerabilities"
+		elif [ "$major" -eq 4 ]; then
+			add_finding "Enhanced Kernel Security" "WARN" "Running kernel 4.x ($kernel_ver) - approaching EOL" "Consider updating to 5.10+ or 6.1+ LTS for long-term support and security patches"
+		elif [ "$major" -eq 5 ] && [ "$minor" -lt 10 ]; then
+			add_finding "Enhanced Kernel Security" "WARN" "Running older 5.x kernel ($kernel_ver)" "Consider updating to 5.10+ LTS or 6.1+ LTS for latest security patches"
+		elif [ "$major" -eq 5 ] && [ "$minor" -ge 10 ]; then
+			add_finding "Enhanced Kernel Security" "OK" "Running supported kernel $kernel_ver (5.10+ LTS)" ""
+		elif [ "$major" -ge 6 ]; then
+			add_finding "Enhanced Kernel Security" "OK" "Running modern kernel $kernel_ver" ""
+		fi
+		
+		# Check for kernel lockdown mode (if available)
+		if [ -r /sys/kernel/security/lockdown ]; then
+			local lockdown_mode=$(cat /sys/kernel/security/lockdown 2>/dev/null | grep -o '\[.*\]' | tr -d '[]')
+			if [ "$lockdown_mode" = "none" ]; then
+				add_finding "Enhanced Kernel Security" "WARN" "Kernel lockdown disabled" "Enable lockdown mode for additional kernel hardening"
+			elif [ "$lockdown_mode" = "integrity" ] || [ "$lockdown_mode" = "confidentiality" ]; then
+				add_finding "Enhanced Kernel Security" "OK" "Kernel lockdown mode: $lockdown_mode" ""
+			fi
+		fi
 	fi
 	
 	# Check for additional security modules
@@ -2253,6 +2501,32 @@ section_enhanced_network_security() {
 	else
 		add_finding "Enhanced Network Security" "INFO" "No network hardening parameters accessible" ""
 		info "No network hardening parameters accessible"
+	fi
+	
+	# NEW CHECK: IP forwarding on non-router systems (security risk)
+	if command_exists sysctl; then
+		local ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "")
+		if [ "$ip_forward" = "1" ]; then
+			# Check if this might be intentional (router/gateway)
+			if command_exists route || command_exists ip; then
+				local default_routes=$(ip route show default 2>/dev/null | wc -l || echo 0)
+				if [ "$default_routes" -gt 1 ]; then
+					add_finding "Enhanced Network Security" "INFO" "IP forwarding enabled (appears to be router/gateway)" "Verify this is intentional for routing purposes"
+				else
+					add_finding "Enhanced Network Security" "WARN" "IP forwarding enabled on non-router system" "Disable: sysctl -w net.ipv4.ip_forward=0 and set in /etc/sysctl.conf"
+				fi
+			else
+				add_finding "Enhanced Network Security" "WARN" "IP forwarding enabled" "Disable unless this system is a router: sysctl -w net.ipv4.ip_forward=0"
+			fi
+		else
+			add_finding "Enhanced Network Security" "OK" "IP forwarding disabled" ""
+		fi
+		
+		# IPv6 forwarding check
+		local ipv6_forward=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo "")
+		if [ "$ipv6_forward" = "1" ]; then
+			add_finding "Enhanced Network Security" "WARN" "IPv6 forwarding enabled" "Disable unless needed: sysctl -w net.ipv6.conf.all.forwarding=0"
+		fi
 	fi
 	
 	# Check for network namespace isolation
@@ -2371,6 +2645,60 @@ section_compliance_checks() {
 		warn "No compliance tools detected"
 	fi
 	
+	# NEW CHECK 1: Password policy compliance (CIS/NIST requirement)
+	if [ -r /etc/login.defs ]; then
+		local pass_max_days=$(grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}')
+		local pass_min_days=$(grep "^PASS_MIN_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}')
+		local pass_warn_age=$(grep "^PASS_WARN_AGE" /etc/login.defs 2>/dev/null | awk '{print $2}')
+		
+		if [ -n "$pass_max_days" ]; then
+			if [ "$pass_max_days" -le 90 ] && [ "$pass_max_days" -gt 0 ]; then
+				add_finding "Compliance" "OK" "Password expiry policy compliant: $pass_max_days days" ""
+			elif [ "$pass_max_days" -eq 99999 ]; then
+				add_finding "Compliance" "CRIT" "Password expiry disabled (PASS_MAX_DAYS=99999)" "Set PASS_MAX_DAYS to 90 or less in /etc/login.defs"
+			else
+				add_finding "Compliance" "WARN" "Weak password expiry: $pass_max_days days" "Set PASS_MAX_DAYS to 90 or less in /etc/login.defs for compliance"
+			fi
+		else
+			add_finding "Compliance" "WARN" "PASS_MAX_DAYS not configured" "Set password aging policy in /etc/login.defs"
+		fi
+		
+		# Check minimum password age
+		if [ -n "$pass_min_days" ] && [ "$pass_min_days" -ge 1 ]; then
+			add_finding "Compliance" "OK" "Minimum password age set: $pass_min_days days" ""
+		fi
+	else
+		add_finding "Compliance" "INFO" "/etc/login.defs not accessible" ""
+	fi
+	
+	# NEW CHECK 2: Failed login lockout policy (brute force protection)
+	local lockout_configured=false
+	
+	# Check for pam_faillock
+	for pam_file in /etc/pam.d/common-auth /etc/pam.d/system-auth /etc/pam.d/password-auth; do
+		if [ -f "$pam_file" ]; then
+			if grep -q "pam_faillock" "$pam_file" 2>/dev/null; then
+				add_finding "Compliance" "OK" "Account lockout policy configured (pam_faillock)" ""
+				lockout_configured=true
+				break
+			fi
+		fi
+	done
+	
+	# Check for fail2ban as alternative
+	if [ "$lockout_configured" = false ]; then
+		if command_exists fail2ban-client; then
+			if systemctl is-active --quiet fail2ban 2>/dev/null || service fail2ban status >/dev/null 2>&1; then
+				add_finding "Compliance" "OK" "fail2ban active for brute force protection" ""
+				lockout_configured=true
+			fi
+		fi
+	fi
+	
+	if [ "$lockout_configured" = false ]; then
+		add_finding "Compliance" "WARN" "No account lockout policy detected" "Configure pam_faillock or install fail2ban for brute force protection"
+	fi
+	
 	# Summary
 	if [ "$audit_configured" -eq 1 ] || [ "$log_retention_configured" -eq 1 ] || [ "$security_policies_found" -gt 0 ] || [ "$compliance_tools_found" -gt 0 ]; then
 		add_finding "Compliance" "INFO" "Compliance framework partially configured" ""
@@ -2382,158 +2710,9 @@ section_compliance_checks() {
 	fi
 }
 
-# Enhanced container security checks
-section_enhanced_container_security() {
-	print_section "Enhanced Container Security"
-	
-	# Check for container runtime security
-	if command_exists docker; then
-		add_finding "Enhanced Container Security" "INFO" "Docker runtime detected" ""
-		info "Docker runtime detected"
-		
-		# Check Docker daemon security configuration
-		if [ -f /etc/docker/daemon.json ]; then
-			security_config=$(grep -E "(live-restore|userland-proxy|no-new-privileges)" /etc/docker/daemon.json 2>/dev/null || true)
-			if [ -n "$security_config" ]; then
-				add_finding "Enhanced Container Security" "OK" "Docker security hardening configured" ""
-				ok "Docker security hardening"
-			else
-				rec="Configure Docker security hardening in /etc/docker/daemon.json"
-				add_finding "Enhanced Container Security" "WARN" "Docker security hardening not configured" "$rec"
-				warn "Docker security hardening not configured"
-			fi
-		else
-			rec="Create /etc/docker/daemon.json with security hardening options"
-			add_finding "Enhanced Container Security" "WARN" "Docker daemon configuration file not found" "$rec"
-			warn "Docker daemon configuration not found"
-		fi
-		
-		# Check for running containers with security profiles
-		if is_root; then
-			running_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | wc -l || echo "0")
-			if [ "$running_containers" -gt 0 ]; then
-				add_finding "Enhanced Container Security" "INFO" "$running_containers container(s) running" ""
-				info "$running_containers container(s) running"
-				
-				unconfined_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | xargs -I {} docker inspect --format '{{.HostConfig.SecurityOpt}}' {} 2>/dev/null | grep -c "unconfined" || echo "0")
-				if [ "$unconfined_containers" -gt 0 ]; then
-					rec="Review containers running without security profiles"
-					add_finding "Enhanced Container Security" "WARN" "$unconfined_containers container(s) without security profiles" "$rec"
-					warn "Unconfined containers detected"
-				else
-					add_finding "Enhanced Container Security" "OK" "All running containers have security profiles" ""
-					ok "All containers have security profiles"
-				fi
-			else
-				add_finding "Enhanced Container Security" "INFO" "No containers currently running" ""
-				info "No containers running"
-			fi
-		else
-			add_finding "Enhanced Container Security" "INFO" "Docker container inspection requires sudo access" ""
-			info "Container inspection requires sudo access"
-		fi
-	else
-		add_finding "Enhanced Container Security" "INFO" "Docker runtime not detected" ""
-		info "Docker runtime not detected"
-	fi
-	
-	# Check for Kubernetes security
-	if command_exists kubectl; then
-		add_finding "Enhanced Container Security" "INFO" "Kubernetes CLI detected" ""
-		info "Kubernetes CLI detected"
-		
-		# Check for RBAC configuration
-		if kubectl get clusterrolebinding 2>/dev/null | grep -q "cluster-admin"; then
-			rec="Review cluster-admin bindings for security implications"
-			add_finding "Enhanced Container Security" "WARN" "Cluster admin bindings detected" "$rec"
-			warn "Cluster admin bindings found"
-		else
-			add_finding "Enhanced Container Security" "OK" "No cluster-admin bindings detected" ""
-			ok "No cluster-admin bindings"
-		fi
-		
-		# Check for network policies
-		network_policies=$(kubectl get networkpolicies --all-namespaces 2>/dev/null | wc -l || echo "0")
-		if [ "$network_policies" -gt 0 ]; then
-			add_finding "Enhanced Container Security" "OK" "Network policies configured: $network_policies" ""
-			ok "Network policies configured"
-		else
-			rec="Configure network policies for pod-to-pod communication control"
-			add_finding "Enhanced Container Security" "WARN" "No network policies configured" "$rec"
-			warn "No network policies configured"
-		fi
-	else
-		add_finding "Enhanced Container Security" "INFO" "Kubernetes CLI not detected" ""
-		info "Kubernetes CLI not detected"
-	fi
-}
-
-# Enhanced file integrity monitoring
-section_enhanced_file_integrity() {
-	print_section "Enhanced File Integrity"
-	
-	# Check for additional integrity monitoring tools
-	integrity_tools=("aide" "tripwire" "ossec" "samhain" "integrity")
-	tools_found=0
-	
-	for tool in "${integrity_tools[@]}"; do
-		if command_exists "$tool"; then
-			tools_found=$((tools_found + 1))
-			add_finding "Enhanced File Integrity" "OK" "File integrity tool available: $tool" ""
-			ok "$tool available"
-			
-			# Check for recent integrity checks
-			if [ "$tool" = "aide" ] && [ -f /var/lib/aide/aide.db ]; then
-				last_check=$(stat -c "%Y" /var/lib/aide/aide.db 2>/dev/null || echo "0")
-				current_time=$(date +%s)
-				days_since_check=$(( (current_time - last_check) / 86400 ))
-				
-				if [ "$days_since_check" -lt 7 ]; then
-					add_finding "Enhanced File Integrity" "OK" "AIDE database updated $days_since_check days ago" ""
-				else
-					rec="Run AIDE integrity check: 'sudo aide --check'"
-					add_finding "Enhanced File Integrity" "WARN" "AIDE database not updated for $days_since_check days" "$rec"
-				fi
-			fi
-		fi
-	done
-	
-	if [ "$tools_found" -eq 0 ]; then
-		rec="Install file integrity monitoring tools: 'sudo apt install aide' or 'sudo yum install aide'"
-		add_finding "Enhanced File Integrity" "WARN" "No file integrity monitoring tools detected" "$rec"
-		warn "No file integrity tools detected"
-	fi
-	
-	# Check for critical file modifications
-	critical_files=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config" "/etc/fstab")
-	critical_files_checked=0
-	
-	for file in "${critical_files[@]}"; do
-		if [ -f "$file" ]; then
-			critical_files_checked=$((critical_files_checked + 1))
-			# Check for recent modifications
-			last_mod=$(stat -c "%Y" "$file" 2>/dev/null || echo "0")
-			current_time=$(date +%s)
-			days_since_mod=$(( (current_time - last_mod) / 86400 ))
-			
-			if [ "$days_since_mod" -lt 30 ]; then
-				add_finding "Enhanced File Integrity" "INFO" "$(basename "$file") modified $days_since_mod days ago" ""
-				info "$(basename "$file") modified $days_since_mod days ago"
-			else
-				add_finding "Enhanced File Integrity" "OK" "$(basename "$file") not modified recently ($days_since_mod days ago)" ""
-				ok "$(basename "$file") not modified recently"
-			fi
-		fi
-	done
-	
-	if [ "$critical_files_checked" -gt 0 ]; then
-		add_finding "Enhanced File Integrity" "INFO" "Checked $critical_files_checked critical system files" ""
-		info "Checked $critical_files_checked critical files"
-	else
-		add_finding "Enhanced File Integrity" "INFO" "No critical system files accessible for modification checking" ""
-		info "No critical files accessible"
-	fi
-}
+# NOTE: Enhanced container security checks have been consolidated into 'Container & Virtualization Security' section
+# NOTE: Enhanced file integrity checks have been consolidated into 'File Integrity' section
+# This eliminates duplication while providing comprehensive security analysis
 
 # Enhanced process security checks
 section_enhanced_process_security() {
@@ -2555,23 +2734,11 @@ section_enhanced_process_security() {
 		fi
 		
 		# Check for process capabilities
+		# NOTE: Comprehensive capability analysis in 'Privilege Escalation Surface (Core)' section
 		if command_exists getcap && is_root; then
 			privileged_processes=$(getcap -r /usr/bin /bin /sbin 2>/dev/null | grep -E "(cap_sys_admin|cap_sys_ptrace|cap_sys_module)" | wc -l || echo "0")
 			if [ "$privileged_processes" -gt 0 ]; then
-				rec="Review processes with elevated capabilities"
-				add_finding "Enhanced Process Security" "WARN" "$privileged_processes process(es) with elevated capabilities" "$rec"
-				warn "Elevated capabilities detected"
-			else
-				add_finding "Enhanced Process Security" "OK" "No processes with elevated capabilities detected" ""
-				ok "No elevated capabilities detected"
-			fi
-		else
-			if ! is_root; then
-				add_finding "Enhanced Process Security" "INFO" "Process capability checking requires sudo access" ""
-				info "Capability checking requires sudo access"
-			else
-				add_finding "Enhanced Process Security" "INFO" "getcap command not available" ""
-				info "getcap command not available"
+				add_finding "Enhanced Process Security" "INFO" "$privileged_processes file(s) with elevated capabilities" "See 'Privilege Escalation Surface (Core)' for detailed analysis"
 			fi
 		fi
 	else
@@ -2595,22 +2762,96 @@ section_enhanced_process_security() {
 		info "Memory protection sysctl not available"
 	fi
 	
-	# Check for process tree
-	if command_exists pstree; then
-		process_count=$(ps aux | wc -l 2>/dev/null || echo "0")
+	# REMOVED DUPLICATE: pstree process tree check (see 'Process & Forensics' section for comprehensive analysis)
+	
+	# NEW CHECK 1: ASLR (Address Space Layout Randomization)
+	if [ -f /proc/sys/kernel/randomize_va_space ]; then
+		aslr_value=$(safe_read /proc/sys/kernel/randomize_va_space)
+		case "$aslr_value" in
+			2)
+				add_finding "Enhanced Process Security" "OK" "ASLR fully enabled (value: 2)" ""
+				ok "ASLR fully enabled"
+				;;
+			1)
+				add_finding "Enhanced Process Security" "WARN" "ASLR partially enabled (value: 1)" "Enable full ASLR: 'echo 2 | sudo tee /proc/sys/kernel/randomize_va_space'"
+				warn "ASLR only partially enabled"
+				;;
+			0)
+				add_finding "Enhanced Process Security" "CRIT" "ASLR disabled (value: 0)" "Enable ASLR: 'echo 2 | sudo tee /proc/sys/kernel/randomize_va_space' and add to /etc/sysctl.conf"
+				crit "ASLR disabled - critical security issue"
+				;;
+			*)
+				add_finding "Enhanced Process Security" "WARN" "ASLR value unknown: $aslr_value" ""
+				;;
+		esac
+	else
+		add_finding "Enhanced Process Security" "WARN" "ASLR configuration not accessible" ""
+		warn "Cannot check ASLR status"
+	fi
+	
+	# NEW CHECK 2: Process memory permissions (RWX pages detection)
+	if is_root && [ -d /proc ]; then
+		rwx_processes=0
+		rwx_process_list=""
+		
+		# Check a sample of running processes for RWX memory regions
+		for pid in $(ls -1 /proc | grep -E '^[0-9]+$' | head -20); do
+			if [ -f "/proc/$pid/maps" ]; then
+				# Look for regions with rwx permissions (read+write+execute)
+				if grep -q "rwxp" "/proc/$pid/maps" 2>/dev/null; then
+					rwx_processes=$((rwx_processes + 1))
+					proc_name=$(cat "/proc/$pid/comm" 2>/dev/null || echo "unknown")
+					rwx_process_list="$rwx_process_list $proc_name(PID:$pid)"
+					
+					# Limit to first 5 findings
+					if [ "$rwx_processes" -ge 5 ]; then
+						break
+					fi
+				fi
+			fi
+		done
+		
+		if [ "$rwx_processes" -gt 0 ]; then
+			rec="Investigate processes with RWX memory pages - potential security risk or JIT compilation"
+			add_finding "Enhanced Process Security" "WARN" "$rwx_processes process(es) with RWX memory regions:$rwx_process_list" "$rec"
+			warn "$rwx_processes processes with RWX memory"
+		else
+			add_finding "Enhanced Process Security" "OK" "No RWX memory regions detected in sampled processes" ""
+			ok "No RWX memory regions found"
+		fi
+	else
+		add_finding "Enhanced Process Security" "INFO" "RWX memory check requires root access" ""
+	fi
+	
+	# Process count summary
+	if command_exists ps; then
+		process_count=$(ps aux --no-headers 2>/dev/null | wc -l || echo "0")
 		if [ "$process_count" -gt 0 ]; then
 			add_finding "Enhanced Process Security" "INFO" "System running $process_count processes" ""
 			info "System running $process_count processes"
 		fi
-	else
-		add_finding "Enhanced Process Security" "INFO" "pstree command not available" ""
-		info "pstree command not available"
 	fi
 }
 
 # Enhanced logging security checks
 section_enhanced_logging_security() {
 	print_section "Enhanced Logging Security"
+	
+	# MIGRATED: Check logging service status
+	if systemctl is-active --quiet rsyslog 2>/dev/null; then
+		add_finding "Enhanced Logging Security" "OK" "rsyslog service is active" ""
+		ok "rsyslog is active"
+	elif systemctl is-active --quiet syslog-ng 2>/dev/null; then
+		add_finding "Enhanced Logging Security" "OK" "syslog-ng service is active" ""
+		ok "syslog-ng is active"
+	elif systemctl is-active --quiet systemd-journald 2>/dev/null; then
+		add_finding "Enhanced Logging Security" "OK" "systemd-journald is active" ""
+		ok "systemd-journald is active"
+	else
+		rec="Ensure logging service is running: 'sudo systemctl start rsyslog'"
+		add_finding "Enhanced Logging Security" "CRIT" "No syslog service detected" "$rec"
+		crit "No syslog service detected"
+	fi
 	
 	# Check for log file permissions
 	log_files=("/var/log/auth.log" "/var/log/secure" "/var/log/messages" "/var/log/syslog" "/var/log/kern.log")
@@ -2684,6 +2925,74 @@ section_enhanced_logging_security() {
 	else
 		add_finding "Enhanced Logging Security" "INFO" "Log rotation configuration not found" ""
 		info "Log rotation not configured"
+	fi
+	
+	# NEW CHECK 1: Log tampering detection (cleared or truncated logs)
+	critical_logs=("/var/log/auth.log" "/var/log/secure" "/var/log/audit/audit.log")
+	suspicious_logs=0
+	
+	for log_file in "${critical_logs[@]}"; do
+		if [ -f "$log_file" ]; then
+			log_size=$(stat -c "%s" "$log_file" 2>/dev/null || echo "0")
+			log_lines=$(wc -l < "$log_file" 2>/dev/null || echo "0")
+			
+			# Check if log file is suspiciously small (< 100 bytes) or empty
+			if [ "$log_size" -lt 100 ] && [ "$log_size" -gt 0 ]; then
+				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") is suspiciously small (${log_size} bytes)" "Investigate potential log tampering or clearing"
+				warn "$(basename "$log_file") suspiciously small"
+				suspicious_logs=$((suspicious_logs + 1))
+			elif [ "$log_size" -eq 0 ]; then
+				add_finding "Enhanced Logging Security" "WARN" "$(basename "$log_file") is empty" "Investigate potential log tampering"
+				warn "$(basename "$log_file") is empty"
+				suspicious_logs=$((suspicious_logs + 1))
+			fi
+			
+			# Check for recent modifications to audit.log (shouldn't be manually modified)
+			if [[ "$log_file" == *"audit.log"* ]]; then
+				last_mod=$(stat -c "%Y" "$log_file" 2>/dev/null || echo "0")
+				current_time=$(date +%s)
+				seconds_since_mod=$(( current_time - last_mod ))
+				
+				# If audit.log was modified very recently (< 60 seconds) and is small, suspicious
+				if [ "$seconds_since_mod" -lt 60 ] && [ "$log_size" -lt 1000 ]; then
+					add_finding "Enhanced Logging Security" "CRIT" "audit.log recently modified and small - potential tampering" "Investigate immediately"
+					crit "Possible audit log tampering detected"
+					suspicious_logs=$((suspicious_logs + 1))
+				fi
+			fi
+		fi
+	done
+	
+	if [ "$suspicious_logs" -eq 0 ]; then
+		add_finding "Enhanced Logging Security" "OK" "No log tampering indicators detected" ""
+		ok "No log tampering detected"
+	fi
+	
+	# NEW CHECK 2: Systemd journal persistent storage
+	if command_exists journalctl; then
+		if [ -d /var/log/journal ]; then
+			journal_size=$(du -sh /var/log/journal 2>/dev/null | awk '{print $1}')
+			add_finding "Enhanced Logging Security" "OK" "Systemd journal persistent storage enabled: $journal_size" ""
+			ok "Journal persistent storage enabled"
+			
+			# Check journal configuration
+			if [ -f /etc/systemd/journald.conf ]; then
+				storage_mode=$(grep "^Storage=" /etc/systemd/journald.conf 2>/dev/null | cut -d= -f2)
+				if [ "$storage_mode" = "persistent" ]; then
+					add_finding "Enhanced Logging Security" "OK" "Journal storage mode: persistent" ""
+					ok "Journal persistent mode confirmed"
+				elif [ "$storage_mode" = "volatile" ]; then
+					add_finding "Enhanced Logging Security" "WARN" "Journal storage mode: volatile (logs lost on reboot)" "Set Storage=persistent in /etc/systemd/journald.conf"
+					warn "Journal in volatile mode"
+				fi
+			fi
+		else
+			rec="Enable persistent journal: 'sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald'"
+			add_finding "Enhanced Logging Security" "WARN" "Systemd journal persistent storage not enabled" "$rec"
+			warn "No persistent journal storage"
+		fi
+	else
+		add_finding "Enhanced Logging Security" "INFO" "systemd-journald not available" ""
 	fi
 }
 
@@ -2772,6 +3081,65 @@ section_enhanced_network_access() {
 		warn "No firewall tools detected"
 	fi
 	
+	# NEW CHECK 1: Default firewall policy (should be DROP/REJECT, not ACCEPT)
+	if command_exists iptables; then
+		default_input_policy=$(iptables -L INPUT -n 2>/dev/null | head -1 | grep -oE "(ACCEPT|DROP|REJECT)" || echo "UNKNOWN")
+		case "$default_input_policy" in
+			DROP|REJECT)
+				add_finding "Enhanced Network Access Controls" "OK" "Default INPUT policy: $default_input_policy (secure)" ""
+				ok "Default INPUT policy secure"
+				;;
+			ACCEPT)
+				rec="Set secure default policy: 'sudo iptables -P INPUT DROP' and configure explicit allow rules"
+				add_finding "Enhanced Network Access Controls" "CRIT" "Default INPUT policy: ACCEPT (insecure)" "$rec"
+				crit "Default INPUT policy is ACCEPT"
+				;;
+			*)
+				add_finding "Enhanced Network Access Controls" "WARN" "Cannot determine default INPUT policy" ""
+				;;
+		esac
+		
+		# Check OUTPUT policy (egress filtering)
+		default_output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -1 | grep -oE "(ACCEPT|DROP|REJECT)" || echo "UNKNOWN")
+		if [ "$default_output_policy" = "DROP" ] || [ "$default_output_policy" = "REJECT" ]; then
+			add_finding "Enhanced Network Access Controls" "OK" "Egress filtering enabled (OUTPUT policy: $default_output_policy)" ""
+			ok "Egress filtering enabled"
+		elif [ "$default_output_policy" = "ACCEPT" ]; then
+			rec="Consider egress filtering for advanced security: 'sudo iptables -P OUTPUT DROP' with explicit allow rules"
+			add_finding "Enhanced Network Access Controls" "INFO" "No egress filtering (OUTPUT policy: ACCEPT)" "$rec"
+			info "No egress filtering configured"
+		fi
+	elif command_exists ufw; then
+		ufw_status=$(ufw status verbose 2>/dev/null || echo "")
+		if echo "$ufw_status" | grep -q "Default: deny (incoming)"; then
+			add_finding "Enhanced Network Access Controls" "OK" "UFW default deny incoming configured" ""
+			ok "UFW default deny incoming"
+		elif echo "$ufw_status" | grep -q "Default: allow (incoming)"; then
+			rec="Secure UFW default policy: 'sudo ufw default deny incoming'"
+			add_finding "Enhanced Network Access Controls" "WARN" "UFW allows incoming by default" "$rec"
+			warn "UFW default allow incoming"
+		fi
+		
+		# Check egress
+		if echo "$ufw_status" | grep -q "Default: deny (outgoing)"; then
+			add_finding "Enhanced Network Access Controls" "OK" "UFW egress filtering enabled" ""
+			ok "UFW egress filtering"
+		fi
+	fi
+	
+	# NEW CHECK 2: Check for OUTPUT/egress firewall rules
+	if command_exists iptables; then
+		output_rules=$(iptables -L OUTPUT -n 2>/dev/null | grep -c "^" || echo "0")
+		if [ "$output_rules" -gt 3 ]; then  # More than just header lines
+			add_finding "Enhanced Network Access Controls" "OK" "Egress firewall rules configured ($output_rules rules)" ""
+			ok "Egress filtering rules present"
+		else
+			rec="Consider implementing egress filtering to control outbound connections and prevent data exfiltration"
+			add_finding "Enhanced Network Access Controls" "INFO" "No egress filtering rules detected" "$rec"
+			info "No egress filtering rules"
+		fi
+	fi
+	
 	# Summary
 	if [ "$tcp_wrappers_found" -eq 1 ] || [ "$firewall_found" -eq 1 ]; then
 		add_finding "Enhanced Network Access Controls" "INFO" "Network access controls partially configured" ""
@@ -2783,12 +3151,624 @@ section_enhanced_network_access() {
 	fi
 }
 
+# Malware signature detection
+section_malware_detection() {
+    print_section "Malware Detection"
+    
+    # Common malware signatures and patterns
+    local malware_patterns=(
+        "backdoor"
+        "trojan"
+        "rootkit"
+        "keylogger"
+        "botnet"
+        "cryptominer"
+        "ransomware"
+        "spyware"
+    )
+    
+    local suspicious_files=()
+    local suspicious_processes=()
+    local suspicious_network=()
+    
+    # Check for suspicious files in common locations (exclude script temp files)
+    local search_paths=("/tmp" "/var/tmp" "/dev/shm" "/home" "/root")
+    for path in "${search_paths[@]}"; do
+        [ -d "$path" ] || continue
+        
+        for pattern in "${malware_patterns[@]}"; do
+            local found_files=$(cached_command find "$path" -maxdepth 3 -type f -iname "*${pattern}*" 2>/dev/null | grep -v "btqc-par-" | head -10)
+            if [ -n "$found_files" ]; then
+                while IFS= read -r file; do
+                    suspicious_files+=("$file")
+                    add_finding "Malware Detection" "WARN" "Suspicious file found: $file" "Investigate file: 'file $file' and 'strings $file | grep -i suspicious'"
+                done <<< "$found_files"
+            fi
+        done
+    done
+    
+    # Check for suspicious processes (exclude script's own processes and commands)
+    if command_exists ps; then
+        local ps_output=$(cached_command ps aux 2>/dev/null)
+        for pattern in "${malware_patterns[@]}"; do
+            local suspicious_procs=$(echo "$ps_output" | grep -i "$pattern" | grep -v "bt-quickcheck\|btqc-par-\|find.*-iname.*$pattern\|grep.*$pattern" | head -5)
+            if [ -n "$suspicious_procs" ]; then
+                while IFS= read -r proc; do
+                    suspicious_processes+=("$proc")
+                    add_finding "Malware Detection" "WARN" "Suspicious process: $proc" "Investigate process: 'ps aux | grep $pattern' and check process tree"
+                done <<< "$suspicious_procs"
+            fi
+        done
+    fi
+    
+    # Check for suspicious network connections
+    if command_exists netstat; then
+        local netstat_output=$(cached_command netstat -tuln 2>/dev/null)
+        # Look for unusual ports or connections
+        local suspicious_ports=$(echo "$netstat_output" | awk '$1 ~ /tcp/ && $4 ~ /:(4444|5555|6666|7777|8888|9999|1337|31337|12345|54321)/ {print $4}')
+        if [ -n "$suspicious_ports" ]; then
+            while IFS= read -r port; do
+                suspicious_network+=("$port")
+                add_finding "Malware Detection" "WARN" "Suspicious port listening: $port" "Investigate port: 'netstat -tuln | grep $port' and 'lsof -i :$port'"
+            done <<< "$suspicious_ports"
+        fi
+    fi
+    
+    # Check for suspicious file permissions (executable in temp directories)
+    local temp_executables=$(cached_command find /tmp /var/tmp /dev/shm -maxdepth 2 -type f -executable 2>/dev/null | head -10)
+    if [ -n "$temp_executables" ]; then
+        while IFS= read -r file; do
+            add_finding "Malware Detection" "WARN" "Executable in temp directory: $file" "Investigate executable: 'file $file' and 'strings $file'"
+        done <<< "$temp_executables"
+    fi
+    
+    # Check for suspicious cron jobs
+    if is_root; then
+        local suspicious_cron=$(cached_command find /etc/cron* /var/spool/cron* -type f 2>/dev/null | xargs grep -l "wget\|curl\|bash.*http\|sh.*http" 2>/dev/null | head -5)
+        if [ -n "$suspicious_cron" ]; then
+            while IFS= read -r cron_file; do
+                add_finding "Malware Detection" "CRIT" "Suspicious cron job: $cron_file" "Review cron job: 'cat $cron_file' and investigate source"
+            done <<< "$suspicious_cron"
+        fi
+    fi
+    
+	# NOTE: Duplicate systemd service check removed - see Rootkit Detection for comprehensive service analysis
+    
+    # NEW CHECK 1: Crypto-jacking detection (cryptocurrency miners)
+    if command_exists ps; then
+        local crypto_miners=("xmrig" "minerd" "cpuminer" "ccminer" "ethminer" "claymore" "phoenix" "t-rex" "nanominer" "lolminer")
+        local mining_found=false
+        
+        for miner in "${crypto_miners[@]}"; do
+            local miner_procs=$(cached_command ps aux 2>/dev/null | grep -i "$miner" | grep -v "grep" | head -3)
+            if [ -n "$miner_procs" ]; then
+                add_finding "Malware Detection" "CRIT" "Cryptocurrency miner detected: $miner" "Investigate and terminate: 'ps aux | grep -i $miner' and 'kill -9 [PID]'"
+                crit "Crypto-miner detected: $miner"
+                mining_found=true
+            fi
+        done
+        
+        # Check for high-CPU processes that might be miners (>80% CPU)
+        local high_cpu_procs=$(cached_command ps aux 2>/dev/null | awk 'NR>1 && $3>80 {print $2":"$11}' | head -5)
+        if [ -n "$high_cpu_procs" ]; then
+            add_finding "Malware Detection" "WARN" "High-CPU processes detected (potential mining): $high_cpu_procs" "Investigate CPU usage: 'top -b -n 1 | head -20'"
+            warn "High-CPU processes detected"
+        fi
+    fi
+    
+    # NEW CHECK 2: LD_PRELOAD/LD_LIBRARY_PATH persistence (library injection)
+    if [ -n "${LD_PRELOAD:-}" ] || [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        add_finding "Malware Detection" "CRIT" "LD_PRELOAD or LD_LIBRARY_PATH is set (potential library injection)" "Investigate: echo \$LD_PRELOAD and echo \$LD_LIBRARY_PATH"
+        crit "Suspicious library injection detected"
+    fi
+    
+    # Check for LD_PRELOAD in system configs
+    local ld_preload_configs=$(grep -r "LD_PRELOAD" /etc/environment /etc/profile /etc/bash.bashrc /etc/profile.d/ 2>/dev/null | head -5)
+    if [ -n "$ld_preload_configs" ]; then
+        add_finding "Malware Detection" "CRIT" "LD_PRELOAD configured in system files: $ld_preload_configs" "Investigate library injection: review files and check loaded libraries"
+        crit "LD_PRELOAD in system config detected"
+    fi
+    
+    # Summary
+    local total_suspicious=$((${#suspicious_files[@]} + ${#suspicious_processes[@]} + ${#suspicious_network[@]}))
+    if [ $total_suspicious -eq 0 ]; then
+        add_finding "Malware Detection" "OK" "No obvious malware signatures detected" "Continue monitoring with regular scans"
+        ok "No obvious malware signatures detected"
+    else
+        add_finding "Malware Detection" "WARN" "Found $total_suspicious suspicious items requiring investigation" "Review all flagged items and consider full malware scan"
+        warn "Found $total_suspicious suspicious items requiring investigation"
+    fi
+}
+
+# Enhanced rootkit detection
+section_rootkit_detection() {
+    print_section "Rootkit Detection"
+    
+    local rootkit_indicators=0
+    local total_checks=0
+    
+    # Check for hidden processes (ps vs /proc comparison)
+    if command_exists ps && [ -d /proc ]; then
+        ((total_checks++))
+        local ps_pids=$(cached_command ps -eo pid 2>/dev/null | tail -n +2 | sort -n)
+        local proc_pids=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+        
+        # Filter out kernel threads and system processes that might not show in ps
+        local hidden_pids=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids") 2>/dev/null | grep -v -E '^[0-9]+$' | head -10 | tr '\n' ' ')
+        
+        # Only flag if we find actual suspicious hidden processes (not just kernel threads)
+        if [ -n "$hidden_pids" ] && [ $(echo "$hidden_pids" | wc -w) -gt 0 ]; then
+            # Double-check by trying to read the process info
+            local real_hidden=""
+            for pid in $hidden_pids; do
+                if [ -f "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/cmdline" ]; then
+                    local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | head -c 100)
+                    if [ -n "$cmdline" ] && [ "$cmdline" != " " ]; then
+                        real_hidden="$real_hidden $pid"
+                    fi
+                fi
+            done
+            
+            if [ -n "$real_hidden" ]; then
+                ((rootkit_indicators++))
+                local hidden_count=$(echo "$real_hidden" | wc -w)
+                add_finding "Rootkit Detection" "CRIT" "Hidden processes detected: $hidden_count PIDs ($real_hidden)" "Investigate hidden processes: 'ls -la /proc/[PID]/' for each PID"
+                crit "Hidden processes detected: $hidden_count PIDs"
+            else
+                add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
+                ok "No hidden processes detected"
+            fi
+        else
+            add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
+        fi
+    fi
+    
+    # Check for suspicious kernel modules
+    if is_root && [ -f /proc/modules ]; then
+        ((total_checks++))
+        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
+        local suspicious_modules=$(echo "$loaded_modules" | grep -E "(backdoor|rootkit|stealth|hidden)" 2>/dev/null)
+        
+        if [ -n "$suspicious_modules" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "Suspicious kernel modules: $suspicious_modules" "Investigate modules: 'modinfo [module_name]' and 'lsmod | grep [module_name]'"
+            crit "Suspicious kernel modules detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious kernel modules detected" ""
+            ok "No suspicious kernel modules detected"
+        fi
+    fi
+    
+    # Check for modified system binaries
+    if is_root; then
+        ((total_checks++))
+        local critical_binaries=("/bin/ls" "/bin/ps" "/bin/netstat" "/bin/ss" "/usr/bin/top" "/bin/df")
+        local modified_binaries=()
+        
+        for binary in "${critical_binaries[@]}"; do
+            if [ -f "$binary" ]; then
+                # Check if binary has been modified recently (within last 7 days)
+                local mod_time=$(stat -c %Y "$binary" 2>/dev/null || echo 0)
+                local current_time=$(date +%s)
+                local age_days=$(( (current_time - mod_time) / 86400 ))
+                
+                if [ $age_days -lt 7 ]; then
+                    modified_binaries+=("$binary (modified $age_days days ago)")
+                fi
+            fi
+        done
+        
+        if [ ${#modified_binaries[@]} -gt 0 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Recently modified system binaries: ${modified_binaries[*]}" "Verify binary integrity: 'rpm -Vf $binary' or 'debsums $binary'"
+        else
+            add_finding "Rootkit Detection" "OK" "System binaries appear unmodified" ""
+        fi
+    fi
+    
+    # Check for suspicious network connections (hidden)
+    if command_exists netstat && command_exists ss; then
+        ((total_checks++))
+        local netstat_conns=$(cached_command netstat -tuln 2>/dev/null | wc -l)
+        local ss_conns=$(cached_command ss -tuln 2>/dev/null | wc -l)
+        local diff=$((netstat_conns - ss_conns))
+        
+        if [ $diff -gt 5 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Significant difference in network connections (netstat: $netstat_conns, ss: $ss_conns)" "Investigate hidden connections: 'netstat -tuln' vs 'ss -tuln'"
+        else
+            add_finding "Rootkit Detection" "OK" "Network connection counts consistent" ""
+        fi
+    fi
+    
+    # Check for suspicious file system inconsistencies
+    if is_root; then
+        ((total_checks++))
+        # Exclude legitimate system files and common benign hidden files
+        local fs_check=$(cached_command find /etc /bin /sbin -maxdepth 2 -type f -name ".*" 2>/dev/null | \
+            grep -v -E "\.(placeholder|bak|lock|updated|dpkg|apt|systemd|pam|profile|bashrc|vimrc|gitignore)$|skel|\.git" | \
+            grep -v -E "^/etc/\.(pwd\.lock|gshadow\.lock|shadow\.lock|passwd\.lock|group\.lock)$" | \
+            head -10 | tr '\n' ' ')
+        if [ -n "$fs_check" ]; then
+            ((rootkit_indicators++))
+            local hidden_count=$(echo "$fs_check" | wc -w)
+            add_finding "Rootkit Detection" "WARN" "Hidden files in system directories: $hidden_count files ($fs_check)" "Investigate hidden files: 'ls -la [file]' and 'file [file]'"
+            warn "Hidden files in system directories: $hidden_count files"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious hidden files in system directories" ""
+            ok "No suspicious hidden files in system directories"
+        fi
+    fi
+    
+    # Check for suspicious system calls (improved detection)
+    if is_root && [ -f /proc/kallsyms ]; then
+        ((total_checks++))
+        # Look for actual hooking patterns, not just the presence of sys_call_table
+        local suspicious_hooks=$(cached_command grep -E "(sys_call_table.*\[|system_call.*\[)" /proc/kallsyms 2>/dev/null | \
+            grep -v -E "(sys_call_table|system_call)$" | \
+            grep -v -E "(sys_call_table|system_call).*0x[0-9a-f]+$" | \
+            wc -l)
+        
+        # Also check for unusual syscall modifications by looking for non-standard syscall entries
+        local unusual_syscalls=$(cached_command grep -E "sys_call_table" /proc/kallsyms 2>/dev/null | \
+            awk '{print $3}' | \
+            grep -v -E "^0x[0-9a-f]+$" | \
+            wc -l)
+        
+        if [ $suspicious_hooks -gt 0 ] || [ $unusual_syscalls -gt 0 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "Suspicious system call modifications detected" "Investigate kernel hooks: 'cat /proc/kallsyms | grep sys_call' and 'dmesg | grep -i hook'"
+            crit "Suspicious system call modifications detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No suspicious system call modifications detected" ""
+            ok "No suspicious system call modifications detected"
+        fi
+    fi
+    
+    # Check for suspicious memory regions (improved)
+    if is_root && [ -f /proc/iomem ]; then
+        ((total_checks++))
+        # Look for unusual memory patterns that might indicate rootkit activity
+        local suspicious_memory=$(cached_file_content /proc/iomem 2>/dev/null | \
+            grep -E "(reserved|unknown)" | \
+            grep -v -E "(ACPI|PCI|System RAM|Video RAM|ROM|Flash)" | \
+            head -5)
+        if [ -n "$suspicious_memory" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Suspicious memory regions: $suspicious_memory" "Investigate memory: 'cat /proc/iomem' and 'dmesg | grep -i memory'"
+            warn "Suspicious memory regions detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Memory regions appear normal" ""
+            ok "Memory regions appear normal"
+        fi
+    fi
+    
+    # Cross-view analysis: Compare different methods of process enumeration
+    if command_exists ps && command_exists ls; then
+        ((total_checks++))
+        local ps_count=$(cached_command ps aux 2>/dev/null | wc -l)
+        local proc_count=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | wc -l)
+        local diff=$((proc_count - ps_count))
+        
+        # Allow for some difference due to kernel threads, but flag significant discrepancies
+        if [ $diff -gt 10 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Significant process count discrepancy: /proc shows $proc_count, ps shows $ps_count" "Investigate hidden processes: 'ls /proc | grep -E ^[0-9] | wc -l' vs 'ps aux | wc -l'"
+            warn "Significant process count discrepancy detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Process enumeration consistent across methods" ""
+            ok "Process enumeration consistent across methods"
+        fi
+    fi
+    
+    # Check for suspicious file permissions and timestamps
+    if is_root; then
+        ((total_checks++))
+        local suspicious_files=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -perm -4000 2>/dev/null | \
+            xargs ls -la 2>/dev/null | \
+            awk '$6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {if ($6 != $7 || $7 != $8) print $9}' | \
+            head -5)
+        
+        if [ -n "$suspicious_files" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "SUID files with suspicious timestamps: $suspicious_files" "Investigate file timestamps: 'stat [file]' and 'ls -la [file]'"
+            warn "SUID files with suspicious timestamps detected"
+        else
+            add_finding "Rootkit Detection" "OK" "SUID file timestamps appear normal" ""
+            ok "SUID file timestamps appear normal"
+        fi
+    fi
+    
+    # Check for suspicious network behavior patterns
+    if command_exists netstat && command_exists ss; then
+        ((total_checks++))
+        # Look for processes listening on unusual ports
+        local unusual_ports=$(cached_command netstat -tuln 2>/dev/null | \
+            awk '$1 ~ /tcp/ && $4 ~ /:([0-9]{4,5})$/ {port=substr($4,index($4,":")+1); if(port > 1024 && port < 65536 && port !~ /^(8080|8443|3000|5000|8000|9000|3306|5432|6379|27017)$/) print port}' | \
+            head -5)
+        
+        if [ -n "$unusual_ports" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Processes listening on unusual ports: $unusual_ports" "Investigate ports: 'netstat -tuln | grep [port]' and 'lsof -i :[port]'"
+            warn "Processes listening on unusual ports detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No unusual network ports detected" ""
+            ok "No unusual network ports detected"
+        fi
+    fi
+    
+	# Check for suspicious systemd services (skip on non-systemd like WSL)
+	if command_exists systemctl && [ -d /run/systemd/system ]; then
+        ((total_checks++))
+        local suspicious_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | grep -E "(\.service|\.timer)" | grep -v "systemd" | wc -l)
+        local total_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | wc -l)
+        
+        if [ $suspicious_services -gt $((total_services / 2)) ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Unusually high number of non-systemd services running" "Review services: 'systemctl list-units --type=service --state=running'"
+            warn "Unusually high number of non-systemd services running"
+        else
+            add_finding "Rootkit Detection" "OK" "Service count appears normal" ""
+            ok "Service count appears normal"
+        fi
+    fi
+    
+    # Check for suspicious kernel module behavior
+    if is_root && [ -f /proc/modules ]; then
+        ((total_checks++))
+        # Look for modules that might be hiding their presence
+        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
+        local suspicious_modules=$(echo "$loaded_modules" | \
+            awk '{if ($3 == "0" && $4 == "0" && $5 == "0") print $1}' | \
+            grep -v -E "(nvidia|nouveau|radeon|amdgpu|intel|wifi|bluetooth|usb|pci)" | \
+            head -5)
+        
+        if [ -n "$suspicious_modules" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Kernel modules with suspicious reference counts: $suspicious_modules" "Investigate modules: 'modinfo [module]' and 'lsmod | grep [module]'"
+            warn "Kernel modules with suspicious reference counts detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Kernel module reference counts appear normal" ""
+            ok "Kernel module reference counts appear normal"
+        fi
+    fi
+    
+    # Check for suspicious file system inconsistencies using stat
+    if is_root; then
+        ((total_checks++))
+        # Check for files that might be hiding their true size or modification time
+        local suspicious_stat=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -executable 2>/dev/null | \
+            head -20 | \
+            xargs stat -c "%n %s %Y" 2>/dev/null | \
+            awk '{if ($2 == 0 || $3 == 0) print $1}' | \
+            head -5)
+        
+        if [ -n "$suspicious_stat" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Executable files with suspicious stat information: $suspicious_stat" "Investigate files: 'stat [file]' and 'file [file]'"
+            warn "Executable files with suspicious stat information detected"
+        else
+            add_finding "Rootkit Detection" "OK" "File stat information appears normal" ""
+            ok "File stat information appears normal"
+        fi
+    fi
+    
+    # Check for suspicious process behavior patterns
+    if command_exists ps; then
+        ((total_checks++))
+        # Look for processes with unusual characteristics
+        local suspicious_procs=$(cached_command ps aux 2>/dev/null | \
+            awk 'NR>1 {if ($3 > 50 || $4 > 50 || $6 > 1000000) print $2 ":" $11}' | \
+            grep -v -E "(systemd|kthreadd|ksoftirqd|migration|rcu_|watchdog)" | \
+            head -5)
+        
+        if [ -n "$suspicious_procs" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "WARN" "Processes with unusual resource usage: $suspicious_procs" "Investigate processes: 'ps aux | grep [PID]' and 'top -p [PID]'"
+            warn "Processes with unusual resource usage detected"
+        else
+            add_finding "Rootkit Detection" "OK" "Process resource usage appears normal" ""
+            ok "Process resource usage appears normal"
+        fi
+    fi
+    
+    # NEW CHECK 1: /dev/tcp backdoor detection (bash built-in networking)
+    if is_root; then
+        ((total_checks++))
+        # Check for suspicious /dev/tcp usage in scripts and processes
+        local dev_tcp_usage=$(grep -r "/dev/tcp" /etc /home /root /tmp /var/tmp 2>/dev/null | grep -v "bt-quickcheck" | head -5)
+        if [ -n "$dev_tcp_usage" ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "/dev/tcp backdoor detected in files: $dev_tcp_usage" "Investigate /dev/tcp usage: 'grep -r /dev/tcp [path]' and review scripts"
+            crit "/dev/tcp backdoor detected"
+        else
+            add_finding "Rootkit Detection" "OK" "No /dev/tcp backdoor detected" ""
+            ok "No /dev/tcp backdoor detected"
+        fi
+    fi
+    
+    # NEW CHECK 2: Cross-tool hidden file detection (compare ls vs find)
+    if is_root; then
+        ((total_checks++))
+        # Compare ls and find output to detect rootkits that hook ls
+        local ls_count=$(ls -1a /bin 2>/dev/null | wc -l)
+        local find_count=$(find /bin -maxdepth 1 -type f 2>/dev/null | wc -l)
+        local diff=$((find_count - ls_count))
+        
+        if [ $diff -gt 5 ]; then
+            ((rootkit_indicators++))
+            add_finding "Rootkit Detection" "CRIT" "ls/find discrepancy in /bin: ls shows $ls_count, find shows $find_count (diff: $diff)" "Investigate: 'ls -la /bin | wc -l' vs 'find /bin -maxdepth 1 | wc -l'"
+            crit "ls/find file count discrepancy detected"
+        else
+            add_finding "Rootkit Detection" "OK" "ls/find file counts consistent" ""
+            ok "ls/find file counts consistent"
+        fi
+    fi
+    
+    # Summary
+    local risk_level="LOW"
+    if [ $rootkit_indicators -gt 3 ]; then
+        risk_level="HIGH"
+    elif [ $rootkit_indicators -gt 1 ]; then
+        risk_level="MEDIUM"
+    fi
+    
+    add_finding "Rootkit Detection" "INFO" "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)" "Consider running dedicated rootkit scanners: 'rkhunter --check' or 'chkrootkit'"
+    info "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)"
+}
+
+# Behavioral analysis for anomaly detection
+section_behavioral_analysis() {
+    print_section "Behavioral Analysis"
+    
+    local anomalies=0
+    local total_checks=0
+    
+    # Disable strict error handling for this function to prevent silent failures
+    set +e
+    
+    # Process behavior analysis
+    if command_exists ps; then
+        ((total_checks++))
+        local process_count=$(ps aux 2>/dev/null | wc -l)
+        local zombie_count=$(ps aux 2>/dev/null | grep -c "<defunct>" 2>/dev/null || echo 0)
+        
+        if [ $process_count -gt 0 ]; then
+            local zombie_percentage=$((zombie_count * 100 / process_count))
+            if [ $zombie_percentage -gt 10 ]; then
+                ((anomalies++))
+                add_finding "Behavioral Analysis" "WARN" "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)" "Investigate zombie processes"
+                warn "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)"
+            else
+                add_finding "Behavioral Analysis" "OK" "Zombie process count normal: $zombie_count/$process_count" ""
+                ok "Zombie process count normal: $zombie_count/$process_count"
+            fi
+        else
+            add_finding "Behavioral Analysis" "WARN" "Could not determine process count" "Check ps command"
+        fi
+    else
+        add_finding "Behavioral Analysis" "WARN" "ps command not available" "Install procps package"
+    fi
+    
+    # NOTE: Network and temp file checks moved to Malware Detection for consolidation
+    
+    # NEW CHECK 1: Time-based anomalies (processes/cron at unusual hours)
+    if is_root; then
+        ((total_checks++))
+        local current_hour=$(date +%H)
+        
+        # Check if we're in suspicious time window (2 AM - 5 AM)
+        if [ $current_hour -ge 2 ] && [ $current_hour -le 5 ]; then
+            # Check for recently started processes during off-hours
+            local recent_procs=$(ps -eo pid,lstart,cmd 2>/dev/null | grep "$(date +%b)" | grep "$(date +%d)" | wc -l)
+            if [ $recent_procs -gt 20 ]; then
+                ((anomalies++))
+                add_finding "Behavioral Analysis" "WARN" "Unusual number of processes started during off-hours (2-5 AM): $recent_procs" "Investigate: 'ps -eo pid,lstart,cmd | grep \"$(date +%b) $(date +%d)\"'"
+                warn "Unusual off-hours process activity"
+            fi
+        fi
+        
+        # Check for cron jobs scheduled during suspicious hours
+        local suspicious_cron=$(grep -r "^[0-9]\+ [2-5] \*" /etc/cron* /var/spool/cron* 2>/dev/null | wc -l)
+        if [ $suspicious_cron -gt 5 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "$suspicious_cron cron jobs scheduled during off-hours (2-5 AM)" "Review: 'grep -r \"^[0-9]\\+ [2-5]\" /etc/cron* /var/spool/cron*'"
+            warn "Suspicious off-hours cron jobs detected"
+        fi
+    fi
+    
+    # NEW CHECK 2: Sudo usage spike detection
+    if is_root && [ -f /var/log/auth.log ]; then
+        ((total_checks++))
+        # Check for unusual sudo activity patterns
+        local sudo_attempts=$(safe_log_grep /var/log/auth.log "sudo:" 100 1000 | wc -l)
+        local sudo_failures=$(safe_log_grep /var/log/auth.log "sudo:.*authentication failure" 100 500 | wc -l)
+        
+        if [ $sudo_failures -gt 20 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High sudo authentication failures: $sudo_failures attempts" "Investigate: 'grep \"sudo.*authentication failure\" /var/log/auth.log'"
+            warn "High sudo authentication failures: $sudo_failures"
+        fi
+        
+        # Check for sudo escalation to root from unusual users
+        local unusual_sudo=$(safe_log_grep /var/log/auth.log "sudo.*COMMAND" 100 500 | grep -v "root\|admin\|sysadmin" | wc -l)
+        if [ $unusual_sudo -gt 10 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "Unusual sudo usage from non-admin users: $unusual_sudo commands" "Review: 'grep \"sudo.*COMMAND\" /var/log/auth.log | grep -v root'"
+            warn "Unusual sudo usage patterns detected"
+        fi
+    fi
+    
+    # System resource behavior analysis
+    if command_exists uptime && command_exists free; then
+        ((total_checks++))
+        local load_avg=$(uptime 2>/dev/null | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
+        local mem_usage=$(free 2>/dev/null | awk '/^Mem:/ {if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
+        
+        if [ -n "$load_avg" ] && [ $(echo "$load_avg" | awk '{print ($1 > 2.0)}' 2>/dev/null || echo 0) -eq 1 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High system load: $load_avg" "Investigate load"
+            warn "High system load: $load_avg"
+        else
+            add_finding "Behavioral Analysis" "OK" "System load normal: $load_avg" ""
+            ok "System load normal: $load_avg"
+        fi
+        
+        if [ -n "$mem_usage" ] && [ $mem_usage -gt 90 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High memory usage: ${mem_usage}%" "Investigate memory"
+            warn "High memory usage: ${mem_usage}%"
+        else
+            add_finding "Behavioral Analysis" "OK" "Memory usage normal: ${mem_usage}%" ""
+            ok "Memory usage normal: ${mem_usage}%"
+        fi
+    fi
+    
+    # Log behavior analysis
+    if is_root && [ -f /var/log/auth.log ]; then
+        ((total_checks++))
+        # SECURITY FIX: Use safe_log_grep with size limits instead of direct grep
+        local failed_logins=$(safe_log_grep /var/log/auth.log "Failed password" 100 1000 | wc -l)
+        
+        if [ $failed_logins -gt 50 ]; then
+            ((anomalies++))
+            add_finding "Behavioral Analysis" "WARN" "High failed login activity: $failed_logins attempts" "Review auth logs"
+            warn "High failed login activity: $failed_logins attempts"
+        else
+            add_finding "Behavioral Analysis" "OK" "Login activity appears normal: $failed_logins failed attempts" ""
+            ok "Login activity appears normal: $failed_logins failed attempts"
+        fi
+    fi
+    
+    # Summary
+    local risk_level="LOW"
+    if [ $anomalies -gt 4 ]; then
+        risk_level="HIGH"
+    elif [ $anomalies -gt 2 ]; then
+        risk_level="MEDIUM"
+    fi
+    
+    # Ensure we always have at least one check
+    if [ $total_checks -eq 0 ]; then
+        total_checks=1
+        add_finding "Behavioral Analysis" "WARN" "No behavioral checks could be performed" "Check system tools availability"
+    fi
+    
+    add_finding "Behavioral Analysis" "INFO" "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)" "Monitor system behavior over time and investigate flagged anomalies"
+    info "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)"
+    
+    # Re-enable strict error handling
+    set -e
+}
+
+
+
 section_system() {
 	print_section "System"
 	
 	# Kernel information
 	kernel_info=$(uname -a 2>/dev/null)
-	add_finding "System" "INFO" "Kernel: $kernel_info" ""
+	add_finding "System" "INFO" "Kernel: $kernel_info" "See 'Enhanced Kernel Security' for CVE/EOL analysis"
 	[ "$OUTPUT_FORMAT" = "console" ] && echo "Kernel: $kernel_info"
 	
 	# Distribution information
@@ -2797,16 +3777,71 @@ section_system() {
 		SCRIPT_VERSION="$VERSION"
 		. /etc/os-release
 		distro="${PRETTY_NAME:-unknown}"
+		local os_id="${ID:-unknown}"
+		local os_version="${VERSION_ID:-unknown}"
 		# Restore our script version
 		VERSION="$SCRIPT_VERSION"
 		add_finding "System" "INFO" "Distribution: $distro" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && echo "Distro: $distro"
+		
+		# NEW CHECK 1: EOL OS detection
+		case "$os_id" in
+			ubuntu)
+				local major_ver=$(echo "$os_version" | cut -d. -f1)
+				if [ "$major_ver" -lt 18 ]; then
+					add_finding "System" "CRIT" "Running EOL Ubuntu $os_version (< 18.04)" "Upgrade to Ubuntu 20.04 LTS or 22.04 LTS immediately - no security updates"
+					crit "EOL OS detected: Ubuntu $os_version"
+				elif [ "$major_ver" -eq 18 ]; then
+					add_finding "System" "WARN" "Ubuntu 18.04 LTS approaching EOL (April 2028 ESM)" "Plan upgrade to Ubuntu 22.04 LTS or 24.04 LTS"
+				fi
+				;;
+			debian)
+				local major_ver=$(echo "$os_version" | cut -d. -f1)
+				if [ "$major_ver" -lt 10 ]; then
+					add_finding "System" "CRIT" "Running EOL Debian $os_version (< 10)" "Upgrade to Debian 11 or 12 immediately - no security updates"
+					crit "EOL OS detected: Debian $os_version"
+				fi
+				;;
+			centos)
+				local major_ver=$(echo "$os_version" | cut -d. -f1)
+				if [ "$major_ver" -lt 7 ]; then
+					add_finding "System" "CRIT" "Running EOL CentOS $os_version (< 7)" "Migrate to Rocky Linux, AlmaLinux, or RHEL - no security updates"
+					crit "EOL OS detected: CentOS $os_version"
+				elif [ "$major_ver" -eq 8 ]; then
+					add_finding "System" "CRIT" "CentOS 8 reached EOL (Dec 2021)" "Migrate to Rocky Linux 8, AlmaLinux 8, or RHEL 8 immediately"
+					crit "EOL OS: CentOS 8"
+				fi
+				;;
+			rhel)
+				local major_ver=$(echo "$os_version" | cut -d. -f1)
+				if [ "$major_ver" -lt 7 ]; then
+					add_finding "System" "CRIT" "Running EOL RHEL $os_version (< 7)" "Upgrade to RHEL 8 or 9 immediately - no security updates"
+					crit "EOL OS detected: RHEL $os_version"
+				fi
+				;;
+		esac
 	fi
 	
 	# Uptime
 	uptime_info=$(uptime -p 2>/dev/null || uptime 2>/dev/null | awk '{print $3,$4}')
 	add_finding "System" "INFO" "Uptime: $uptime_info" ""
 	[ "$OUTPUT_FORMAT" = "console" ] && echo "Uptime: $uptime_info"
+	
+	# NEW CHECK 2: Last reboot reason (panic/crash detection)
+	if [ -f /var/log/syslog ] || [ -f /var/log/messages ]; then
+		local log_file="/var/log/syslog"
+		[ -f /var/log/messages ] && log_file="/var/log/messages"
+		
+		local last_boot=$(safe_log_grep "$log_file" "kernel.*Linux version" 50 100 | tail -1)
+		if [ -n "$last_boot" ]; then
+			# Check for crash/panic indicators
+			local panic_check=$(safe_log_grep "$log_file" "Kernel panic\|segfault\|Out of memory\|BUG:" 50 100 | tail -5)
+			if [ -n "$panic_check" ]; then
+				add_finding "System" "WARN" "Recent kernel panic or crash detected" "Investigate: 'journalctl -k | grep -i panic' and review /var/log/messages"
+				warn "System crash indicators found"
+			fi
+		fi
+	fi
 	
 	# Virtualization detection
 	if command_exists systemd-detect-virt; then
@@ -2889,38 +3924,217 @@ section_updates() {
 			warn "Unknown package manager; skip check"
 			;;
 	 esac
+	 
+	 # NEW CHECK 1: Unattended-upgrades status (automatic security updates)
+	 if [ "$pm" = "apt" ]; then
+	 	if command_exists unattended-upgrade; then
+	 		if systemctl is-enabled unattended-upgrades 2>/dev/null | grep -q "enabled"; then
+	 			add_finding "Updates" "OK" "Automatic security updates enabled (unattended-upgrades)" ""
+	 			ok "Automatic security updates enabled"
+	 		else
+	 			rec="Enable automatic security updates: 'sudo systemctl enable unattended-upgrades && sudo systemctl start unattended-upgrades'"
+	 			add_finding "Updates" "WARN" "Automatic security updates not enabled" "$rec"
+	 			warn "Automatic security updates disabled"
+	 		fi
+	 	else
+	 		rec="Install unattended-upgrades: 'sudo apt install unattended-upgrades && sudo dpkg-reconfigure --priority=low unattended-upgrades'"
+	 		add_finding "Updates" "WARN" "Automatic security updates not installed" "$rec"
+	 		warn "unattended-upgrades not installed"
+	 	fi
+	 elif [ "$pm" = "dnf" ] || [ "$pm" = "yum" ]; then
+	 	if command_exists dnf-automatic || command_exists yum-cron; then
+	 		add_finding "Updates" "OK" "Automatic updates tool available (dnf-automatic or yum-cron)" "Verify it's enabled"
+	 		ok "Automatic updates tool detected"
+	 	else
+	 		rec="Install automatic updates: 'sudo dnf install dnf-automatic' and enable it"
+	 		add_finding "Updates" "WARN" "Automatic updates not configured" "$rec"
+	 		warn "No automatic updates configured"
+	 	fi
+	 fi
+	 
+	 # NEW CHECK 2: Last update time (warn if not updated in >90 days)
+	 local last_update_days="unknown"
+	 if [ "$pm" = "apt" ] && [ -f /var/log/apt/history.log ]; then
+	 	local last_update=$(grep "Start-Date" /var/log/apt/history.log | tail -1 | awk '{print $2}' | tr -d '\n')
+	 	if [ -n "$last_update" ]; then
+	 		local last_update_epoch=$(date -d "$last_update" +%s 2>/dev/null || echo "0")
+	 		local current_epoch=$(date +%s)
+	 		last_update_days=$(( (current_epoch - last_update_epoch) / 86400 ))
+	 	fi
+	 elif [ "$pm" = "dnf" ] || [ "$pm" = "yum" ]; then
+	 	if [ -f /var/log/yum.log ] || [ -f /var/log/dnf.log ]; then
+	 		local log_file="/var/log/dnf.log"
+	 		[ -f /var/log/yum.log ] && log_file="/var/log/yum.log"
+	 		local last_update=$(grep -E "Updated:|Installed:" "$log_file" | tail -1 | awk '{print $1,$2,$3}' | tr -d '\n')
+	 		if [ -n "$last_update" ]; then
+	 			local last_update_epoch=$(date -d "$last_update" +%s 2>/dev/null || echo "0")
+	 			local current_epoch=$(date +%s)
+	 			last_update_days=$(( (current_epoch - last_update_epoch) / 86400 ))
+	 		fi
+	 	fi
+	 fi
+	 
+	 if [ "$last_update_days" != "unknown" ] && [ "$last_update_days" -gt 0 ]; then
+	 	if [ "$last_update_days" -gt 180 ]; then
+	 		add_finding "Updates" "CRIT" "System not updated in $last_update_days days (>6 months)" "Update system immediately: 'sudo apt upgrade' or 'sudo dnf upgrade'"
+	 		crit "System not updated in $last_update_days days"
+	 	elif [ "$last_update_days" -gt 90 ]; then
+	 		add_finding "Updates" "WARN" "System not updated in $last_update_days days (>3 months)" "Update system: 'sudo apt upgrade' or 'sudo dnf upgrade'"
+	 		warn "System not updated in $last_update_days days"
+	 	elif [ "$last_update_days" -gt 30 ]; then
+	 		add_finding "Updates" "INFO" "System last updated $last_update_days days ago" "Consider updating regularly"
+	 		info "Last updated $last_update_days days ago"
+	 	else
+	 		add_finding "Updates" "OK" "System recently updated ($last_update_days days ago)" ""
+	 		ok "System recently updated"
+	 	fi
+	 else
+	 	add_finding "Updates" "INFO" "Cannot determine last update time" "Check package manager logs manually"
+	 fi
 }
 
 section_listening() {
 	print_section "Listening Services"
+	
+	local network_output=""
 	if command_exists ss; then
-		ss -tulpen 2>/dev/null | sed -n '1,30p' || true
+		network_output=$(ss -tulpen 2>/dev/null || true)
+		echo "$network_output" | sed -n '1,30p'
 	elif command_exists netstat; then
-		netstat -tulpen 2>/dev/null | sed -n '1,30p' || true
+		network_output=$(netstat -tulpen 2>/dev/null || true)
+		echo "$network_output" | sed -n '1,30p'
 	else
 		warn "Neither ss nor netstat available"
 		add_finding "Listening Services" "WARN" "No network tools available" "Install ss or netstat packages"
+		return
+	fi
+	
+	# NEW CHECK 1: Unnecessary/insecure services detection
+	local insecure_services=(
+		"telnet:23:Use SSH instead of telnet"
+		"ftp:21:Use SFTP or FTPS instead of FTP"
+		"rsh:514:Use SSH instead of rsh"
+		"rlogin:513:Use SSH instead of rlogin"
+		"finger:79:Disable finger service"
+		"tftp:69:Disable TFTP or use secure alternative"
+	)
+	
+	for service_info in "${insecure_services[@]}"; do
+		IFS=':' read -r service_name port recommendation <<< "$service_info"
+		if echo "$network_output" | grep -q ":$port "; then
+			add_finding "Listening Services" "CRIT" "Insecure service $service_name listening on port $port" "$recommendation"
+			crit "Insecure service detected: $service_name (port $port)"
+		fi
+	done
+	
+	# NOTE: Database exposure checks are performed in 'Application Security' section
+	# That section provides comprehensive database service detection and binding verification
+	add_finding "Listening Services" "INFO" "Database security analysis available in Application Security section" "See database binding and exposure checks"
+	
+	# Check for any listening services on privileged ports (<1024)
+	local privileged_count=$(echo "$network_output" | awk '$1 ~ /LISTEN/ && $5 ~ /:[0-9]+/ {port=substr($5,index($5,":")+1); if(port<1024 && port>0) print port}' | sort -u | wc -l)
+	if [ "$privileged_count" -gt 0 ]; then
+		add_finding "Listening Services" "INFO" "$privileged_count service(s) on privileged ports (<1024)" "Review services list above"
+		info "$privileged_count services on privileged ports"
 	fi
 }
 
 section_firewall() {
 	print_section "Firewall"
+	
+	# NOTE: Comprehensive firewall analysis in 'Enhanced Network Access Controls' section
+	# This section provides basic status and rule preview
+	
 	local firewall_found=false
+	local firewall_active=false
+	
+	# NEW CHECK 1: UFW active status
 	if command_exists ufw; then
+		local ufw_status=$(ufw status 2>/dev/null | head -1)
 		ufw status verbose 2>/dev/null | sed 's/^/ufw: /' || true
 		firewall_found=true
+		
+		if echo "$ufw_status" | grep -q "Status: active"; then
+			add_finding "Firewall" "OK" "UFW firewall is active" ""
+			ok "UFW active"
+			firewall_active=true
+		else
+			rec="Enable UFW: 'sudo ufw enable' after configuring rules"
+			add_finding "Firewall" "WARN" "UFW installed but not active" "$rec"
+			warn "UFW not active"
+		fi
 	fi
+	
+	# NEW CHECK 1 (continued): firewalld active status
 	if command_exists firewall-cmd; then
+		local firewalld_state=$(firewall-cmd --state 2>/dev/null || echo "not running")
 		firewall-cmd --state 2>/dev/null | sed 's/^/firewalld: /' || true
 		firewall-cmd --list-all 2>/dev/null | sed 's/^/firewalld: /' | sed -n '1,50p' || true
 		firewall_found=true
+		
+		if [ "$firewalld_state" = "running" ]; then
+			add_finding "Firewall" "OK" "firewalld is running" ""
+			ok "firewalld running"
+			firewall_active=true
+		else
+			rec="Enable firewalld: 'sudo systemctl enable firewalld && sudo systemctl start firewalld'"
+			add_finding "Firewall" "WARN" "firewalld installed but not running" "$rec"
+			warn "firewalld not running"
+		fi
 	fi
+	
 	if command_exists nft; then
 		nft list ruleset 2>/dev/null | sed -n '1,50p' | sed 's/^/nftables: /' || true
 		firewall_found=true
+		local nft_rules=$(nft list ruleset 2>/dev/null | wc -l)
+		if [ "$nft_rules" -gt 0 ]; then
+			firewall_active=true
+		fi
 	elif command_exists iptables; then
 		iptables -S 2>/dev/null | sed -n '1,50p' | sed 's/^/iptables: /' || true
 		firewall_found=true
+		local iptables_rules=$(iptables -S 2>/dev/null | wc -l)
+		if [ "$iptables_rules" -gt 3 ]; then  # More than default 3 lines
+			firewall_active=true
+		fi
+	fi
+
+	# NEW CHECK 2: SSH rate limiting (brute force protection at firewall level)
+	if [ "$firewall_active" = true ]; then
+		local ssh_rate_limit=false
+		
+		# Check UFW for SSH rate limiting
+		if command_exists ufw; then
+			if ufw status verbose 2>/dev/null | grep -qE "LIMIT.*22"; then
+				add_finding "Firewall" "OK" "SSH rate limiting configured in UFW" ""
+				ok "SSH rate limiting enabled"
+				ssh_rate_limit=true
+			fi
+		fi
+		
+		# Check iptables for SSH rate limiting
+		if command_exists iptables && [ "$ssh_rate_limit" = false ]; then
+			if iptables -S 2>/dev/null | grep -qE "(recent|limit).*22"; then
+				add_finding "Firewall" "OK" "SSH rate limiting configured in iptables" ""
+				ok "SSH rate limiting in iptables"
+				ssh_rate_limit=true
+			fi
+		fi
+		
+		# Check firewalld for SSH rate limiting
+		if command_exists firewall-cmd && [ "$ssh_rate_limit" = false ]; then
+			if firewall-cmd --list-all 2>/dev/null | grep -qE "limit.*ssh"; then
+				add_finding "Firewall" "OK" "SSH rate limiting configured in firewalld" ""
+				ok "SSH rate limiting in firewalld"
+				ssh_rate_limit=true
+			fi
+		fi
+		
+		if [ "$ssh_rate_limit" = false ]; then
+			rec="Add SSH rate limiting: 'sudo ufw limit 22/tcp' or configure iptables with recent module"
+			add_finding "Firewall" "INFO" "No SSH rate limiting detected in firewall" "$rec"
+			info "Consider SSH rate limiting"
+		fi
 	fi
 
 	# Severity based on mode
@@ -2936,7 +4150,7 @@ section_firewall() {
 			warn "No firewall tooling/rules detected"
 		fi
 	else
-		add_finding "Firewall" "INFO" "Firewall tooling present" "Review rules above"
+		add_finding "Firewall" "INFO" "Firewall tooling present" "See 'Enhanced Network Access Controls' for rate limiting, egress filtering, and policy analysis"
 	fi
 }
 
@@ -2992,6 +4206,52 @@ section_ssh() {
 			add_finding "SSH" "INFO" "SSH running on default port 22" "$rec"
 		fi
 		
+		# NEW CHECK 1: SSH Protocol version (should be 2 only)
+		protocol=$(grep -Ei '^\s*Protocol\s+' "$sshd_cfg" | tail -n1 | awk '{print $2}')
+		if [ -n "$protocol" ]; then
+			if [ "$protocol" = "2" ]; then
+				add_finding "SSH" "OK" "SSH Protocol 2 enforced" ""
+				ok "SSH Protocol 2"
+			else
+				rec="Set 'Protocol 2' in $sshd_cfg to disable insecure SSH-1"
+				add_finding "SSH" "CRIT" "Insecure SSH protocol: $protocol" "$rec"
+				crit "SSH Protocol $protocol (not 2)"
+			fi
+		else
+			# Protocol 2 is default in modern OpenSSH, but good to verify
+			add_finding "SSH" "INFO" "SSH Protocol not explicitly set (defaults to 2)" "Consider explicitly setting 'Protocol 2' in $sshd_cfg"
+			info "SSH Protocol not explicitly set"
+		fi
+		
+		# NEW CHECK 2: MaxAuthTries (prevent brute force)
+		max_auth_tries=$(grep -Ei '^\s*MaxAuthTries\s+' "$sshd_cfg" | tail -n1 | awk '{print $2}')
+		if [ -n "$max_auth_tries" ]; then
+			if [ "$max_auth_tries" -le 4 ]; then
+				add_finding "SSH" "OK" "MaxAuthTries set to $max_auth_tries" ""
+				ok "MaxAuthTries: $max_auth_tries"
+			else
+				rec="Set 'MaxAuthTries 4' in $sshd_cfg to limit brute force attempts"
+				add_finding "SSH" "WARN" "MaxAuthTries too high: $max_auth_tries" "$rec"
+				warn "MaxAuthTries: $max_auth_tries (consider 4)"
+			fi
+		else
+			rec="Add 'MaxAuthTries 4' to $sshd_cfg to limit authentication attempts"
+			add_finding "SSH" "INFO" "MaxAuthTries not configured" "$rec"
+			info "MaxAuthTries not set"
+		fi
+		
+		# NEW CHECK 3: PubkeyAuthentication (should be enabled)
+		pubkey_auth=$(grep -Ei '^\s*PubkeyAuthentication\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}')
+		if [ "$pubkey_auth" = "yes" ] || [ -z "$pubkey_auth" ]; then
+			# Default is yes, so empty is OK
+			add_finding "SSH" "OK" "PubkeyAuthentication enabled" ""
+			ok "PubkeyAuthentication enabled"
+		else
+			rec="Set 'PubkeyAuthentication yes' in $sshd_cfg for key-based auth"
+			add_finding "SSH" "WARN" "PubkeyAuthentication disabled" "$rec"
+			warn "PubkeyAuthentication disabled"
+		fi
+		
 	else
 		add_finding "SSH" "WARN" "Cannot read $sshd_cfg" "Check SSH configuration file permissions"
 		warn "Cannot read $sshd_cfg"
@@ -3001,16 +4261,65 @@ section_ssh() {
 section_auditing() {
 	print_section "Auditing/Hardening"
 	
-	# Auditd check
+	# NOTE: Comprehensive audit daemon configuration analysis in 'Compliance & Audit' section
+	# This section provides basic status check
+	local auditd_active=false
 	if systemctl is-active --quiet auditd 2>/dev/null; then 
-		add_finding "Auditing" "OK" "auditd active" ""
+		add_finding "Auditing" "OK" "auditd active" "See 'Compliance & Audit' for detailed configuration analysis"
 		ok "auditd active"
+		auditd_active=true
 	else 
 		rec=$(get_recommendation "Install and enable auditd: 'sudo apt install auditd && sudo systemctl enable auditd'" \
 			"Enable system auditing with auditd for security monitoring" \
 			"Deploy auditd with centralized logging and compliance-aligned rules")
 		add_finding "Auditing" "WARN" "auditd not active" "$rec"
 		warn "auditd not active"
+	fi
+	
+	# NEW CHECK 1: Audit log immutability (prevents tampering)
+	if [ "$auditd_active" = true ] && is_root; then
+		if [ -d /var/log/audit ]; then
+			# Check if audit logs are immutable (chattr +i)
+			local audit_log="/var/log/audit/audit.log"
+			if [ -f "$audit_log" ]; then
+				local immutable=$(lsattr "$audit_log" 2>/dev/null | cut -d' ' -f1 | grep -o 'i' || true)
+				if [ -n "$immutable" ]; then
+					add_finding "Auditing" "OK" "Audit log is immutable" ""
+					ok "Audit log immutable"
+				else
+					rec="Make audit log immutable: 'sudo chattr +a /var/log/audit/audit.log' (append-only)"
+					add_finding "Auditing" "INFO" "Audit log not immutable" "$rec"
+					info "Consider immutable audit logs"
+				fi
+			fi
+			
+			# Check audit log permissions
+			local audit_perms=$(stat -Lc "%a" "$audit_log" 2>/dev/null || echo "")
+			if [ "$audit_perms" = "600" ] || [ "$audit_perms" = "400" ]; then
+				add_finding "Auditing" "OK" "Audit log permissions secure: $audit_perms" ""
+			else
+				rec="Set audit log permissions: 'sudo chmod 600 /var/log/audit/audit.log'"
+				add_finding "Auditing" "WARN" "Audit log permissions weak: $audit_perms" "$rec"
+				warn "Audit log perms: $audit_perms"
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 2: Audit rules count (comprehensive monitoring)
+	if [ "$auditd_active" = true ] && command_exists auditctl; then
+		local audit_rules_count=$(auditctl -l 2>/dev/null | grep -v "No rules" | wc -l)
+		if [ "$audit_rules_count" -gt 20 ]; then
+			add_finding "Auditing" "OK" "Comprehensive audit rules configured: $audit_rules_count rules" ""
+			ok "Audit rules: $audit_rules_count"
+		elif [ "$audit_rules_count" -gt 5 ]; then
+			rec="Consider adding more audit rules for comprehensive monitoring (CIS benchmarks recommend 30+ rules)"
+			add_finding "Auditing" "INFO" "Basic audit rules configured: $audit_rules_count rules" "$rec"
+			info "Audit rules: $audit_rules_count"
+		else
+			rec="Configure comprehensive audit rules: review CIS benchmarks or NIST guidelines"
+			add_finding "Auditing" "WARN" "Minimal audit rules: $audit_rules_count" "$rec"
+			warn "Few audit rules: $audit_rules_count"
+		fi
 	fi
 	
 	# SELinux check
@@ -3062,17 +4371,16 @@ section_accounts() {
 	add_finding "Accounts" "INFO" "UID 0 accounts: $all_uid0" ""
 	[ "$OUTPUT_FORMAT" = "console" ] && echo "UID0: $all_uid0"
 	
-	# Check for NOPASSWD sudo entries - requires root access
+	# NOTE: Detailed NOPASSWD and sudo security checks are performed in 
+	# section_privesc_surface_core for comprehensive privilege escalation analysis
+	# This section provides a quick summary only
 	if is_root; then
 		if [ -r /etc/sudoers ]; then
-			nopasswd_entries=$(grep -R "NOPASSWD" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)
-			if [ -n "$nopasswd_entries" ]; then
-				rec=$(get_recommendation "Review NOPASSWD sudo entries for security risks" \
-					"Consider requiring passwords for sudo access or limit to specific commands" \
-					"Audit NOPASSWD entries: document business justification or remove")
-				add_finding "Accounts" "WARN" "NOPASSWD sudo entries found" "$rec"
-				warn "NOPASSWD sudo entries found"
-				[ "$OUTPUT_FORMAT" = "console" ] && echo "$nopasswd_entries" | sed 's/^/NOPASSWD: /'
+			# Quick check for reference (detailed analysis in privesc section)
+			nopasswd_count=$(grep -R "NOPASSWD" /etc/sudoers /etc/sudoers.d 2>/dev/null | wc -l || echo "0")
+			if [ "$nopasswd_count" -gt 0 ]; then
+				add_finding "Accounts" "INFO" "NOPASSWD sudo entries detected ($nopasswd_count)" "See 'Privilege Escalation Surface (Core)' section for detailed analysis"
+				[ "$OUTPUT_FORMAT" = "console" ] && info "NOPASSWD entries: $nopasswd_count (see Privilege Escalation section for details)"
 			else
 				add_finding "Accounts" "OK" "No NOPASSWD sudo entries" ""
 				ok "No NOPASSWD sudo entries"
@@ -3088,29 +4396,152 @@ section_accounts() {
 			add_finding "Accounts" "WARN" "Accounts without passwords: $empty_pass" "$rec"
 			warn "Accounts without passwords detected"
 		fi
+		
+		# NEW CHECK 1: Inactive accounts (last login >90 days)
+		if command_exists lastlog; then
+			local inactive_accounts=()
+			local ninety_days_ago=$(date -d '90 days ago' +%s 2>/dev/null || echo "0")
+			
+			# Get human accounts (UID >= 1000, excluding nobody)
+			while IFS=: read -r user uid; do
+				[ "$uid" -lt 1000 ] && continue
+				[ "$user" = "nobody" ] && continue
+				
+				# Check last login
+				local last_login=$(lastlog -u "$user" 2>/dev/null | tail -1 | awk '{print $4,$5,$6,$9}')
+				if echo "$last_login" | grep -q "Never logged in"; then
+					inactive_accounts+=("$user (never)")
+				elif [ -n "$last_login" ] && [ "$ninety_days_ago" != "0" ]; then
+					local last_login_epoch=$(date -d "$last_login" +%s 2>/dev/null || echo "0")
+					if [ "$last_login_epoch" -gt 0 ] && [ "$last_login_epoch" -lt "$ninety_days_ago" ]; then
+						inactive_accounts+=("$user (>90 days)")
+					fi
+				fi
+			done < <(awk -F: '($3>=1000) {print $1":"$3}' /etc/passwd 2>/dev/null)
+			
+			if [ ${#inactive_accounts[@]} -gt 0 ]; then
+				local inactive_list=$(printf '%s, ' "${inactive_accounts[@]}" | sed 's/, $//')
+				rec="Review and lock inactive accounts: 'sudo usermod -L username' or remove with 'sudo userdel username'"
+				add_finding "Accounts" "WARN" "Inactive accounts detected: $inactive_list" "$rec"
+				warn "Inactive accounts: ${#inactive_accounts[@]}"
+			else
+				add_finding "Accounts" "OK" "No long-term inactive accounts detected" ""
+				ok "No inactive accounts"
+			fi
+		fi
+		
+		# NEW CHECK 2: Sudo session timeout (prevents idle sudo sessions)
+		if [ -r /etc/sudoers ]; then
+			local sudo_timestamp_timeout=$(grep -E "^\s*Defaults.*timestamp_timeout" /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -1)
+			if [ -n "$sudo_timestamp_timeout" ]; then
+				local timeout_value=$(echo "$sudo_timestamp_timeout" | grep -oP 'timestamp_timeout=\K[0-9]+' || echo "")
+				if [ -n "$timeout_value" ]; then
+					if [ "$timeout_value" -le 5 ]; then
+						add_finding "Accounts" "OK" "Sudo session timeout configured: $timeout_value minutes" ""
+						ok "Sudo timeout: ${timeout_value}min"
+					elif [ "$timeout_value" -le 15 ]; then
+						rec="Consider reducing sudo timestamp_timeout to 5 minutes or less in /etc/sudoers"
+						add_finding "Accounts" "INFO" "Sudo session timeout: $timeout_value minutes" "$rec"
+						info "Sudo timeout: ${timeout_value}min"
+					else
+						rec="Set 'Defaults timestamp_timeout=5' in /etc/sudoers to limit idle sudo sessions"
+						add_finding "Accounts" "WARN" "Long sudo session timeout: $timeout_value minutes" "$rec"
+						warn "Sudo timeout: ${timeout_value}min"
+					fi
+				fi
+			else
+				rec="Add 'Defaults timestamp_timeout=5' to /etc/sudoers to expire sudo credentials after 5 minutes"
+				add_finding "Accounts" "INFO" "Sudo session timeout not configured (defaults to 15 minutes)" "$rec"
+				info "Consider sudo timeout"
+			fi
+		fi
+		
+		# NOTE: Password policies are checked in 'Compliance & Audit' section
+		add_finding "Accounts" "INFO" "Password policy analysis available in Compliance section" "See PASS_MAX_DAYS, PASS_MIN_DAYS, and pam_faillock checks"
 	else
 		# Limited checks without root
 		if [ "$OUTPUT_FORMAT" = "console" ]; then
 			warn "NOPASSWD sudo check skipped - requires sudo access"
 			warn "Password audit skipped - requires sudo access to /etc/shadow"
+			warn "Inactive account check skipped - requires sudo access"
 		fi
 		add_finding "Accounts" "INFO" "NOPASSWD sudo check requires root access" "Run script with sudo for complete account analysis"
 		add_finding "Accounts" "INFO" "Password audit requires root access" "Run script with sudo for complete account analysis"
+		add_finding "Accounts" "INFO" "Inactive account detection requires root access" "Run script with sudo for lastlog analysis"
 	fi
 }
 
 section_permissions() {
 	print_section "Risky Permissions"
+	
+	# Display world-writable directories and files
 	find_paths=(/etc /var /home /root)
 	for p in "${find_paths[@]}"; do
 		[ -d "$p" ] || continue
 		cached_command find "$p" -xdev -type d -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable dir: /" | sed -n '1,20p'
 		cached_command find "$p" -xdev -type f -perm -0002 -maxdepth 2 2>/dev/null | sed "s/^/World-writable file: /" | sed -n '1,20p'
 	done
+	
 	# Search common SUID locations instead of entire filesystem
 	for suid_path in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do
 		[ -d "$suid_path" ] && cached_command find "$suid_path" -xdev -perm -4000 -type f 2>/dev/null | sed 's/^/SUID: /' | sed -n '1,30p'
 	done
+	
+	# NEW CHECK 1: Unowned files (orphaned files without owner/group)
+	if is_root; then
+		local unowned_files=$(find /etc /var /home -xdev \( -nouser -o -nogroup \) -maxdepth 3 2>/dev/null | head -10)
+		if [ -n "$unowned_files" ]; then
+			local unowned_count=$(echo "$unowned_files" | wc -l)
+			add_finding "Permissions" "WARN" "Unowned files detected: $unowned_count files" "Review and assign ownership: 'find / -nouser -o -nogroup'"
+			warn "Unowned files: $unowned_count"
+			echo "$unowned_files" | sed 's/^/Unowned: /' | sed -n '1,10p'
+		else
+			add_finding "Permissions" "OK" "No unowned files detected in critical paths" ""
+			ok "No unowned files"
+		fi
+	else
+		add_finding "Permissions" "INFO" "Unowned file check requires root access" "Run with sudo to detect orphaned files"
+	fi
+	
+	# NEW CHECK 2: Sensitive file permissions (critical system files)
+	local sensitive_files=(
+		"/etc/passwd:644"
+		"/etc/shadow:000"
+		"/etc/gshadow:000"
+		"/etc/group:644"
+		"/etc/ssh/sshd_config:600"
+		"/root/.ssh:700"
+	)
+	
+	local permission_issues=0
+	for file_info in "${sensitive_files[@]}"; do
+		IFS=':' read -r file expected_perms <<< "$file_info"
+		if [ -e "$file" ]; then
+			local actual_perms=$(stat -Lc "%a" "$file" 2>/dev/null || echo "")
+			
+			# For shadow files, check if they're restricted (0--, 4--, 6--)
+			if [ "$expected_perms" = "000" ]; then
+				local first_digit=${actual_perms:0:1}
+				if [ "$first_digit" != "0" ] && [ "$first_digit" != "4" ] && [ "$first_digit" != "6" ]; then
+					add_finding "Permissions" "CRIT" "Sensitive file $file has weak permissions: $actual_perms" "Set restrictive permissions: 'sudo chmod 640 $file'"
+					crit "Weak perms on $file: $actual_perms"
+					((permission_issues++))
+				fi
+			elif [ "$actual_perms" != "$expected_perms" ]; then
+				# For other files, check exact match or more restrictive
+				if [ "${actual_perms: -1}" != "0" ] && [ "${actual_perms: -1}" != "4" ]; then
+					add_finding "Permissions" "WARN" "$file permissions: $actual_perms (expected $expected_perms)" "Fix permissions: 'sudo chmod $expected_perms $file'"
+					warn "$file perms: $actual_perms"
+					((permission_issues++))
+				fi
+			fi
+		fi
+	done
+	
+	if [ "$permission_issues" -eq 0 ]; then
+		add_finding "Permissions" "OK" "Sensitive file permissions secure" ""
+		ok "Sensitive file permissions OK"
+	fi
 }
 
 section_intrusion_detection() {
@@ -3148,48 +4579,99 @@ section_intrusion_detection() {
 		[ "$OUTPUT_FORMAT" = "console" ] && info "fail2ban not installed"
 	fi
 	
-	# Check for suspicious login attempts in auth logs - requires root access
-	if is_root; then
-		if [ -r /var/log/auth.log ]; then
-			failed_logins=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -5 | wc -l || echo 0)
-			if [ "$failed_logins" -gt 3 ]; then
-				rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/auth.log'"
-				add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
-				warn "Recent failed login attempts detected"
-			else
-				add_finding "Intrusion Detection" "OK" "No recent failed login attempts in auth.log" ""
-				ok "No recent failed logins detected"
-			fi
-		elif [ -r /var/log/secure ]; then
-			failed_logins=$(grep "Failed password" /var/log/secure 2>/dev/null | tail -5 | wc -l || echo 0)
-			if [ "$failed_logins" -gt 3 ]; then
-				rec="Review authentication logs for suspicious activity: 'sudo tail -50 /var/log/secure'"
-				add_finding "Intrusion Detection" "WARN" "Recent failed login attempts detected" "$rec"
-				warn "Recent failed login attempts detected"
-			else
-				add_finding "Intrusion Detection" "OK" "No recent failed login attempts in secure log" ""
-				ok "No recent failed logins detected"
-			fi
-		else
-			add_finding "Intrusion Detection" "INFO" "No standard auth logs found" "Check system-specific log locations"
+	# NOTE: Detailed failed login analysis is performed in 'Behavioral Analysis' section
+	# This section focuses on IDS tools and ban statistics
+	
+	# NEW CHECK 1: File Integrity Monitoring tools (AIDE, Tripwire, OSSEC)
+	local fim_tools=("aide" "tripwire" "ossec-control" "wazuh-control")
+	local fim_found=false
+	
+	for tool in "${fim_tools[@]}"; do
+		if command_exists "$tool"; then
+			fim_found=true
+			case "$tool" in
+				aide)
+					if [ -f /var/lib/aide/aide.db ] || [ -f /var/lib/aide/aide.db.gz ]; then
+						add_finding "Intrusion Detection" "OK" "AIDE file integrity monitoring installed and initialized" ""
+						ok "AIDE FIM detected"
+					else
+						rec="Initialize AIDE database: 'sudo aideinit' and schedule regular checks"
+						add_finding "Intrusion Detection" "WARN" "AIDE installed but not initialized" "$rec"
+						warn "AIDE not initialized"
+					fi
+					;;
+				tripwire)
+					if [ -f /var/lib/tripwire/*.twd ] 2>/dev/null; then
+						add_finding "Intrusion Detection" "OK" "Tripwire file integrity monitoring detected" ""
+						ok "Tripwire FIM detected"
+					else
+						rec="Initialize Tripwire: 'sudo tripwire --init'"
+						add_finding "Intrusion Detection" "WARN" "Tripwire installed but not initialized" "$rec"
+						warn "Tripwire not initialized"
+					fi
+					;;
+				ossec-control|wazuh-control)
+					if systemctl is-active --quiet wazuh-agent 2>/dev/null || systemctl is-active --quiet ossec 2>/dev/null; then
+						add_finding "Intrusion Detection" "OK" "OSSEC/Wazuh agent active" ""
+						ok "OSSEC/Wazuh agent active"
+					else
+						rec="Start OSSEC/Wazuh agent: 'sudo systemctl start wazuh-agent'"
+						add_finding "Intrusion Detection" "WARN" "OSSEC/Wazuh installed but not active" "$rec"
+						warn "OSSEC/Wazuh not active"
+					fi
+					;;
+			esac
 		fi
-	else
-		# Without root, cannot read auth logs
-		if [ "$OUTPUT_FORMAT" = "console" ]; then
-			warn "Authentication log analysis skipped - requires sudo access"
-		fi
-		add_finding "Intrusion Detection" "INFO" "Authentication log analysis requires root access" "Run script with sudo to check for failed login attempts"
+	done
+	
+	if [ "$fim_found" = false ]; then
+		rec="Install file integrity monitoring: 'sudo apt install aide' or 'sudo yum install aide'"
+		add_finding "Intrusion Detection" "WARN" "No file integrity monitoring tools detected" "$rec"
+		warn "No FIM tools detected"
 	fi
+	
+	# NEW CHECK 2: fail2ban ban statistics (active bans indicate attacks)
+	if command_exists fail2ban-client && systemctl is-active --quiet fail2ban 2>/dev/null; then
+		if is_root; then
+			local total_banned=0
+			local jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr ',' '\n' | tr -d ' \t')
+			
+			if [ -n "$jails" ]; then
+				for jail in $jails; do
+					[ -z "$jail" ] && continue
+					local banned_count=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
+					total_banned=$((total_banned + banned_count))
+				done
+				
+				if [ "$total_banned" -gt 10 ]; then
+					add_finding "Intrusion Detection" "WARN" "High number of banned IPs: $total_banned" "Active attacks detected - review fail2ban logs: 'sudo fail2ban-client status'"
+					warn "Active bans: $total_banned IPs"
+				elif [ "$total_banned" -gt 0 ]; then
+					add_finding "Intrusion Detection" "INFO" "Currently banned IPs: $total_banned" "Some attack activity detected"
+					info "Active bans: $total_banned IPs"
+				else
+					add_finding "Intrusion Detection" "OK" "No currently banned IPs" ""
+					ok "No active bans"
+				fi
+			fi
+		fi
+	fi
+	
+	# Quick reference to detailed auth log analysis
+	add_finding "Intrusion Detection" "INFO" "Detailed authentication analysis available in Behavioral Analysis section" "See failed login patterns and sudo usage analysis"
 }
 
 section_time_sync() {
 	print_section "Time Synchronization"
+	
+	local time_service_active=false
 	
 	# Check for chrony
 	if command_exists chronyc; then
 		if systemctl is-active --quiet chronyd 2>/dev/null; then
 			add_finding "Time Sync" "OK" "chronyd is active" ""
 			ok "chronyd is active"
+			time_service_active=true
 			
 			if is_root; then
 				sources=$(chronyc sources 2>/dev/null | grep "^\^" | wc -l || echo 0)
@@ -3209,12 +4691,14 @@ section_time_sync() {
 		if systemctl is-active --quiet ntp 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null; then
 			add_finding "Time Sync" "OK" "NTP daemon is active" ""
 			ok "NTP daemon is active"
+			time_service_active=true
 		else
 			rec="Enable NTP service: 'sudo systemctl enable --now ntp'"
 			add_finding "Time Sync" "WARN" "NTP installed but not active" "$rec"
 		fi
 	# Check for systemd-timesyncd
 	elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+		time_service_active=true
 		if [ "$OPERATION_MODE" = "production" ]; then
 			add_finding "Time Sync" "WARN" "systemd-timesyncd active (minimal)" "Deploy chrony/ntp with authenticated multi-source time servers"
 			warn "systemd-timesyncd active (minimal)"
@@ -3229,69 +4713,199 @@ section_time_sync() {
 		add_finding "Time Sync" "WARN" "No time synchronization service detected" "$rec"
 		warn "No time synchronization service detected"
 	fi
+	
+	# NEW CHECK 1: Time drift detection (actual time vs NTP server)
+	if [ "$time_service_active" = true ]; then
+		if command_exists chronyc && systemctl is-active --quiet chronyd 2>/dev/null; then
+			local tracking_output=$(chronyc tracking 2>/dev/null)
+			local offset=$(echo "$tracking_output" | grep "System time" | awk '{print $4}' | tr -d '-')
+			
+			if [ -n "$offset" ]; then
+				# Convert to absolute value and compare (offset in seconds)
+				if (( $(echo "$offset < 0.1" | bc -l 2>/dev/null || echo "1") )); then
+					add_finding "Time Sync" "OK" "Time drift minimal: ${offset}s" ""
+					ok "Time drift: ${offset}s"
+				elif (( $(echo "$offset < 1.0" | bc -l 2>/dev/null || echo "1") )); then
+					add_finding "Time Sync" "WARN" "Time drift detected: ${offset}s" "Consider investigating time synchronization: 'chronyc tracking'"
+					warn "Time drift: ${offset}s"
+				else
+					add_finding "Time Sync" "CRIT" "Significant time drift: ${offset}s" "Fix time synchronization immediately: 'sudo systemctl restart chronyd'"
+					crit "Time drift: ${offset}s"
+				fi
+			fi
+		elif command_exists ntpq; then
+			local ntp_offset=$(ntpq -p 2>/dev/null | grep '^\*' | awk '{print $9}' | tr -d '-')
+			if [ -n "$ntp_offset" ]; then
+				# ntpq offset is in milliseconds
+				if (( $(echo "$ntp_offset < 100" | bc -l 2>/dev/null || echo "1") )); then
+					add_finding "Time Sync" "OK" "Time drift minimal: ${ntp_offset}ms" ""
+					ok "Time drift: ${ntp_offset}ms"
+				elif (( $(echo "$ntp_offset < 1000" | bc -l 2>/dev/null || echo "1") )); then
+					add_finding "Time Sync" "WARN" "Time drift detected: ${ntp_offset}ms" "Monitor time synchronization"
+					warn "Time drift: ${ntp_offset}ms"
+				else
+					add_finding "Time Sync" "CRIT" "Significant time drift: ${ntp_offset}ms" "Fix time synchronization"
+					crit "Time drift: ${ntp_offset}ms"
+				fi
+			fi
+		elif command_exists timedatectl; then
+			local timesync_status=$(timedatectl status 2>/dev/null | grep "synchronized" | awk '{print $NF}')
+			if [ "$timesync_status" = "yes" ]; then
+				add_finding "Time Sync" "OK" "System clock synchronized" ""
+				ok "Clock synchronized"
+			else
+				add_finding "Time Sync" "WARN" "System clock not synchronized" "Check time service: 'timedatectl status'"
+				warn "Clock not synchronized"
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 2: NTP authentication (secure time sources)
+	if [ "$time_service_active" = true ]; then
+		local ntp_auth_configured=false
+		
+		# Check chrony for NTP authentication
+		if [ -f /etc/chrony/chrony.conf ] || [ -f /etc/chrony.conf ]; then
+			local chrony_conf="/etc/chrony/chrony.conf"
+			[ -f /etc/chrony.conf ] && chrony_conf="/etc/chrony.conf"
+			
+			if grep -qE "^\s*(key|keyfile)" "$chrony_conf" 2>/dev/null; then
+				add_finding "Time Sync" "OK" "NTP authentication configured in chrony" ""
+				ok "NTP auth configured"
+				ntp_auth_configured=true
+			fi
+		fi
+		
+		# Check ntpd for authentication
+		if [ -f /etc/ntp.conf ] && [ "$ntp_auth_configured" = false ]; then
+			if grep -qE "^\s*keys" /etc/ntp.conf 2>/dev/null; then
+				add_finding "Time Sync" "OK" "NTP authentication configured in ntpd" ""
+				ok "NTP auth configured"
+				ntp_auth_configured=true
+			fi
+		fi
+		
+		if [ "$ntp_auth_configured" = false ] && [ "$OPERATION_MODE" = "production" ]; then
+			rec="Configure NTP authentication: add 'keyfile /etc/chrony/chrony.keys' to chrony.conf for secure time sync"
+			add_finding "Time Sync" "INFO" "NTP authentication not configured" "$rec"
+			info "Consider NTP authentication"
+		fi
+	fi
 }
 
 section_logging() {
 	print_section "Logging and Monitoring"
 	
-	# Check rsyslog
-	if systemctl is-active --quiet rsyslog 2>/dev/null; then
-		add_finding "Logging" "OK" "rsyslog is active" ""
-		ok "rsyslog is active"
-	elif systemctl is-active --quiet syslog-ng 2>/dev/null; then
-		add_finding "Logging" "OK" "syslog-ng is active" ""
-		ok "syslog-ng is active"
+	# NOTE: Comprehensive logging security analysis in 'Enhanced Logging Security' section
+	# This section provides basic status overview
+	
+	# Quick logging service check
+	local logging_active=false
+	if systemctl is-active --quiet rsyslog 2>/dev/null || systemctl is-active --quiet syslog-ng 2>/dev/null || systemctl is-active --quiet systemd-journald 2>/dev/null; then
+		add_finding "Logging" "OK" "Logging service is active" "See 'Enhanced Logging Security' for detailed analysis"
+		ok "Logging service is active"
+		logging_active=true
 	else
 		rec="Ensure logging service is running: 'sudo systemctl start rsyslog'"
 		add_finding "Logging" "WARN" "No syslog service detected" "$rec"
 		warn "No syslog service detected"
 	fi
 	
-	# Check log file permissions
-	log_files=("/var/log/auth.log" "/var/log/secure" "/var/log/messages" "/var/log/syslog")
-	for log_file in "${log_files[@]}"; do
-		if [ -f "$log_file" ]; then
-			perms=$(stat -c "%a" "$log_file" 2>/dev/null || true)
-			if [ -n "$perms" ] && [ "$perms" -gt 644 ]; then
-				rec="Secure log file permissions: 'sudo chmod 640 $log_file'"
-				add_finding "Logging" "WARN" "$log_file has loose permissions ($perms)" "$rec"
-				warn "$log_file has loose permissions"
-			fi
-		fi
-	done
-	
-	# Check logrotate
-	if command_exists logrotate; then
-		if [ -f /etc/logrotate.conf ]; then
-			add_finding "Logging" "OK" "logrotate is configured" ""
-			ok "logrotate is configured"
-		else
-			rec="Configure log rotation: create /etc/logrotate.conf"
-			add_finding "Logging" "WARN" "logrotate not configured" "$rec"
-		fi
+	# Quick logrotate check
+	if command_exists logrotate && [ -f /etc/logrotate.conf ]; then
+		add_finding "Logging" "OK" "Log rotation is configured" "See 'Enhanced Logging Security' for detailed analysis"
+		ok "Log rotation is configured"
 	else
 		rec=$(get_recommendation "Install logrotate: 'sudo apt install logrotate'" \
 			"Install logrotate for log management" \
 			"Deploy centralized log management with rotation and archival policies")
-		add_finding "Logging" "INFO" "logrotate not installed" "$rec"
+		add_finding "Logging" "INFO" "logrotate not fully configured" "$rec"
 	fi
-
-	# Remote log forwarding (rsyslog)
-	if [ -f /etc/rsyslog.conf ] || [ -d /etc/rsyslog.d ]; then
-		forwarding=$(grep -R "@" /etc/rsyslog.conf /etc/rsyslog.d 2>/dev/null | grep -v '^#' | head -1 || true)
-		if [ -n "$forwarding" ]; then
-			add_finding "Logging" "INFO" "Remote log forwarding configured" ""
-		else
-			rec=$(get_recommendation "Consider configuring remote log forwarding" \
-				"Optional: configure remote log forwarding" \
-				"Require centralized logging: configure rsyslog/syslog-ng forwarding to SIEM")
-			if [ "$OPERATION_MODE" = "production" ]; then
-				add_finding "Logging" "WARN" "No remote log forwarding detected" "$rec"
-				warn "No remote log forwarding detected"
-			else
-				add_finding "Logging" "INFO" "No remote log forwarding detected" "$rec"
+	
+	# NEW CHECK 1: Remote logging configuration (centralized log management)
+	if [ "$logging_active" = true ]; then
+		local remote_logging=false
+		
+		# Check rsyslog for remote logging
+		if [ -f /etc/rsyslog.conf ] || [ -d /etc/rsyslog.d ]; then
+			if grep -qE "^\s*\*\.\*\s+@" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null; then
+				add_finding "Logging" "OK" "Remote logging configured (rsyslog)" ""
+				ok "Remote logging configured"
+				remote_logging=true
 			fi
 		fi
+		
+		# Check syslog-ng for remote logging
+		if [ "$remote_logging" = false ] && [ -f /etc/syslog-ng/syslog-ng.conf ]; then
+			if grep -qE "destination.*tcp|destination.*udp" /etc/syslog-ng/syslog-ng.conf 2>/dev/null; then
+				add_finding "Logging" "OK" "Remote logging configured (syslog-ng)" ""
+				ok "Remote logging configured"
+				remote_logging=true
+			fi
+		fi
+		
+		if [ "$remote_logging" = false ]; then
+			if [ "$OPERATION_MODE" = "production" ]; then
+				rec="Configure remote logging: add '*.* @logserver:514' to /etc/rsyslog.conf for centralized log management"
+				add_finding "Logging" "WARN" "Remote logging not configured" "$rec"
+				warn "No remote logging"
+			else
+				rec="Consider remote logging for better security: configure rsyslog to forward logs to a central server"
+				add_finding "Logging" "INFO" "Remote logging not configured" "$rec"
+				info "No remote logging"
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 2: Critical log file existence and size
+	if is_root; then
+		local critical_logs=(
+			"/var/log/auth.log"
+			"/var/log/secure"
+			"/var/log/syslog"
+			"/var/log/messages"
+			"/var/log/kern.log"
+		)
+		
+		local log_found=false
+		local log_issues=0
+		
+		for log_file in "${critical_logs[@]}"; do
+			if [ -f "$log_file" ]; then
+				log_found=true
+				local log_size=$(stat -Lc "%s" "$log_file" 2>/dev/null || echo "0")
+				local log_size_mb=$((log_size / 1024 / 1024))
+				
+				# Check if log is suspiciously empty or too large
+				if [ "$log_size" -eq 0 ]; then
+					add_finding "Logging" "WARN" "Log file is empty: $log_file" "Investigate why logging stopped or if log was cleared"
+					warn "$log_file is empty"
+					((log_issues++))
+				elif [ "$log_size_mb" -gt 1000 ]; then
+					add_finding "Logging" "WARN" "Log file very large: $log_file (${log_size_mb}MB)" "Check logrotate configuration: /etc/logrotate.d/"
+					warn "$log_file: ${log_size_mb}MB"
+					((log_issues++))
+				fi
+				
+				# Check log file permissions
+				local log_perms=$(stat -Lc "%a" "$log_file" 2>/dev/null)
+				if [ "${log_perms: -1}" != "0" ] && [ "${log_perms: -1}" != "4" ]; then
+					add_finding "Logging" "WARN" "Log file has weak permissions: $log_file ($log_perms)" "Set secure permissions: 'sudo chmod 640 $log_file'"
+					warn "$log_file perms: $log_perms"
+					((log_issues++))
+				fi
+			fi
+		done
+		
+		if [ "$log_found" = false ]; then
+			add_finding "Logging" "WARN" "No standard log files found in /var/log" "Check logging configuration"
+			warn "No standard log files found"
+		elif [ "$log_issues" -eq 0 ]; then
+			add_finding "Logging" "OK" "Critical log files present and healthy" ""
+			ok "Log files healthy"
+		fi
+	else
+		add_finding "Logging" "INFO" "Log file analysis requires root access" "Run with sudo for detailed log file checks"
 	fi
 }
 
@@ -3318,17 +4932,67 @@ section_network_security() {
 		fi
 	fi
 	
-	# Check TCP SYN cookies
-	syn_cookies=$(safe_read /proc/sys/net/ipv4/tcp_syncookies)
-	[ -z "$syn_cookies" ] && syn_cookies=0
-	if [ "$syn_cookies" = "1" ]; then
-		add_finding "Network Security" "OK" "TCP SYN cookies enabled" ""
-		ok "TCP SYN cookies enabled"
-	else
-		rec="Enable SYN cookies: 'echo 1 | sudo tee /proc/sys/net/ipv4/tcp_syncookies'"
-		add_finding "Network Security" "WARN" "TCP SYN cookies disabled" "$rec"
-		warn "TCP SYN cookies disabled"
+	# NEW CHECK 1: Network interfaces in promiscuous mode (packet sniffing)
+	if is_root && command_exists ip; then
+		local promisc_ifaces=$(ip link show 2>/dev/null | grep -i "PROMISC" | awk '{print $2}' | tr -d ':' | head -5)
+		if [ -n "$promisc_ifaces" ]; then
+			add_finding "Network Security" "WARN" "Network interface(s) in promiscuous mode: $promisc_ifaces" "Investigate: may indicate packet sniffing or network monitoring tools"
+			warn "Promiscuous mode detected: $promisc_ifaces"
+		else
+			add_finding "Network Security" "OK" "No network interfaces in promiscuous mode" ""
+			ok "No promiscuous mode"
+		fi
+	elif command_exists ifconfig; then
+		local promisc_ifaces=$(ifconfig 2>/dev/null | grep -i "PROMISC" | awk '{print $1}' | head -5)
+		if [ -n "$promisc_ifaces" ]; then
+			add_finding "Network Security" "WARN" "Network interface(s) in promiscuous mode: $promisc_ifaces" "Investigate packet capture tools"
+			warn "Promiscuous mode: $promisc_ifaces"
+		fi
 	fi
+	
+	# NEW CHECK 2: Specific risky port analysis (database, management, development ports)
+	if command_exists ss || command_exists netstat; then
+		local risky_ports=(
+			"3306:MySQL"
+			"5432:PostgreSQL"
+			"27017:MongoDB"
+			"6379:Redis"
+			"9200:Elasticsearch"
+			"8080:HTTP-Alt"
+			"8888:HTTP-Proxy"
+			"3000:Development"
+			"4444:Metasploit"
+			"5555:ADB"
+		)
+		
+		local exposed_services=""
+		for port_info in "${risky_ports[@]}"; do
+			IFS=':' read -r port service_name <<< "$port_info"
+			if command_exists ss; then
+				if ss -tuln 2>/dev/null | grep -q ":$port "; then
+					exposed_services="$exposed_services$service_name($port), "
+				fi
+			elif command_exists netstat; then
+				if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+					exposed_services="$exposed_services$service_name($port), "
+				fi
+			fi
+		done
+		
+		if [ -n "$exposed_services" ]; then
+			exposed_services=${exposed_services%, }
+			rec="Review and secure exposed services: $exposed_services - ensure proper authentication and firewall rules"
+			add_finding "Network Security" "WARN" "Risky services exposed: $exposed_services" "$rec"
+			warn "Risky services exposed"
+		else
+			add_finding "Network Security" "OK" "No commonly risky ports exposed" ""
+			ok "No risky ports exposed"
+		fi
+	fi
+	
+	# NOTE: Comprehensive network hardening checks (TCP SYN cookies, timestamps, etc.) 
+	# are performed in 'Enhanced Network Security' section
+	# This section provides basic network exposure analysis only
 }
 
 section_package_integrity() {
@@ -3385,6 +5049,73 @@ section_package_integrity() {
 		add_finding "Package Integrity" "INFO" "No supported package manager for integrity checking" "Manual package verification recommended"
 		if [ "$OUTPUT_FORMAT" = "console" ]; then
 			info "No supported package manager for automated integrity checking"
+		fi
+	fi
+	
+	# NEW CHECK 1: Unused/orphaned packages (reduce attack surface)
+	if command_exists apt; then
+		if command_exists deborphan && is_root; then
+			local orphaned=$(deborphan 2>/dev/null | wc -l || echo 0)
+			if [ "$orphaned" -gt 0 ]; then
+				rec="Review orphaned packages: 'deborphan' and remove if not needed: 'sudo apt autoremove'"
+				add_finding "Package Integrity" "INFO" "$orphaned orphaned package(s) detected" "$rec"
+				info "$orphaned orphaned packages"
+			else
+				add_finding "Package Integrity" "OK" "No orphaned packages detected" ""
+				ok "No orphaned packages"
+			fi
+		elif command_exists apt-get; then
+			# Alternative: check for autoremovable packages
+			local autoremovable=$(apt-get --dry-run autoremove 2>/dev/null | grep -oP '\K[0-9]+(?= to remove)' | head -1)
+			if [ -n "$autoremovable" ] && [ "$autoremovable" -gt 0 ]; then
+				rec="Remove unused packages: 'sudo apt autoremove'"
+				add_finding "Package Integrity" "INFO" "$autoremovable package(s) can be autoremoved" "$rec"
+				info "$autoremovable autoremovable packages"
+			fi
+		fi
+	elif command_exists yum; then
+		if command_exists package-cleanup && is_root; then
+			local orphaned=$(package-cleanup --quiet --leaves --all 2>/dev/null | wc -l || echo 0)
+			if [ "$orphaned" -gt 0 ]; then
+				rec="Review leaf packages: 'package-cleanup --leaves' and remove if not needed"
+				add_finding "Package Integrity" "INFO" "$orphaned leaf package(s) detected" "$rec"
+				info "$orphaned leaf packages"
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 2: Package repository signature verification
+	if command_exists apt; then
+		# Check for unsigned/untrusted repositories
+		if [ -d /etc/apt/sources.list.d ]; then
+			local unsigned_repos=$(grep -r "trusted=yes" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | wc -l || echo 0)
+			if [ "$unsigned_repos" -gt 0 ]; then
+				add_finding "Package Integrity" "WARN" "$unsigned_repos repository(ies) marked as trusted without signature verification" "Review /etc/apt/sources.list.d/ for '[trusted=yes]' entries - this bypasses GPG verification"
+				warn "$unsigned_repos unsigned repos"
+			else
+				add_finding "Package Integrity" "OK" "All repositories require GPG signature verification" ""
+				ok "GPG verification enabled"
+			fi
+		fi
+	elif command_exists yum || command_exists dnf; then
+		# Check for gpgcheck=0 in yum/dnf configs
+		local yum_configs=("/etc/yum.conf" "/etc/dnf/dnf.conf" "/etc/yum.repos.d/*.repo")
+		local nogpgcheck_count=0
+		
+		for config_pattern in "${yum_configs[@]}"; do
+			if ls $config_pattern >/dev/null 2>&1; then
+				nogpgcheck_count=$(grep -h "gpgcheck=0" $config_pattern 2>/dev/null | wc -l || echo 0)
+				if [ "$nogpgcheck_count" -gt 0 ]; then
+					add_finding "Package Integrity" "WARN" "$nogpgcheck_count repository(ies) have GPG check disabled" "Enable GPG verification: set 'gpgcheck=1' in yum/dnf configs"
+					warn "$nogpgcheck_count repos without GPG check"
+					break
+				fi
+			fi
+		done
+		
+		if [ "$nogpgcheck_count" -eq 0 ]; then
+			add_finding "Package Integrity" "OK" "GPG signature verification enabled for all repos" ""
+			ok "GPG verification enabled"
 		fi
 	fi
 }
@@ -3465,6 +5196,98 @@ section_file_integrity() {
 		rec="Implement automated integrity monitoring with AIDE/Tripwire and baseline comparisons"
 		add_finding "File Integrity" "INFO" "File integrity monitoring recommended" "$rec"
 		[ "$OUTPUT_FORMAT" = "console" ] && info "File integrity monitoring recommended"
+	fi
+	
+	# MIGRATED: Check for additional integrity monitoring tools
+	additional_tools=("ossec" "samhain" "osquery")
+	for tool in "${additional_tools[@]}"; do
+		if command_exists "$tool"; then
+			add_finding "File Integrity" "OK" "Advanced integrity tool available: $tool" ""
+			ok "$tool detected"
+		fi
+	done
+	
+	# MIGRATED: Check for recent modifications to critical files
+	critical_files_extended=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config" "/etc/fstab" "/etc/hosts" "/etc/resolv.conf")
+	recent_mods=0
+	
+	for file in "${critical_files_extended[@]}"; do
+		if [ -f "$file" ]; then
+			last_mod=$(stat -c "%Y" "$file" 2>/dev/null || echo "0")
+			current_time=$(date +%s)
+			days_since_mod=$(( (current_time - last_mod) / 86400 ))
+			
+			if [ "$days_since_mod" -lt 7 ]; then
+				add_finding "File Integrity" "WARN" "$(basename "$file") modified recently: $days_since_mod days ago" "Verify if this change was authorized"
+				warn "$(basename "$file") modified $days_since_mod days ago"
+				recent_mods=$((recent_mods + 1))
+			elif [ "$days_since_mod" -lt 30 ]; then
+				add_finding "File Integrity" "INFO" "$(basename "$file") modified $days_since_mod days ago" ""
+			fi
+		fi
+	done
+	
+	if [ "$recent_mods" -eq 0 ]; then
+		add_finding "File Integrity" "OK" "No recent critical file modifications detected" ""
+		ok "No recent critical file modifications"
+	fi
+	
+	# NEW CHECK 1: Immutable file attributes (chattr +i protection)
+	if command_exists lsattr && is_root; then
+		immutable_count=0
+		should_be_immutable=("/etc/passwd" "/etc/shadow" "/etc/sudoers")
+		
+		for file in "${should_be_immutable[@]}"; do
+			if [ -f "$file" ]; then
+				attrs=$(lsattr "$file" 2>/dev/null | awk '{print $1}')
+				if echo "$attrs" | grep -q "i"; then
+					add_finding "File Integrity" "OK" "$(basename "$file") is immutable (chattr +i)" ""
+					ok "$(basename "$file") immutable"
+					immutable_count=$((immutable_count + 1))
+				else
+					rec="Set immutable: 'sudo chattr +i $file' (requires chattr -i to modify)"
+					add_finding "File Integrity" "INFO" "$(basename "$file") not immutable" "$rec"
+					info "$(basename "$file") not immutable"
+				fi
+			fi
+		done
+		
+		if [ "$immutable_count" -gt 0 ]; then
+			add_finding "File Integrity" "OK" "$immutable_count critical file(s) protected with immutable attribute" ""
+		fi
+	fi
+	
+	# NEW CHECK 2: Suspicious recently modified system binaries
+	if is_root; then
+		suspicious_binaries=0
+		bin_dirs=("/bin" "/sbin" "/usr/bin" "/usr/sbin")
+		
+		for dir in "${bin_dirs[@]}"; do
+			if [ -d "$dir" ]; then
+				# Find binaries modified in last 7 days
+				recent_bins=$(find "$dir" -type f -mtime -7 2>/dev/null | wc -l)
+				if [ "$recent_bins" -gt 0 ]; then
+					add_finding "File Integrity" "WARN" "$recent_bins binary(ies) in $dir modified in last 7 days" "Verify if system updates occurred or investigate potential tampering"
+					warn "$recent_bins recent binaries in $dir"
+					suspicious_binaries=$((suspicious_binaries + recent_bins))
+					
+					# Show first few modified binaries
+					if [ "$recent_bins" -le 5 ]; then
+						modified_list=$(find "$dir" -type f -mtime -7 -printf "%p (modified: %TY-%Tm-%Td)\n" 2>/dev/null | head -5)
+						if [ -n "$modified_list" ]; then
+							add_finding "File Integrity" "INFO" "Recently modified binaries in $dir: $(echo "$modified_list" | tr '\n' '; ')" ""
+						fi
+					fi
+				fi
+			fi
+		done
+		
+		if [ "$suspicious_binaries" -eq 0 ]; then
+			add_finding "File Integrity" "OK" "No suspicious recent binary modifications" ""
+			ok "No suspicious binary modifications"
+		fi
+	else
+		add_finding "File Integrity" "INFO" "Binary modification check requires root access" ""
 	fi
 }
 
@@ -3560,6 +5383,66 @@ section_persistence_mechanisms() {
 			crit "Suspicious kernel modules found"
 		fi
 	fi
+	
+	# NEW CHECK 1: Unauthorized systemd services (non-standard services)
+	if command_exists systemctl; then
+		if is_root; then
+			# Get user-created services (typically in /etc/systemd/system)
+			local user_services=$(find /etc/systemd/system -type f -name "*.service" 2>/dev/null | grep -v ".wants/" | wc -l || echo 0)
+			if [ "$user_services" -gt 0 ]; then
+				add_finding "Persistence" "INFO" "$user_services custom systemd service(s) in /etc/systemd/system" "Review: 'ls -la /etc/systemd/system/*.service'"
+				info "$user_services custom services"
+				
+				# Check for recently created services (last 30 days)
+				local recent_services=$(find /etc/systemd/system -type f -name "*.service" -mtime -30 2>/dev/null | wc -l || echo 0)
+				if [ "$recent_services" -gt 0 ]; then
+					add_finding "Persistence" "WARN" "$recent_services systemd service(s) created in last 30 days" "Review recent services: 'find /etc/systemd/system -name *.service -mtime -30 -ls'"
+					warn "$recent_services recent services"
+				fi
+			fi
+			
+			# Check for failed services (might indicate persistence attempts)
+			local failed_services=$(systemctl list-units --state=failed --type=service --no-pager 2>/dev/null | grep -c "failed" || echo 0)
+			if [ "$failed_services" -gt 0 ]; then
+				add_finding "Persistence" "WARN" "$failed_services failed systemd service(s)" "Investigate: 'systemctl --failed'"
+				warn "$failed_services failed services"
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 2: Bootloader configuration modifications (GRUB tampering)
+	if is_root; then
+		local grub_configs=("/boot/grub/grub.cfg" "/boot/grub2/grub.cfg" "/etc/default/grub")
+		local grub_modified=false
+		
+		for grub_file in "${grub_configs[@]}"; do
+			if [ -f "$grub_file" ]; then
+				local last_mod=$(stat -c "%Y" "$grub_file" 2>/dev/null || echo "0")
+				local current_time=$(date +%s)
+				local days_since_mod=$(( (current_time - last_mod) / 86400 ))
+				
+				if [ "$days_since_mod" -lt 7 ]; then
+					add_finding "Persistence" "WARN" "Bootloader config modified recently: $grub_file ($days_since_mod days ago)" "Verify if authorized: 'sudo cat $grub_file | tail -20'"
+					warn "GRUB modified: $days_since_mod days ago"
+					grub_modified=true
+				fi
+				
+				# Check for suspicious boot parameters (init=/bin/bash is common rootkit technique)
+				if grep -qE "(init=/bin/(bash|sh)|rdinit=/bin/(bash|sh))" "$grub_file" 2>/dev/null; then
+					add_finding "Persistence" "CRIT" "Suspicious boot parameter in $grub_file: init=/bin/bash or similar" "Investigate bootloader tampering immediately"
+					crit "Suspicious GRUB parameters"
+					grub_modified=true
+				fi
+			fi
+		done
+		
+		if [ "$grub_modified" = false ]; then
+			add_finding "Persistence" "OK" "No recent bootloader modifications detected" ""
+			ok "Bootloader config stable"
+		fi
+	else
+		add_finding "Persistence" "INFO" "Bootloader check requires root access" "Run with sudo to verify GRUB configuration"
+	fi
 }
 
 section_process_forensics() {
@@ -3582,25 +5465,9 @@ section_process_forensics() {
 		fi
 	fi
 	
-	# Check for hidden processes (basic check)
-	if [ -d /proc ]; then
-		proc_count=$(ls -1 /proc | grep -E '^[0-9]+$' | wc -l 2>/dev/null || echo 0)
-		proc_count=$(echo "$proc_count" | tr -d '\n' | awk '{print $1}')
-		ps_count=$(ps aux --no-headers 2>/dev/null | wc -l 2>/dev/null || echo 0)
-		ps_count=$(echo "$ps_count" | tr -d '\n' | awk '{print $1}')
-		
-		if [ "$proc_count" -gt 0 ] && [ "$ps_count" -gt 0 ]; then
-			diff=$((proc_count - ps_count))
-			if [ "$diff" -gt 10 ]; then  # Allow some variance
-				rec="Investigate process discrepancy: /proc shows $proc_count, ps shows $ps_count"
-				add_finding "Process Forensics" "WARN" "Process count discrepancy detected" "$rec"
-				warn "Process visibility discrepancy"
-			else
-				add_finding "Process Forensics" "OK" "Process counts consistent" ""
-				ok "Process visibility normal"
-			fi
-		fi
-	fi
+	# NOTE: Hidden process detection (proc vs ps count discrepancy) is performed 
+	# in 'Rootkit Detection' section for comprehensive rootkit analysis
+	add_finding "Process Forensics" "INFO" "Hidden process detection available in Rootkit Detection section" "See comprehensive /proc vs ps analysis"
 	
 	# Personal mode: Basic process analysis
 	if [ "$OPERATION_MODE" = "personal" ]; then
@@ -3623,12 +5490,11 @@ section_process_forensics() {
 		fi
 	fi
 	
-	# Check for ELF capabilities (if available)
+	# NOTE: Detailed capability analysis in 'Privilege Escalation Surface (Core)' section
 	if command_exists getcap && is_root; then
 		cap_files=$(getcap -r /usr/bin /bin /sbin 2>/dev/null | wc -l || echo 0)
 		if [ "$cap_files" -gt 0 ]; then
-			rec="Review file capabilities: 'sudo getcap -r /usr/bin /bin /sbin'"
-			add_finding "Process Forensics" "INFO" "$cap_files files with capabilities" "$rec"
+			add_finding "Process Forensics" "INFO" "$cap_files files with capabilities detected" "See 'Privilege Escalation Surface (Core)' for dangerous capability analysis"
 		fi
 	fi
 }
@@ -3636,37 +5502,9 @@ section_process_forensics() {
 section_secure_configuration() {
 	print_section "Secure Configuration"
 	
-	# Check kernel hardening flags
-	hardening_flags=("kernel.dmesg_restrict" "kernel.kptr_restrict" "net.ipv4.conf.all.send_redirects" "net.ipv4.conf.all.accept_redirects")
-	
-	for flag in "${hardening_flags[@]}"; do
-		if [ -f /proc/sys/${flag//./\/} ]; then
-			value=$(safe_read "/proc/sys/${flag//./\/}")
-		[ -z "$value" ] && value="unknown"
-			case "$flag" in
-				"kernel.dmesg_restrict"|"kernel.kptr_restrict")
-					if [ "$value" = "1" ]; then
-						add_finding "Secure Config" "OK" "$flag = $value (hardened)" ""
-						ok "$flag enabled"
-					else
-						rec="Enable $flag: 'echo 1 | sudo tee /proc/sys/${flag//./\/}'"
-						add_finding "Secure Config" "WARN" "$flag = $value (not hardened)" "$rec"
-						warn "$flag not enabled"
-					fi
-					;;
-				"net.ipv4.conf.all.send_redirects"|"net.ipv4.conf.all.accept_redirects")
-					if [ "$value" = "0" ]; then
-						add_finding "Secure Config" "OK" "$flag = $value (secure)" ""
-						ok "$flag disabled"
-					else
-						rec="Disable $flag: 'echo 0 | sudo tee /proc/sys/${flag//./\/}'"
-						add_finding "Secure Config" "WARN" "$flag = $value (insecure)" "$rec"
-						warn "$flag enabled"
-					fi
-					;;
-			esac
-		fi
-	done
+	# NOTE: Comprehensive kernel hardening checks (dmesg_restrict, kptr_restrict, etc.) 
+	# are performed in 'Kernel Hardening' section
+	add_finding "Secure Config" "INFO" "Kernel hardening analysis available in Kernel Hardening section" "See comprehensive sysctl parameter checks"
 	
 	# Check /etc/security/limits.conf for basic protections
 	if [ -f /etc/security/limits.conf ]; then
@@ -3792,7 +5630,7 @@ section_container_security() {
 		fi
 	fi
 	
-	# Kubernetes detection
+	# Kubernetes detection and security
 	if command_exists kubectl || command_exists kubelet || systemctl list-unit-files | grep -q kubelet; then
 		add_finding "Container Security" "INFO" "Kubernetes components detected" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && info "Kubernetes detected"
@@ -3805,6 +5643,119 @@ section_container_security() {
 		# Check for kubelet configuration
 		if [ -f /etc/kubernetes/kubelet/kubelet-config.yaml ] || [ -f /var/lib/kubelet/config.yaml ]; then
 			add_finding "Container Security" "INFO" "Kubelet configuration found" ""
+		fi
+		
+		# MIGRATED: Check for RBAC cluster-admin bindings (security risk)
+		if command_exists kubectl; then
+			if kubectl get clusterrolebinding 2>/dev/null | grep -q "cluster-admin"; then
+				rec="Review cluster-admin bindings for security implications: 'kubectl get clusterrolebinding -o wide'"
+				add_finding "Container Security" "WARN" "Cluster admin bindings detected" "$rec"
+				warn "Cluster admin bindings found"
+			else
+				add_finding "Container Security" "OK" "No cluster-admin bindings detected" ""
+				ok "No cluster-admin bindings"
+			fi
+			
+			# MIGRATED: Check for network policies
+			network_policies=$(kubectl get networkpolicies --all-namespaces 2>/dev/null | wc -l || echo "0")
+			if [ "$network_policies" -gt 1 ]; then
+				add_finding "Container Security" "OK" "Network policies configured: $network_policies" ""
+				ok "Network policies configured"
+			else
+				rec="Configure network policies for pod-to-pod communication control"
+				add_finding "Container Security" "WARN" "No network policies configured" "$rec"
+				warn "No network policies configured"
+			fi
+			
+			# NEW CHECK: Pod Security Standards (PSS) / Pod Security Admission
+			if kubectl api-resources 2>/dev/null | grep -q "podsecuritypolicies"; then
+				psp_count=$(kubectl get psp 2>/dev/null | wc -l || echo "0")
+				if [ "$psp_count" -gt 1 ]; then
+					add_finding "Container Security" "OK" "Pod Security Policies configured" ""
+					ok "Pod Security Policies found"
+				else
+					rec="Configure Pod Security Standards for k8s 1.25+"
+					add_finding "Container Security" "WARN" "No Pod Security Policies found" "$rec"
+					warn "No pod security policies"
+				fi
+			fi
+		fi
+	fi
+	
+	# NEW CHECK 1: Container image vulnerability scanning tools
+	vuln_scanners=("trivy" "grype" "clair" "anchore-cli")
+	scanner_found=false
+	for scanner in "${vuln_scanners[@]}"; do
+		if command_exists "$scanner"; then
+			add_finding "Container Security" "OK" "Image vulnerability scanner available: $scanner" ""
+			ok "$scanner available for image scanning"
+			scanner_found=true
+			break
+		fi
+	done
+	if [ "$scanner_found" = false ]; then
+		rec="Install container image scanner: 'curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh'"
+		add_finding "Container Security" "WARN" "No container image vulnerability scanner detected" "$rec"
+		warn "No image vulnerability scanner found"
+	fi
+	
+	# NEW CHECK 2: Docker Content Trust (image signing verification)
+	if command_exists docker; then
+		if [ "${DOCKER_CONTENT_TRUST:-0}" = "1" ]; then
+			add_finding "Container Security" "OK" "Docker Content Trust enabled" ""
+			ok "Docker Content Trust enabled"
+		else
+			rec="Enable Docker Content Trust: 'export DOCKER_CONTENT_TRUST=1' in /etc/environment or daemon config"
+			add_finding "Container Security" "WARN" "Docker Content Trust not enabled" "$rec"
+			warn "Docker Content Trust disabled"
+		fi
+		
+		# MIGRATED: Advanced Docker daemon security configuration
+		if [ -f /etc/docker/daemon.json ]; then
+			# Check file permissions
+			daemon_perms=$(stat -c "%a" /etc/docker/daemon.json 2>/dev/null || echo "000")
+			if [ "$daemon_perms" = "644" ] || [ "$daemon_perms" = "600" ]; then
+				add_finding "Container Security" "OK" "Docker daemon.json has secure permissions: $daemon_perms" ""
+			else
+				rec="Set secure permissions: 'sudo chmod 644 /etc/docker/daemon.json'"
+				add_finding "Container Security" "WARN" "Docker daemon.json has insecure permissions: $daemon_perms" "$rec"
+				warn "Insecure daemon.json permissions"
+			fi
+			
+			# Check for security hardening options
+			security_config=$(grep -E "(live-restore|userland-proxy|no-new-privileges|userns-remap)" /etc/docker/daemon.json 2>/dev/null || true)
+			if [ -n "$security_config" ]; then
+				add_finding "Container Security" "OK" "Docker security hardening configured" ""
+				ok "Docker security hardening detected"
+			else
+				rec="Configure Docker security hardening: live-restore, no-new-privileges, userns-remap in /etc/docker/daemon.json"
+				add_finding "Container Security" "WARN" "Docker security hardening not configured" "$rec"
+				warn "Docker security hardening not configured"
+			fi
+		fi
+		
+		# MIGRATED: Check for running containers with security profiles
+		if is_root && docker ps -q 2>/dev/null | grep -q .; then
+			running_containers=$(docker ps --format "{{.Names}}" 2>/dev/null | wc -l || echo "0")
+			if [ "$running_containers" -gt 0 ]; then
+				# Check for unconfined containers
+				unconfined_containers=0
+				for container in $(docker ps --format "{{.Names}}" 2>/dev/null); do
+					sec_opts=$(docker inspect --format '{{.HostConfig.SecurityOpt}}' "$container" 2>/dev/null || echo "")
+					if echo "$sec_opts" | grep -q "unconfined"; then
+						unconfined_containers=$((unconfined_containers + 1))
+					fi
+				done
+				
+				if [ "$unconfined_containers" -gt 0 ]; then
+					rec="Review containers running without security profiles: 'docker inspect --format=\"{{.Name}}: {{.HostConfig.SecurityOpt}}\" \$(docker ps -q)'"
+					add_finding "Container Security" "WARN" "$unconfined_containers container(s) without security profiles" "$rec"
+					warn "Unconfined containers detected"
+				else
+					add_finding "Container Security" "OK" "All running containers have security profiles" ""
+					ok "All containers have security profiles"
+				fi
+			fi
 		fi
 	fi
 }
@@ -4556,539 +6507,7 @@ if [ -n "$OUTPUT_FILE" ]; then
 	fi
 fi
 
-# Malware signature detection
-section_malware_detection() {
-    print_section "Malware Detection"
-    
-    # Common malware signatures and patterns
-    local malware_patterns=(
-        "backdoor"
-        "trojan"
-        "rootkit"
-        "keylogger"
-        "botnet"
-        "cryptominer"
-        "ransomware"
-        "spyware"
-    )
-    
-    local suspicious_files=()
-    local suspicious_processes=()
-    local suspicious_network=()
-    
-    # Check for suspicious files in common locations (exclude script temp files)
-    local search_paths=("/tmp" "/var/tmp" "/dev/shm" "/home" "/root")
-    for path in "${search_paths[@]}"; do
-        [ -d "$path" ] || continue
-        
-        for pattern in "${malware_patterns[@]}"; do
-            local found_files=$(cached_command find "$path" -maxdepth 3 -type f -iname "*${pattern}*" 2>/dev/null | grep -v "btqc-par-" | head -10)
-            if [ -n "$found_files" ]; then
-                while IFS= read -r file; do
-                    suspicious_files+=("$file")
-                    add_finding "Malware Detection" "WARN" "Suspicious file found: $file" "Investigate file: 'file $file' and 'strings $file | grep -i suspicious'"
-                done <<< "$found_files"
-            fi
-        done
-    done
-    
-    # Check for suspicious processes (exclude script's own processes and commands)
-    if command_exists ps; then
-        local ps_output=$(cached_command ps aux 2>/dev/null)
-        for pattern in "${malware_patterns[@]}"; do
-            local suspicious_procs=$(echo "$ps_output" | grep -i "$pattern" | grep -v "bt-quickcheck\|btqc-par-\|find.*-iname.*$pattern\|grep.*$pattern" | head -5)
-            if [ -n "$suspicious_procs" ]; then
-                while IFS= read -r proc; do
-                    suspicious_processes+=("$proc")
-                    add_finding "Malware Detection" "WARN" "Suspicious process: $proc" "Investigate process: 'ps aux | grep $pattern' and check process tree"
-                done <<< "$suspicious_procs"
-            fi
-        done
-    fi
-    
-    # Check for suspicious network connections
-    if command_exists netstat; then
-        local netstat_output=$(cached_command netstat -tuln 2>/dev/null)
-        # Look for unusual ports or connections
-        local suspicious_ports=$(echo "$netstat_output" | awk '$1 ~ /tcp/ && $4 ~ /:(4444|5555|6666|7777|8888|9999|1337|31337|12345|54321)/ {print $4}')
-        if [ -n "$suspicious_ports" ]; then
-            while IFS= read -r port; do
-                suspicious_network+=("$port")
-                add_finding "Malware Detection" "WARN" "Suspicious port listening: $port" "Investigate port: 'netstat -tuln | grep $port' and 'lsof -i :$port'"
-            done <<< "$suspicious_ports"
-        fi
-    fi
-    
-    # Check for suspicious file permissions (executable in temp directories)
-    local temp_executables=$(cached_command find /tmp /var/tmp /dev/shm -maxdepth 2 -type f -executable 2>/dev/null | head -10)
-    if [ -n "$temp_executables" ]; then
-        while IFS= read -r file; do
-            add_finding "Malware Detection" "WARN" "Executable in temp directory: $file" "Investigate executable: 'file $file' and 'strings $file'"
-        done <<< "$temp_executables"
-    fi
-    
-    # Check for suspicious cron jobs
-    if is_root; then
-        local suspicious_cron=$(cached_command find /etc/cron* /var/spool/cron* -type f 2>/dev/null | xargs grep -l "wget\|curl\|bash.*http\|sh.*http" 2>/dev/null | head -5)
-        if [ -n "$suspicious_cron" ]; then
-            while IFS= read -r cron_file; do
-                add_finding "Malware Detection" "CRIT" "Suspicious cron job: $cron_file" "Review cron job: 'cat $cron_file' and investigate source"
-            done <<< "$suspicious_cron"
-        fi
-    fi
-    
-	# Check for suspicious systemd services (skip on non-systemd like WSL)
-	if command_exists systemctl && [ -d /run/systemd/system ]; then
-        local suspicious_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | grep -E "(backdoor|trojan|rootkit|keylog)" | head -5)
-        if [ -n "$suspicious_services" ]; then
-            while IFS= read -r service; do
-                add_finding "Malware Detection" "CRIT" "Suspicious service running: $service" "Investigate service: 'systemctl status $service' and 'systemctl cat $service'"
-            done <<< "$suspicious_services"
-        fi
-    fi
-    
-    # Summary
-    local total_suspicious=$((${#suspicious_files[@]} + ${#suspicious_processes[@]} + ${#suspicious_network[@]}))
-    if [ $total_suspicious -eq 0 ]; then
-        add_finding "Malware Detection" "OK" "No obvious malware signatures detected" "Continue monitoring with regular scans"
-        ok "No obvious malware signatures detected"
-    else
-        add_finding "Malware Detection" "WARN" "Found $total_suspicious suspicious items requiring investigation" "Review all flagged items and consider full malware scan"
-        warn "Found $total_suspicious suspicious items requiring investigation"
-    fi
-}
 
-# Enhanced rootkit detection
-section_rootkit_detection() {
-    print_section "Rootkit Detection"
-    
-    local rootkit_indicators=0
-    local total_checks=0
-    
-    # Check for hidden processes (ps vs /proc comparison)
-    if command_exists ps && [ -d /proc ]; then
-        ((total_checks++))
-        local ps_pids=$(cached_command ps -eo pid 2>/dev/null | tail -n +2 | sort -n)
-        local proc_pids=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
-        
-        # Filter out kernel threads and system processes that might not show in ps
-        local hidden_pids=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids") 2>/dev/null | grep -v -E '^[0-9]+$' | head -10 | tr '\n' ' ')
-        
-        # Only flag if we find actual suspicious hidden processes (not just kernel threads)
-        if [ -n "$hidden_pids" ] && [ $(echo "$hidden_pids" | wc -w) -gt 0 ]; then
-            # Double-check by trying to read the process info
-            local real_hidden=""
-            for pid in $hidden_pids; do
-                if [ -f "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/cmdline" ]; then
-                    local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | head -c 100)
-                    if [ -n "$cmdline" ] && [ "$cmdline" != " " ]; then
-                        real_hidden="$real_hidden $pid"
-                    fi
-                fi
-            done
-            
-            if [ -n "$real_hidden" ]; then
-                ((rootkit_indicators++))
-                local hidden_count=$(echo "$real_hidden" | wc -w)
-                add_finding "Rootkit Detection" "CRIT" "Hidden processes detected: $hidden_count PIDs ($real_hidden)" "Investigate hidden processes: 'ls -la /proc/[PID]/' for each PID"
-                crit "Hidden processes detected: $hidden_count PIDs"
-            else
-                add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
-                ok "No hidden processes detected"
-            fi
-        else
-            add_finding "Rootkit Detection" "OK" "No hidden processes detected" ""
-        fi
-    fi
-    
-    # Check for suspicious kernel modules
-    if is_root && [ -f /proc/modules ]; then
-        ((total_checks++))
-        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
-        local suspicious_modules=$(echo "$loaded_modules" | grep -E "(backdoor|rootkit|stealth|hidden)" 2>/dev/null)
-        
-        if [ -n "$suspicious_modules" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "CRIT" "Suspicious kernel modules: $suspicious_modules" "Investigate modules: 'modinfo [module_name]' and 'lsmod | grep [module_name]'"
-            crit "Suspicious kernel modules detected"
-        else
-            add_finding "Rootkit Detection" "OK" "No suspicious kernel modules detected" ""
-            ok "No suspicious kernel modules detected"
-        fi
-    fi
-    
-    # Check for modified system binaries
-    if is_root; then
-        ((total_checks++))
-        local critical_binaries=("/bin/ls" "/bin/ps" "/bin/netstat" "/bin/ss" "/usr/bin/top" "/bin/df")
-        local modified_binaries=()
-        
-        for binary in "${critical_binaries[@]}"; do
-            if [ -f "$binary" ]; then
-                # Check if binary has been modified recently (within last 7 days)
-                local mod_time=$(stat -c %Y "$binary" 2>/dev/null || echo 0)
-                local current_time=$(date +%s)
-                local age_days=$(( (current_time - mod_time) / 86400 ))
-                
-                if [ $age_days -lt 7 ]; then
-                    modified_binaries+=("$binary (modified $age_days days ago)")
-                fi
-            fi
-        done
-        
-        if [ ${#modified_binaries[@]} -gt 0 ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Recently modified system binaries: ${modified_binaries[*]}" "Verify binary integrity: 'rpm -Vf $binary' or 'debsums $binary'"
-        else
-            add_finding "Rootkit Detection" "OK" "System binaries appear unmodified" ""
-        fi
-    fi
-    
-    # Check for suspicious network connections (hidden)
-    if command_exists netstat && command_exists ss; then
-        ((total_checks++))
-        local netstat_conns=$(cached_command netstat -tuln 2>/dev/null | wc -l)
-        local ss_conns=$(cached_command ss -tuln 2>/dev/null | wc -l)
-        local diff=$((netstat_conns - ss_conns))
-        
-        if [ $diff -gt 5 ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Significant difference in network connections (netstat: $netstat_conns, ss: $ss_conns)" "Investigate hidden connections: 'netstat -tuln' vs 'ss -tuln'"
-        else
-            add_finding "Rootkit Detection" "OK" "Network connection counts consistent" ""
-        fi
-    fi
-    
-    # Check for suspicious file system inconsistencies
-    if is_root; then
-        ((total_checks++))
-        # Exclude legitimate system files and common benign hidden files
-        local fs_check=$(cached_command find /etc /bin /sbin -maxdepth 2 -type f -name ".*" 2>/dev/null | \
-            grep -v -E "\.(placeholder|bak|lock|updated|dpkg|apt|systemd|pam|profile|bashrc|vimrc|gitignore)$|skel|\.git" | \
-            grep -v -E "^/etc/\.(pwd\.lock|gshadow\.lock|shadow\.lock|passwd\.lock|group\.lock)$" | \
-            head -10 | tr '\n' ' ')
-        if [ -n "$fs_check" ]; then
-            ((rootkit_indicators++))
-            local hidden_count=$(echo "$fs_check" | wc -w)
-            add_finding "Rootkit Detection" "WARN" "Hidden files in system directories: $hidden_count files ($fs_check)" "Investigate hidden files: 'ls -la [file]' and 'file [file]'"
-            warn "Hidden files in system directories: $hidden_count files"
-        else
-            add_finding "Rootkit Detection" "OK" "No suspicious hidden files in system directories" ""
-            ok "No suspicious hidden files in system directories"
-        fi
-    fi
-    
-    # Check for suspicious system calls (improved detection)
-    if is_root && [ -f /proc/kallsyms ]; then
-        ((total_checks++))
-        # Look for actual hooking patterns, not just the presence of sys_call_table
-        local suspicious_hooks=$(cached_command grep -E "(sys_call_table.*\[|system_call.*\[)" /proc/kallsyms 2>/dev/null | \
-            grep -v -E "(sys_call_table|system_call)$" | \
-            grep -v -E "(sys_call_table|system_call).*0x[0-9a-f]+$" | \
-            wc -l)
-        
-        # Also check for unusual syscall modifications by looking for non-standard syscall entries
-        local unusual_syscalls=$(cached_command grep -E "sys_call_table" /proc/kallsyms 2>/dev/null | \
-            awk '{print $3}' | \
-            grep -v -E "^0x[0-9a-f]+$" | \
-            wc -l)
-        
-        if [ $suspicious_hooks -gt 0 ] || [ $unusual_syscalls -gt 0 ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "CRIT" "Suspicious system call modifications detected" "Investigate kernel hooks: 'cat /proc/kallsyms | grep sys_call' and 'dmesg | grep -i hook'"
-            crit "Suspicious system call modifications detected"
-        else
-            add_finding "Rootkit Detection" "OK" "No suspicious system call modifications detected" ""
-            ok "No suspicious system call modifications detected"
-        fi
-    fi
-    
-    # Check for suspicious memory regions (improved)
-    if is_root && [ -f /proc/iomem ]; then
-        ((total_checks++))
-        # Look for unusual memory patterns that might indicate rootkit activity
-        local suspicious_memory=$(cached_file_content /proc/iomem 2>/dev/null | \
-            grep -E "(reserved|unknown)" | \
-            grep -v -E "(ACPI|PCI|System RAM|Video RAM|ROM|Flash)" | \
-            head -5)
-        if [ -n "$suspicious_memory" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Suspicious memory regions: $suspicious_memory" "Investigate memory: 'cat /proc/iomem' and 'dmesg | grep -i memory'"
-            warn "Suspicious memory regions detected"
-        else
-            add_finding "Rootkit Detection" "OK" "Memory regions appear normal" ""
-            ok "Memory regions appear normal"
-        fi
-    fi
-    
-    # Cross-view analysis: Compare different methods of process enumeration
-    if command_exists ps && command_exists ls; then
-        ((total_checks++))
-        local ps_count=$(cached_command ps aux 2>/dev/null | wc -l)
-        local proc_count=$(cached_command ls /proc 2>/dev/null | grep -E '^[0-9]+$' | wc -l)
-        local diff=$((proc_count - ps_count))
-        
-        # Allow for some difference due to kernel threads, but flag significant discrepancies
-        if [ $diff -gt 10 ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Significant process count discrepancy: /proc shows $proc_count, ps shows $ps_count" "Investigate hidden processes: 'ls /proc | grep -E ^[0-9] | wc -l' vs 'ps aux | wc -l'"
-            warn "Significant process count discrepancy detected"
-        else
-            add_finding "Rootkit Detection" "OK" "Process enumeration consistent across methods" ""
-            ok "Process enumeration consistent across methods"
-        fi
-    fi
-    
-    # Check for suspicious file permissions and timestamps
-    if is_root; then
-        ((total_checks++))
-        local suspicious_files=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -perm -4000 2>/dev/null | \
-            xargs ls -la 2>/dev/null | \
-            awk '$6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {if ($6 != $7 || $7 != $8) print $9}' | \
-            head -5)
-        
-        if [ -n "$suspicious_files" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "SUID files with suspicious timestamps: $suspicious_files" "Investigate file timestamps: 'stat [file]' and 'ls -la [file]'"
-            warn "SUID files with suspicious timestamps detected"
-        else
-            add_finding "Rootkit Detection" "OK" "SUID file timestamps appear normal" ""
-            ok "SUID file timestamps appear normal"
-        fi
-    fi
-    
-    # Check for suspicious network behavior patterns
-    if command_exists netstat && command_exists ss; then
-        ((total_checks++))
-        # Look for processes listening on unusual ports
-        local unusual_ports=$(cached_command netstat -tuln 2>/dev/null | \
-            awk '$1 ~ /tcp/ && $4 ~ /:([0-9]{4,5})$/ {port=substr($4,index($4,":")+1); if(port > 1024 && port < 65536 && port !~ /^(8080|8443|3000|5000|8000|9000|3306|5432|6379|27017)$/) print port}' | \
-            head -5)
-        
-        if [ -n "$unusual_ports" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Processes listening on unusual ports: $unusual_ports" "Investigate ports: 'netstat -tuln | grep [port]' and 'lsof -i :[port]'"
-            warn "Processes listening on unusual ports detected"
-        else
-            add_finding "Rootkit Detection" "OK" "No unusual network ports detected" ""
-            ok "No unusual network ports detected"
-        fi
-    fi
-    
-	# Check for suspicious systemd services (skip on non-systemd like WSL)
-	if command_exists systemctl && [ -d /run/systemd/system ]; then
-        ((total_checks++))
-        local suspicious_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | grep -E "(\.service|\.timer)" | grep -v "systemd" | wc -l)
-        local total_services=$(cached_command systemctl list-units --type=service --state=running 2>/dev/null | wc -l)
-        
-        if [ $suspicious_services -gt $((total_services / 2)) ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Unusually high number of non-systemd services running" "Review services: 'systemctl list-units --type=service --state=running'"
-            warn "Unusually high number of non-systemd services running"
-        else
-            add_finding "Rootkit Detection" "OK" "Service count appears normal" ""
-            ok "Service count appears normal"
-        fi
-    fi
-    
-    # Check for suspicious kernel module behavior
-    if is_root && [ -f /proc/modules ]; then
-        ((total_checks++))
-        # Look for modules that might be hiding their presence
-        local loaded_modules=$(cached_file_content /proc/modules 2>/dev/null)
-        local suspicious_modules=$(echo "$loaded_modules" | \
-            awk '{if ($3 == "0" && $4 == "0" && $5 == "0") print $1}' | \
-            grep -v -E "(nvidia|nouveau|radeon|amdgpu|intel|wifi|bluetooth|usb|pci)" | \
-            head -5)
-        
-        if [ -n "$suspicious_modules" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Kernel modules with suspicious reference counts: $suspicious_modules" "Investigate modules: 'modinfo [module]' and 'lsmod | grep [module]'"
-            warn "Kernel modules with suspicious reference counts detected"
-        else
-            add_finding "Rootkit Detection" "OK" "Kernel module reference counts appear normal" ""
-            ok "Kernel module reference counts appear normal"
-        fi
-    fi
-    
-    # Check for suspicious file system inconsistencies using stat
-    if is_root; then
-        ((total_checks++))
-        # Check for files that might be hiding their true size or modification time
-        local suspicious_stat=$(cached_command find /bin /sbin /usr/bin /usr/sbin -type f -executable 2>/dev/null | \
-            head -20 | \
-            xargs stat -c "%n %s %Y" 2>/dev/null | \
-            awk '{if ($2 == 0 || $3 == 0) print $1}' | \
-            head -5)
-        
-        if [ -n "$suspicious_stat" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Executable files with suspicious stat information: $suspicious_stat" "Investigate files: 'stat [file]' and 'file [file]'"
-            warn "Executable files with suspicious stat information detected"
-        else
-            add_finding "Rootkit Detection" "OK" "File stat information appears normal" ""
-            ok "File stat information appears normal"
-        fi
-    fi
-    
-    # Check for suspicious process behavior patterns
-    if command_exists ps; then
-        ((total_checks++))
-        # Look for processes with unusual characteristics
-        local suspicious_procs=$(cached_command ps aux 2>/dev/null | \
-            awk 'NR>1 {if ($3 > 50 || $4 > 50 || $6 > 1000000) print $2 ":" $11}' | \
-            grep -v -E "(systemd|kthreadd|ksoftirqd|migration|rcu_|watchdog)" | \
-            head -5)
-        
-        if [ -n "$suspicious_procs" ]; then
-            ((rootkit_indicators++))
-            add_finding "Rootkit Detection" "WARN" "Processes with unusual resource usage: $suspicious_procs" "Investigate processes: 'ps aux | grep [PID]' and 'top -p [PID]'"
-            warn "Processes with unusual resource usage detected"
-        else
-            add_finding "Rootkit Detection" "OK" "Process resource usage appears normal" ""
-            ok "Process resource usage appears normal"
-        fi
-    fi
-    
-    # Summary
-    local risk_level="LOW"
-    if [ $rootkit_indicators -gt 3 ]; then
-        risk_level="HIGH"
-    elif [ $rootkit_indicators -gt 1 ]; then
-        risk_level="MEDIUM"
-    fi
-    
-    add_finding "Rootkit Detection" "INFO" "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)" "Consider running dedicated rootkit scanners: 'rkhunter --check' or 'chkrootkit'"
-    info "Rootkit detection completed: $rootkit_indicators/$total_checks indicators found (Risk: $risk_level)"
-}
-
-# Behavioral analysis for anomaly detection
-section_behavioral_analysis() {
-    print_section "Behavioral Analysis"
-    
-    local anomalies=0
-    local total_checks=0
-    
-    # Disable strict error handling for this function to prevent silent failures
-    set +e
-    
-    # Process behavior analysis
-    if command_exists ps; then
-        ((total_checks++))
-        local process_count=$(ps aux 2>/dev/null | wc -l)
-        local zombie_count=$(ps aux 2>/dev/null | grep -c "<defunct>" 2>/dev/null || echo 0)
-        
-        if [ $process_count -gt 0 ]; then
-            local zombie_percentage=$((zombie_count * 100 / process_count))
-            if [ $zombie_percentage -gt 10 ]; then
-                ((anomalies++))
-                add_finding "Behavioral Analysis" "WARN" "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)" "Investigate zombie processes"
-                warn "High zombie process count: $zombie_count/$process_count ($zombie_percentage%)"
-            else
-                add_finding "Behavioral Analysis" "OK" "Zombie process count normal: $zombie_count/$process_count" ""
-                ok "Zombie process count normal: $zombie_count/$process_count"
-            fi
-        else
-            add_finding "Behavioral Analysis" "WARN" "Could not determine process count" "Check ps command"
-        fi
-    else
-        add_finding "Behavioral Analysis" "WARN" "ps command not available" "Install procps package"
-    fi
-    
-    # Network behavior analysis
-    if command_exists netstat; then
-        ((total_checks++))
-        local listening_ports=$(netstat -tuln 2>/dev/null | grep LISTEN | wc -l)
-        local established_conns=$(netstat -tuln 2>/dev/null | grep ESTABLISHED | wc -l)
-        
-        if [ $established_conns -gt 100 ]; then
-            ((anomalies++))
-            add_finding "Behavioral Analysis" "WARN" "High number of established connections: $established_conns" "Review connections"
-            warn "High number of established connections: $established_conns"
-        else
-            add_finding "Behavioral Analysis" "OK" "Connection count appears normal: $established_conns" ""
-            ok "Connection count appears normal: $established_conns"
-        fi
-    else
-        add_finding "Behavioral Analysis" "WARN" "netstat command not available" "Install net-tools package"
-    fi
-    
-    # File system behavior analysis
-    if is_root; then
-        ((total_checks++))
-        local temp_files=$(find /tmp /var/tmp /dev/shm -maxdepth 3 -type f 2>/dev/null | wc -l)
-        
-        if [ $temp_files -gt 1000 ]; then
-            ((anomalies++))
-            add_finding "Behavioral Analysis" "WARN" "High number of temporary files: $temp_files" "Review temp directory"
-            warn "High number of temporary files: $temp_files"
-        else
-            add_finding "Behavioral Analysis" "OK" "Temporary file count normal: $temp_files" ""
-            ok "Temporary file count normal: $temp_files"
-        fi
-    fi
-    
-    # System resource behavior analysis
-    if command_exists uptime && command_exists free; then
-        ((total_checks++))
-        local load_avg=$(uptime 2>/dev/null | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
-        local mem_usage=$(free 2>/dev/null | awk '/^Mem:/ {if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
-        
-        if [ -n "$load_avg" ] && [ $(echo "$load_avg" | awk '{print ($1 > 2.0)}' 2>/dev/null || echo 0) -eq 1 ]; then
-            ((anomalies++))
-            add_finding "Behavioral Analysis" "WARN" "High system load: $load_avg" "Investigate load"
-            warn "High system load: $load_avg"
-        else
-            add_finding "Behavioral Analysis" "OK" "System load normal: $load_avg" ""
-            ok "System load normal: $load_avg"
-        fi
-        
-        if [ -n "$mem_usage" ] && [ $mem_usage -gt 90 ]; then
-            ((anomalies++))
-            add_finding "Behavioral Analysis" "WARN" "High memory usage: ${mem_usage}%" "Investigate memory"
-            warn "High memory usage: ${mem_usage}%"
-        else
-            add_finding "Behavioral Analysis" "OK" "Memory usage normal: ${mem_usage}%" ""
-            ok "Memory usage normal: ${mem_usage}%"
-        fi
-    fi
-    
-    # Log behavior analysis
-    if is_root && [ -f /var/log/auth.log ]; then
-        ((total_checks++))
-        # SECURITY FIX: Use safe_log_grep with size limits instead of direct grep
-        local failed_logins=$(safe_log_grep /var/log/auth.log "Failed password" 100 1000 | wc -l)
-        
-        if [ $failed_logins -gt 50 ]; then
-            ((anomalies++))
-            add_finding "Behavioral Analysis" "WARN" "High failed login activity: $failed_logins attempts" "Review auth logs"
-            warn "High failed login activity: $failed_logins attempts"
-        else
-            add_finding "Behavioral Analysis" "OK" "Login activity appears normal: $failed_logins failed attempts" ""
-            ok "Login activity appears normal: $failed_logins failed attempts"
-        fi
-    fi
-    
-    # Summary
-    local risk_level="LOW"
-    if [ $anomalies -gt 4 ]; then
-        risk_level="HIGH"
-    elif [ $anomalies -gt 2 ]; then
-        risk_level="MEDIUM"
-    fi
-    
-    # Ensure we always have at least one check
-    if [ $total_checks -eq 0 ]; then
-        total_checks=1
-        add_finding "Behavioral Analysis" "WARN" "No behavioral checks could be performed" "Check system tools availability"
-    fi
-    
-    add_finding "Behavioral Analysis" "INFO" "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)" "Monitor system behavior over time and investigate flagged anomalies"
-    info "Behavioral analysis completed: $anomalies/$total_checks anomalies detected (Risk: $risk_level)"
-    
-    # Re-enable strict error handling
-    set -e
-}
 
 # Initialize advanced security features
 # Verify script integrity
@@ -5255,7 +6674,9 @@ if [ "$PARALLEL_MODE" = true ]; then
     run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
     run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
     run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
-    run_section_safely section_scheduler_controls "Scheduler Controls (cron/anacron/at)"
+    # NOTE: Scheduler controls (cron/anacron/at) are covered in:
+    # - section_persistence_mechanisms (crontabs, systemd timers)
+    # - section_taskrunners_nfs (cron security analysis)
 
     # Keep only advanced detection in parallel for speed without destabilizing output
     run_section_parallel section_malware_detection "Malware Detection"
@@ -5297,7 +6718,9 @@ else
     run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
     run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
     run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
-    run_section_safely section_scheduler_controls "Scheduler Controls (cron/anacron/at)"
+    # NOTE: Scheduler controls (cron/anacron/at) are covered in:
+    # - section_persistence_mechanisms (crontabs, systemd timers)
+    # - section_taskrunners_nfs (cron security analysis)
     run_section_safely section_malware_detection "Malware Detection"
     run_section_safely section_rootkit_detection "Rootkit Detection"
     run_section_safely section_behavioral_analysis "Behavioral Analysis"
@@ -5307,8 +6730,8 @@ fi
 run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
 run_section_safely section_enhanced_network_security "Enhanced Network Security"
 run_section_safely section_compliance_checks "Compliance & Audit"
-run_section_safely section_enhanced_container_security "Enhanced Container Security"
-run_section_safely section_enhanced_file_integrity "Enhanced File Integrity"
+# NOTE: section_enhanced_container_security consolidated into section_container_security
+# NOTE: section_enhanced_file_integrity consolidated into section_file_integrity
 run_section_safely section_enhanced_process_security "Enhanced Process Security"
 run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
 run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
