@@ -6666,19 +6666,32 @@ if [ "$PARALLEL_MODE" = true ]; then
     run_section_safely section_kernel_hardening "Kernel & System Hardening"
     run_section_safely section_application_security "Application-Level Protections"
     run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
-    run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
-    run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
-    run_section_safely section_backup_resilience "Resilience & Backup"
+    
+    # Production-only sections (compliance, enterprise monitoring, centralized logging)
+    if [ "$OPERATION_MODE" = "production" ]; then
+        run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
+        run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
+        run_section_safely section_backup_resilience "Resilience & Backup"
+        run_section_safely section_compliance_checks "Compliance & Audit"
+        run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
+        run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
+    fi
+    
+    # Privilege escalation and hardening checks (both modes)
     run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
     run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
     run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
     run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
     run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
+    run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
+    run_section_safely section_enhanced_network_security "Enhanced Network Security"
+    run_section_safely section_enhanced_process_security "Enhanced Process Security"
+    
     # NOTE: Scheduler controls (cron/anacron/at) are covered in:
     # - section_persistence_mechanisms (crontabs, systemd timers)
     # - section_taskrunners_nfs (cron security analysis)
-
-    # Keep only advanced detection in parallel for speed without destabilizing output
+    
+    # Advanced detection in parallel for speed without destabilizing output
     run_section_parallel section_malware_detection "Malware Detection"
     run_section_parallel section_rootkit_detection "Rootkit Detection"
     run_section_parallel section_behavioral_analysis "Behavioral Analysis"
@@ -6710,39 +6723,42 @@ else
     run_section_safely section_kernel_hardening "Kernel & System Hardening"
     run_section_safely section_application_security "Application-Level Protections"
     run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
-    run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
-    run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
-    run_section_safely section_backup_resilience "Resilience & Backup"
+    
+    # Production-only sections (compliance, enterprise monitoring, centralized logging)
+    if [ "$OPERATION_MODE" = "production" ]; then
+        run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
+        run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
+        run_section_safely section_backup_resilience "Resilience & Backup"
+        run_section_safely section_compliance_checks "Compliance & Audit"
+        run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
+        run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
+    fi
+    
+    # Privilege escalation and hardening checks (both modes)
     run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
     run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
     run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
     run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
     run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
+    run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
+    run_section_safely section_enhanced_network_security "Enhanced Network Security"
+    run_section_safely section_enhanced_process_security "Enhanced Process Security"
+    
     # NOTE: Scheduler controls (cron/anacron/at) are covered in:
     # - section_persistence_mechanisms (crontabs, systemd timers)
     # - section_taskrunners_nfs (cron security analysis)
+    
+    # Advanced detection (sequential)
     run_section_safely section_malware_detection "Malware Detection"
     run_section_safely section_rootkit_detection "Rootkit Detection"
     run_section_safely section_behavioral_analysis "Behavioral Analysis"
 fi
 
-# Enhanced security checks (new in v0.6.0)
-run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
-run_section_safely section_enhanced_network_security "Enhanced Network Security"
-run_section_safely section_compliance_checks "Compliance & Audit"
-# NOTE: section_enhanced_container_security consolidated into section_container_security
-# NOTE: section_enhanced_file_integrity consolidated into section_file_integrity
-run_section_safely section_enhanced_process_security "Enhanced Process Security"
-run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
-run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
-
-# Note: Malware detection, rootkit detection, and behavioral analysis are now included
-# in the parallel execution groups above for better performance
-
+# Always run privilege summary and overall summary
 run_section_safely section_privilege_summary "Privilege Limitations Summary"
 run_section_safely section_summary "Summary"
 
-# Production-only: Resource Health
+# Production-only: Resource Health monitoring
 if [ "$OPERATION_MODE" = "production" ]; then
     run_section_safely section_resource_health "Resource Health"
 fi
