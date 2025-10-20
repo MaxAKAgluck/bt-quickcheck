@@ -266,20 +266,36 @@ sudo ./bt-quickcheck.sh -m production
 - Additional checks enabled (see below)
 - Compliance and centralization focus
 
-### Mode Differences (high-level)
-- Firewall: production requires host firewall tooling/rules (WARN/CRIT if missing); personal suggests
-- Logging: production expects remote forwarding to a central collector; personal optional
-- Time sync: production discourages minimal timesyncd, prefers chrony/ntp with multiple sources
-- File integrity: production checks for AIDE/Tripwire and recommends automated monitoring
-- EDR: production may flag missing EDR as CRIT and expects SIEM/forwarding
-- Resource health (production-only): CPU/memory/disk space checks
+### Mode Differences
+
+**Personal Mode** (34 sections):
+- Home/personal machine focus with user-friendly guidance
+- Skips enterprise-focused compliance and monitoring checks
+- Security-through-obscurity suggestions acceptable
+- Runs core security, hardening, and detection sections
+
+**Production Mode** (41 sections):
+- All personal mode sections PLUS 7 additional enterprise sections:
+  1. Cloud & Remote Management (AWS, Azure, GCP agents)
+  2. Endpoint Detection & Monitoring (EDR/AV expectations, SIEM forwarding)
+  3. Resilience & Backup (backup tools, disaster recovery)
+  4. Compliance & Audit (password policy, lockout policy, audit rules)
+  5. Enhanced Logging Security (centralized logging, log tampering)
+  6. Enhanced Network Access Controls (firewall policies, egress filtering)
+  7. Resource Health (CPU/memory/disk monitoring)
+
+**Severity & Recommendation Differences:**
+- Firewall: production flags missing firewall as CRIT; personal as INFO
+- Logging: production requires remote forwarding (WARN); personal optional (INFO)
+- Time sync: production discourages systemd-timesyncd (WARN); personal accepts it (OK)
+- EDR: production flags missing EDR as CRIT; personal skips this check entirely
 
 
 ## Security Assessment Categories
 
-bt-quickcheck performs comprehensive security assessments across **41 sections** covering all aspects of Linux security:
+bt-quickcheck performs comprehensive security assessments across **41 sections** (34 in personal mode, 41 in production mode):
 
-### Core System Security (26 sections)
+### Core System Security (21 sections - both modes)
 1. **System Information**: Distribution, kernel version (with EOL detection), uptime, virtualization, crash analysis
 2. **Updates & Patching**: Pending updates, automatic updates status, last update time tracking
 3. **Listening Services**: Open ports, insecure service detection (telnet, FTP, rsh), exposed databases
@@ -288,41 +304,43 @@ bt-quickcheck performs comprehensive security assessments across **41 sections**
 6. **Auditing**: auditd status, log immutability, audit rules count, SELinux/AppArmor
 7. **User Accounts**: UID 0 validation, inactive accounts (>90 days), sudo timeout, passwordless accounts
 8. **Permissions**: World-writable files, SUID binaries, unowned files, sensitive file permissions
-9. **Intrusion Detection**: fail2ban status, FIM tools (AIDE, Tripwire, OSSEC, Wazuh), ban statistics
-10. **Time Synchronization**: chrony/NTP status, time drift detection, NTP authentication
-11. **Logging**: Service status, remote logging configuration, log file health and permissions
-12. **Network Security**: Promiscuous mode detection, risky port analysis, network hardening
-13. **Package Integrity**: RPM/DEB verification, orphaned packages, GPG signature verification
-14. **File Integrity**: AIDE/Tripwire detection, immutable attributes (chattr +i), suspicious binary modifications
-15. **Persistence Mechanisms**: Cron jobs, systemd timers/services, rc.local, shell configs, bootloader tampering
+9. **Package Integrity**: RPM/DEB verification, orphaned packages, GPG signature verification
+10. **File Integrity**: AIDE/Tripwire detection, immutable attributes (chattr +i), suspicious binary modifications
+11. **Persistence Mechanisms**: Cron jobs, systemd timers/services, rc.local, shell configs, bootloader tampering
+12. **Intrusion Detection**: fail2ban status, FIM tools (AIDE, Tripwire, OSSEC, Wazuh), ban statistics
+13. **Time Synchronization**: chrony/NTP status, time drift detection, NTP authentication
+14. **Logging**: Service status, remote logging configuration, log file health and permissions
+15. **Network Security**: Promiscuous mode detection, risky port analysis, network hardening
 16. **Process Forensics**: Process tree analysis, network connections, temp directory execution, capabilities
 17. **Secure Configuration**: Core dumps, umask settings, 2FA detection
 18. **Container Security**: Docker/Podman/LXC/Kubernetes, privileged containers, image scanners, Content Trust
 19. **Kernel Hardening**: Secure Boot, lockdown mode, module signing, sysctl hardening (dmesg_restrict, kptr_restrict)
 20. **Application Security**: Web server TLS, database binding validation, SSL/TLS enforcement
 21. **Secrets & Sensitive Data**: AWS/SSH/Kubernetes credentials, .env files, SSH/GPG agent detection
-22. **Cloud & Remote Management**: Cloud agents (AWS, Azure, GCP), VNC/RDP/TeamViewer detection
-23. **EDR/Monitoring**: Antivirus/EDR detection, SIEM forwarding agents, log analysis tools
-24. **Backup & Resilience**: Backup tools, snapshot capabilities (BTRFS, ZFS, LVM), disaster recovery
-25. **Privilege Summary**: Detailed report of checks skipped without sudo
-26. **Summary**: Comprehensive findings report with severity counts
 
-### Advanced Detection & Hardening (15 sections)
-27. **Privilege Escalation (Core)**: SUID analysis, sudo vulnerabilities (CVE-2023-22809, Baron Samedit), PolKit/PwnKit, Docker socket, dangerous capabilities
-28. **Privilege Escalation (Extended)**: LD_LOADER paths, PAM backdoors, systemd timer hijacking, Python library path hijacking
-29. **Task Runners & NFS**: Cron security, anacron/at, NFS exports, Docker socket duplicate removal
-30. **Container, SSH & Secrets Hygiene**: Home directory SSH keys, Docker credentials, known_hosts, authorized_keys
-31. **Kernel, Polkit & Filesystem**: ptrace_scope, dmesg_restrict, tmpfs exec permissions, protected hardlinks/symlinks
-32. **Enhanced Kernel Security**: Kernel version CVE checks, EOL kernel detection, lockdown mode validation
-33. **Enhanced Network Security**: IP forwarding, TCP SYN cookies, ICMP redirects, source routing
-34. **Compliance & Audit**: Password policy (PASS_MAX_DAYS), account lockout (pam_faillock, fail2ban), auditd rules
-35. **Enhanced Process Security**: Process namespaces, memory protection, ASLR, RWX memory regions
-36. **Enhanced Logging Security**: Service status, logrotate, remote forwarding, log tampering detection, journal persistence
-37. **Enhanced Network Access**: TCP wrappers, iptables rate limiting, default firewall policies, egress filtering
-38. **Malware Detection**: Suspicious files/processes/network, crypto-jacking (xmrig, minerd), LD_PRELOAD persistence
-39. **Rootkit Detection**: Hidden processes, kernel modules, modified binaries, /dev/tcp backdoors, ls/find discrepancies
-40. **Behavioral Analysis**: Zombie processes, time-based anomalies (off-hours activity), sudo usage spikes
-41. **Resource Health** (production only): CPU load, memory usage, disk space monitoring
+### Advanced Detection & Hardening (13 sections - both modes)
+22. **Privilege Escalation (Core)**: SUID analysis, sudo vulnerabilities (CVE-2023-22809, Baron Samedit), PolKit/PwnKit, Docker socket, dangerous capabilities
+23. **Privilege Escalation (Extended)**: LD_LOADER paths, PAM backdoors, systemd timer hijacking, Python library path hijacking
+24. **Task Runners & NFS**: Cron security, anacron/at, NFS exports, Docker socket duplicate removal
+25. **Container, SSH & Secrets Hygiene**: Home directory SSH keys, Docker credentials, known_hosts, authorized_keys
+26. **Kernel, Polkit & Filesystem**: ptrace_scope, dmesg_restrict, tmpfs exec permissions, protected hardlinks/symlinks
+27. **Enhanced Kernel Security**: Kernel version CVE checks, EOL kernel detection, lockdown mode validation
+28. **Enhanced Network Security**: IP forwarding, TCP SYN cookies, ICMP redirects, source routing
+29. **Enhanced Process Security**: Process namespaces, memory protection, ASLR, RWX memory regions
+30. **Malware Detection**: Suspicious files/processes/network, crypto-jacking (xmrig, minerd), LD_PRELOAD persistence
+31. **Rootkit Detection**: Hidden processes, kernel modules, modified binaries, /dev/tcp backdoors, ls/find discrepancies
+32. **Behavioral Analysis**: Zombie processes, time-based anomalies (off-hours activity), sudo usage spikes
+33. **Privilege Summary**: Detailed report of checks skipped without sudo
+34. **Summary**: Comprehensive findings report with severity counts
+
+### Enterprise & Compliance (7 sections - production mode only)
+35. **Cloud & Remote Management**: Cloud agents (AWS, Azure, GCP), VNC/RDP/TeamViewer detection
+36. **Endpoint Detection & Monitoring**: Antivirus/EDR detection, SIEM forwarding agents, log analysis tools
+37. **Resilience & Backup**: Backup tools, snapshot capabilities (BTRFS, ZFS, LVM), disaster recovery
+38. **Compliance & Audit**: Password policy (PASS_MAX_DAYS), account lockout (pam_faillock, fail2ban), auditd rules
+39. **Enhanced Logging Security**: Service status, logrotate, remote forwarding, log tampering detection, journal persistence
+40. **Enhanced Network Access Controls**: TCP wrappers, iptables rate limiting, default firewall policies, egress filtering
+41. **Resource Health**: CPU load, memory usage, disk space monitoring
 
 ### Recent Enhancements (v0.6.3)
 - **52 new security checks** added across all sections
