@@ -353,6 +353,9 @@ bt-quickcheck performs comprehensive security assessments across **41 sections**
 - **GPG verification**: Package repository signature validation
 - **Inactive accounts**: User accounts not logged in for >90 days
 - **Sudo timeout**: Session timeout configuration validation
+- **Command failure telemetry**: Non-zero exit codes now generate WARN findings with sanitized stderr details
+- **Audit hygiene**: Command arguments are scrubbed before logging and temporary assessment logs are removed automatically
+- **Consistent version messaging**: Help, banners, and reports now reflect the same release identifier
 
 Each finding includes:
 - **Severity level**: OK, WARN, CRIT, INFO
@@ -437,6 +440,7 @@ v0.6.3 (Latest - Security Hardened & Enhanced)
 - **Code Quality**: 10 duplicate checks removed, proper cross-referencing between sections
 - **Bug Fixes**: Sudo version detection (Baron Samedit false positives), systemd timer symlink handling, missing function call removed
 - **All Variables**: Properly quoted and sanitized for `set -u` strict mode
+- **Audit & Logging Hygiene**: Command stderr captured and surfaced as WARN findings, audit arguments sanitized, temporary log files auto-removed, and version strings unified across outputs
 
 v0.6.2
 - **Performance**: Parallel execution with `-p` flag for 30-50% faster scanning
@@ -628,6 +632,11 @@ sudo ./bt-quickcheck.sh
 - Audit log immutability (chattr +i/+a)
 - Inactive account detection (>90 days since last login)
 - Sudo session timeout verification
+
+**Logging & Audit Hygiene**:
+- Command stderr captured and surfaced as WARN findings when checks fail
+- Audit trail entries sanitize command arguments and automatically purge temporary assessment logs
+- Version banners, help text, and reports now stay in sync for clearer operational context
 
 **File & Process Security**:
 - Immutable file attributes (chattr +i)
