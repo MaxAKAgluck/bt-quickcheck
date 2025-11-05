@@ -64,23 +64,31 @@ LOG_LEVEL=${BTQC_LOG_LEVEL:-$LOG_INFO}
 # SECURITY FIX: Create secure temporary log file with mktemp (prevents race conditions)
 # Log file (can be overridden by environment variable)
 # Use parameter expansion to safely check if BTQC_LOG_FILE is set (works with set -u)
+LOG_FILE_IS_TEMP=false
 if [ -z "${BTQC_LOG_FILE:-}" ]; then
     # Use mktemp for secure temporary file creation with random suffix
     LOG_FILE=$(mktemp /tmp/bt-quickcheck.XXXXXXXXXX.log 2>/dev/null)
+    LOG_FILE_IS_TEMP=true
     # Fallback if mktemp fails
     if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
         LOG_FILE=$(mktemp -t bt-quickcheck.XXXXXXXXXX 2>/dev/null)
+        [ -n "$LOG_FILE" ] && LOG_FILE_IS_TEMP=true
     fi
     # Final fallback - but prefer to fail if we can't create secure temp file
     if [ -z "$LOG_FILE" ]; then
         LOG_FILE="/tmp/bt-quickcheck-$$.log"
         echo "Warning: Could not create secure temp file, using fallback: $LOG_FILE" >&2
+        LOG_FILE_IS_TEMP=true
     fi
 else
     LOG_FILE="${BTQC_LOG_FILE}"
+    LOG_FILE_IS_TEMP=false
 fi
 # Ensure log file has secure permissions
 chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+# Ensure cleanup runs even on early exit
+trap 'cleanup_and_exit $?' EXIT
 
 # Structured logging function
 log() {
@@ -107,6 +115,49 @@ log() {
     if [ "$level" -le $LOG_WARN ] && [ "$OUTPUT_FORMAT" = "console" ]; then
         echo "[$level_name] $message" >&2
     fi
+}
+
+# Sanitize strings destined for logs/audit trails (limit length and printable chars)
+sanitize_for_log() {
+    local input="${1:-}"
+    printf '%s' "$input" | tr -cd '[:print:]\n' | sed 's/[`$\\]/ /g' | head -c 400
+}
+
+# Centralized cleanup that also scrubs temporary artifacts
+cleanup_and_exit() {
+    local exit_code="${1:-0}"
+    local log_available=false
+
+    if declare -F log >/dev/null 2>&1 && [ "${LOG_FILE_IS_TEMP:-false}" != true ]; then
+        log_available=true
+        log "$LOG_INFO" "Blue Team QuickCheck completed with exit code: $exit_code"
+        if declare -p FINDINGS >/dev/null 2>&1; then
+            log "$LOG_INFO" "Total findings generated: ${#FINDINGS[@]}"
+        else
+            log "$LOG_INFO" "Total findings generated: 0"
+        fi
+    fi
+
+    if declare -F cleanup_cache >/dev/null 2>&1; then
+        cleanup_cache
+    fi
+
+    if [ -n "${PARALLEL_TMP_DIR:-}" ] && [ -d "$PARALLEL_TMP_DIR" ]; then
+        rm -rf "$PARALLEL_TMP_DIR" 2>/dev/null || true
+    fi
+
+    if [ "${LOG_FILE_IS_TEMP:-false}" = true ] && [ -n "${LOG_FILE:-}" ]; then
+        rm -f "$LOG_FILE" 2>/dev/null || true
+    fi
+
+    if command -v ps >/dev/null 2>&1 && [ "$log_available" = true ]; then
+        local mem_usage
+        mem_usage=$(ps -o pid,vsz,rss,comm -p $$ 2>/dev/null | tail -1 | awk '{print $3}')
+        [ -n "$mem_usage" ] && log "$LOG_DEBUG" "Final memory usage: ${mem_usage}KB"
+    fi
+
+    trap - EXIT
+    exit "$exit_code"
 }
 
 # Embedded default configuration (can be overridden by environment variables)
@@ -497,11 +548,47 @@ safe_exec_enhanced() {
         return 1
     fi
     
-    # Log command execution for audit
-    audit_log "COMMAND_EXECUTED" "Command: $abs_cmd_path, Args: $*" "INFO"
+    # Log command execution for audit with sanitized arguments
+    local sanitized_args="[none]"
+    if [ "$#" -gt 0 ]; then
+        sanitized_args=$(sanitize_for_log "$*")
+        [ -z "$sanitized_args" ] && sanitized_args="[redacted]"
+    fi
+    audit_log "COMMAND_EXECUTED" "Command: $abs_cmd_path, Args: $sanitized_args" "INFO"
     
-    # Execute with absolute path for additional safety
-    "$abs_cmd_path" "$@" 2>/dev/null || true
+    # Capture stderr while preserving stdout for callers
+    local stderr_tmp
+    stderr_tmp=$(mktemp -t btqc-cmd-stderr.XXXXXXXX 2>/dev/null)
+    if [ -z "$stderr_tmp" ]; then
+        local stderr_fallback_root="${PARALLEL_TMP_DIR:-/tmp}"
+        stderr_tmp="$stderr_fallback_root/btqc-cmd-stderr-$$-$RANDOM"
+    fi
+
+    local stdout_output
+    stdout_output=$("$abs_cmd_path" "$@" 2>"$stderr_tmp")
+    local exit_code=$?
+    local stderr_content=""
+    if [ -s "$stderr_tmp" ]; then
+        stderr_content=$(cat "$stderr_tmp" 2>/dev/null || echo "")
+    fi
+    rm -f "$stderr_tmp" 2>/dev/null || true
+
+    if [ $exit_code -ne 0 ]; then
+        local sanitized_err="$(sanitize_for_log "$stderr_content")"
+        local failure_msg="Command '${abs_cmd_path##*/}' failed (exit $exit_code)"
+        [ -n "$sanitized_err" ] && failure_msg="$failure_msg: $sanitized_err"
+        log "$LOG_WARN" "$failure_msg"
+        add_finding "Command Execution" "WARN" "$failure_msg" "Verify command availability and permissions"
+        return $exit_code
+    fi
+
+    if [ -n "$stderr_content" ]; then
+        local sanitized_stderr="$(sanitize_for_log "$stderr_content")"
+        [ -n "$sanitized_stderr" ] && log "$LOG_DEBUG" "Command '${abs_cmd_path##*/}' stderr: $sanitized_stderr"
+    fi
+
+    printf '%s' "$stdout_output"
+    return 0
 }
 
 # Lightweight spinner for quiet mode
@@ -1281,8 +1368,9 @@ init_cache() {
 }
 
 cleanup_cache() {
-    if [ -d "$CACHE_DIR" ]; then
-        rm -rf "$CACHE_DIR" 2>/dev/null || true
+    local cache_dir="${CACHE_DIR:-}"
+    if [ -n "$cache_dir" ] && [ -d "$cache_dir" ]; then
+        rm -rf "$cache_dir" 2>/dev/null || true
     fi
 }
 
@@ -6316,7 +6404,7 @@ This tool performs READ-ONLY security assessment of Linux systems.
 It requires sudo privileges to access system files but makes NO modifications.
 All operations are defensive security checks - no malicious activity performed.
 
-ENHANCED SECURITY FEATURES (v0.6.2):
+ENHANCED SECURITY FEATURES (v$VERSION):
 • Enhanced input validation and command sanitization
 • Advanced kernel and network security hardening checks
 • Comprehensive compliance and audit validation
@@ -6816,30 +6904,6 @@ if [ "$EUID" -eq 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
     drop_privileges
 fi
 
-# Final cleanup and logging
-cleanup_and_exit() {
-    local exit_code="${1:-0}"
-    
-    log "$LOG_INFO" "Blue Team QuickCheck completed with exit code: $exit_code"
-    log "$LOG_INFO" "Total findings generated: ${#FINDINGS[@]}"
-    
-    # Cleanup temporary directories
-    cleanup_cache
-    [ -d "$PARALLEL_TMP_DIR" ] && rm -rf "$PARALLEL_TMP_DIR" 2>/dev/null || true
-    
-    # Log final resource usage if available
-    if command -v ps >/dev/null 2>&1; then
-        local mem_usage
-        mem_usage=$(ps -o pid,vsz,rss,comm -p $$ 2>/dev/null | tail -1 | awk '{print $3}')
-        log "$LOG_DEBUG" "Final memory usage: ${mem_usage}KB"
-    fi
-    
-    exit "$exit_code"
-}
-
-# Set up cleanup trap
-trap 'cleanup_and_exit $?' EXIT
-
 # Production-only resource health checks (function defined near end for structure)
 section_resource_health() {
     print_section "Resource Health"
@@ -6867,7 +6931,7 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo "✅ Security assessment completed successfully"
 	echo "📋 Review CRITICAL and WARNING findings above for security improvements"
-	echo "🔒 Enhanced security checks completed (v0.6.2)"
+    echo "🔒 Enhanced security checks completed (v$VERSION)"
 	echo "   • Advanced kernel and network hardening validation"
 	echo "   • Comprehensive compliance and audit assessment"
 	echo "   • Enhanced container and process security analysis"
