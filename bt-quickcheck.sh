@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 # Blue Team QuickCheck - Linux Security Assessment Tool
-# Version: 0.6.3
+# Version: 0.8.0
 # 
 # Ensure we're running under bash (re-exec if invoked with sh)
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -40,16 +40,6 @@ unset BASH_ENV
 if command -v compgen >/dev/null 2>&1; then
     while read -r fn; do export -n "$fn" 2>/dev/null || true; done < <(compgen -A function 2>/dev/null || echo)
 fi
-
-# Advanced Security Features - Authentication & Authorization
-# Permission levels for different operations
-declare -A PERMISSION_LEVELS=(
-    ["basic"]="1"
-    ["standard"]="2" 
-    ["elevated"]="3"
-    ["administrative"]="4"
-    ["audit"]="5"
-)
 
 # Structured Logging System
 # Log levels (higher number = more verbose)
@@ -185,6 +175,7 @@ init_embedded_config() {
     : "${BTQC_OPERATION_MODE:=personal}"
     : "${BTQC_EXCLUDE_SECTIONS:=""}"
     : "${BTQC_EXCLUDE_SEVERITY:=""}"
+    : "${BTQC_OFFLINE:=false}"
     : "${BTQC_MAX_FINDINGS:=1000}"
     : "${BTQC_SECTION_TIMEOUT:=30}"
     : "${BTQC_PARALLEL_WORKERS:=4}"
@@ -196,7 +187,7 @@ init_embedded_config() {
     export BTQC_PRIVACY_LEVEL BTQC_ANONYMIZE BTQC_AUDIT_ENABLED BTQC_AUDIT_LOG
     export BTQC_OUTPUT_FORMAT BTQC_QUIET_MODE BTQC_PARALLEL_MODE
     export BTQC_OPERATION_MODE BTQC_EXCLUDE_SECTIONS BTQC_EXCLUDE_SEVERITY
-    export BTQC_MAX_FINDINGS BTQC_SECTION_TIMEOUT BTQC_PARALLEL_WORKERS
+    export BTQC_MAX_FINDINGS BTQC_SECTION_TIMEOUT BTQC_PARALLEL_WORKERS BTQC_OFFLINE
 }
 
 # Optional: Load configuration from external file (SECURE VERSION)
@@ -243,45 +234,10 @@ CURRENT_PERMISSION_LEVEL="basic"
 AUDIT_LOG="/var/log/bt-quickcheck-audit.log"
 AUDIT_ENABLED=false
 
-# Script integrity verification
-verify_script_integrity() {
-    local script_path="$0"
-    local expected_hash=""
-    local actual_hash=""
-    
-    # Calculate script hash (excluding signature block)
-    if command_exists sha256sum; then
-        actual_hash=$(head -n -10 "$script_path" | sha256sum | cut -d' ' -f1)
-    elif command_exists shasum; then
-        actual_hash=$(head -n -10 "$script_path" | shasum -a 256 | cut -d' ' -f1)
-    else
-        # Fallback to basic checksum
-        actual_hash=$(head -n -10 "$script_path" | wc -c)
-    fi
-    
-    # For now, we'll use a simple integrity check
-    # In production, this would verify against a known good hash or digital signature
-    if [ ${#actual_hash} -lt 8 ]; then
-        echo "Warning: Script integrity verification failed - hash too short" >&2
-        return 1
-    fi
-    
-    return 0
-}
+# Current user privilege context (informational: shown in JSON/HTML/TXT headers)
+CURRENT_PERMISSION_LEVEL="basic"
 
-# Permission level checking
-check_permission_level() {
-    local required_level="$1"
-    local current_level="${PERMISSION_LEVELS[$CURRENT_PERMISSION_LEVEL]:-1}"
-    local required_level_num="${PERMISSION_LEVELS[$required_level]:-1}"
-    
-    if [ "$current_level" -lt "$required_level_num" ]; then
-        return 1
-    fi
-    return 0
-}
-
-# Set permission level based on user context
+# Derive privilege context from user identity
 set_permission_level() {
     if is_root; then
         CURRENT_PERMISSION_LEVEL="administrative"
@@ -322,47 +278,6 @@ audit_log() {
     fi
 }
 
-# Role-based access control
-check_access_control() {
-    local operation="$1"
-    local resource="$2"
-    local user=$(whoami 2>/dev/null || echo "unknown")
-    
-    # Define access control matrix
-    case "$operation" in
-        "read_system_files")
-            if ! check_permission_level "standard"; then
-                audit_log "ACCESS_DENIED" "Attempted to read system files without sufficient permissions" "WARN"
-                return 1
-            fi
-            ;;
-        "execute_commands")
-            if ! check_permission_level "elevated"; then
-                audit_log "ACCESS_DENIED" "Attempted to execute commands without sufficient permissions" "WARN"
-                return 1
-            fi
-            ;;
-        "access_sensitive_data")
-            if ! check_permission_level "administrative"; then
-                audit_log "ACCESS_DENIED" "Attempted to access sensitive data without sufficient permissions" "WARN"
-                return 1
-            fi
-            ;;
-        "audit_operations")
-            if ! check_permission_level "audit"; then
-                audit_log "ACCESS_DENIED" "Attempted audit operations without sufficient permissions" "WARN"
-                return 1
-            fi
-            ;;
-        *)
-            # Default allow for basic operations
-            ;;
-    esac
-    
-    audit_log "ACCESS_GRANTED" "Operation: $operation, Resource: $resource" "INFO"
-    return 0
-}
-
 # Enhanced error handling with comprehensive logging and sanitization
 handle_section_error() {
     local section="$1"
@@ -391,129 +306,10 @@ handle_section_error() {
     fi
 }
 
-# Standardized error handling functions
-handle_error() {
-    local error_code="$1"
-    local context="$2"
-    local message="$3"
-    
-    log "$LOG_ERROR" "ERROR [$error_code] in $context: $message"
-    
-    # Add to findings for tracking
-    add_finding "System" "ERROR" "Error $error_code in $context: $message" "Review logs for details"
-    
-    return "$error_code"
-}
-
-handle_warning() {
-    local context="$1"
-    local message="$2"
-    
-    log "$LOG_WARN" "WARNING in $context: $message"
-    
-    # Add to findings for tracking
-    add_finding "System" "WARN" "Warning in $context: $message" "Review configuration"
-}
-
-# Safe execution wrapper with error handling
-safe_exec_with_error_handling() {
-    local cmd="$1"
-    local context="${2:-Command execution}"
-    shift 2
-    
-    if ! safe_exec_enhanced "$cmd" "$@"; then
-        handle_error 1 "$context" "Failed to execute: $cmd $*"
-        return 1
-    fi
-    
-    log "$LOG_DEBUG" "Successfully executed: $cmd $*"
-    return 0
-}
-
-# Base section template to reduce duplication
-run_section_check() {
-    local section_name="$1"
-    local check_type="$2"  # info, warn, ok, crit
-    local message="$3"
-    local recommendation="${4:-}"
-    local command="${5:-}"
-    local args="${6:-}"
-    
-    local result=""
-    local severity="INFO"
-    
-    # Determine severity based on check type
-    case "$check_type" in
-        "info")  severity="INFO" ;;
-        "warn")  severity="WARN" ;;
-        "ok")    severity="OK"   ;;
-        "crit")  severity="CRIT" ;;
-        *)       severity="INFO" ;;
-    esac
-    
-    # Execute command if provided
-    if [ -n "$command" ]; then
-        if [ -n "$args" ]; then
-            result=$(safe_exec_enhanced "$command" "$args" 2>/dev/null || echo "")
-        else
-            result=$(safe_exec_enhanced "$command" 2>/dev/null || echo "")
-        fi
-        
-        # SECURITY FIX: Use safe string substitution instead of printf with user-controlled format
-        # Use result in message if provided
-        if [ -n "$result" ]; then
-            # Replace %s placeholder safely without printf format string vulnerability
-            message="${message//%s/$result}"
-        fi
-    fi
-    
-    # Add finding
-    add_finding "$section_name" "$severity" "$message" "$recommendation"
-    
-    # Console output
-    if [ "$OUTPUT_FORMAT" = "console" ]; then
-        case "$severity" in
-            "INFO") info "$message" ;;
-            "WARN") warn "$message" ;;
-            "OK")   ok "$message"   ;;
-            "CRIT") crit "$message" ;;
-        esac
-    fi
-    
-    log "$LOG_DEBUG" "Section check completed: $section_name - $severity"
-}
-
-# File existence and content checker
-check_file_content() {
-    local file_path="$1"
-    local section_name="$2"
-    local check_type="$3"
-    local message_template="$4"
-    local recommendation="${5:-}"
-    
-    if [ -f "$file_path" ] && [ -r "$file_path" ]; then
-        local content
-        content=$(safe_read "$file_path" 2>/dev/null || echo "")
-        if [ -n "$content" ]; then
-            run_section_check "$section_name" "$check_type" "$message_template" "$recommendation" "" ""
-        else
-            run_section_check "$section_name" "warn" "File exists but is empty: $file_path" "Check file permissions and content"
-        fi
-    else
-        run_section_check "$section_name" "warn" "File not found or not readable: $file_path" "$recommendation"
-    fi
-}
-
-# Enhanced safe command execution with additional security and access control
+# Enhanced safe command execution with hardening validation
 safe_exec_enhanced() {
     local cmd="$1"
     shift
-    
-    # Check access control for command execution
-    if ! check_access_control "execute_commands" "$cmd"; then
-        handle_section_error "Access Control" "0" "Insufficient permissions to execute command: $cmd"
-        return 1
-    fi
     
     # Validate command before execution
     if ! validate_command "$cmd"; then
@@ -680,6 +476,47 @@ section_privesc_surface_core() {
         fi
     else
         add_finding "Sudo" "INFO" "Limited sudoers review without sudo" "Run with sudo to fully analyze sudoers and includes"
+    fi
+
+    # doas parity: the sudo alternative is easy to miss in audits
+    if command_exists doas; then
+        add_finding "Sudo" "INFO" "doas installed alongside/instead of sudo" "Audit /etc/doas.conf just like sudoers"
+        local doas_conf_seen=false
+        local doas_c
+        if [ -r /etc/doas.conf ]; then
+            doas_conf_seen=true
+            doas_c=$(cached_file_content /etc/doas.conf)
+            if echo "$doas_c" | grep -Eiq 'permit\s+[^#\n]*nopass'; then
+                if echo "$doas_c" | grep -Eiq 'permit\s+[^#\n]*nopass.*as\s+root'; then
+                    add_finding "Sudo" "WARN" "doas 'permit nopass ... as root' rule found" "nopass keepenv or broad groups make this risky; scope to explicit commands only"
+                else
+                    add_finding "Sudo" "CRIT" "doas 'permit nopass' rule for non-root target found" "Require authentication for privilege escalation or scope nopass narrowly"
+                fi
+            fi
+            if echo "$doas_c" | grep -Eiq 'permit\s+[^#\n]*nopass[^#\n]*keepenv'; then
+                add_finding "Sudo" "CRIT" "doas 'nopass + keepenv' combination found" "keepenv preserves the full environment across privilege boundaries; remove keepenv or add persist-safe rules"
+            fi
+        fi
+        if [ -d /etc/doas.d ]; then
+            local doas_d_files
+            doas_d_files=$(find /etc/doas.d -maxdepth 1 -type f -readable 2>/dev/null | head -20)
+            if [ -n "$doas_d_files" ]; then
+                doas_conf_seen=true
+                while IFS= read -r f; do
+                    local dcontent; dcontent=$(safe_read "$f")
+                    if echo "$dcontent" | grep -Eiq 'permit\s+[^#\n]*nopass'; then
+                        add_finding "Sudo" "CRIT" "doas 'permit nopass' rule in $(basename "$f")" "Audit nopass rules; scope to least privilege"
+                    fi
+                done <<< "$doas_d_files"
+            fi
+        fi
+        if [ "$doas_conf_seen" = false ]; then
+            if [ -f /etc/doas.conf ] || [ -d /etc/doas.d ]; then
+                add_finding "Sudo" "INFO" "doas config exists but is not readable without root" "Run with sudo to review doas.conf"
+            else
+                add_finding "Sudo" "WARN" "doas installed but no configuration file found" "Create /etc/doas.conf or remove the package if unused"
+            fi
+        fi
     fi
 
     # PATH hijack risks
@@ -1256,6 +1093,23 @@ section_kernel_polkit_fstab_refinements() {
         if [ "$symlink_val" = "0" ]; then
             add_finding "Kernel" "WARN" "Symlink protection disabled" "Set fs.protected_symlinks=1 to prevent symlink attacks"
         fi
+
+        # Unprivileged eBPF (a live privilege-escalation surface)
+        # 0 = unprivileged programs allowed, 1 = disabled (until reboot), 2 = disabled but re-enableable
+        if [ -f /proc/sys/kernel/unprivileged_bpf_disabled ]; then
+            local bpf_val
+            bpf_val=$(safe_read /proc/sys/kernel/unprivileged_bpf_disabled)
+            case "$bpf_val" in
+                1|2)
+                    add_finding "Kernel" "OK" "Unprivileged eBPF restricted (kernel value $bpf_val)" ""
+                    ok "Unprivileged eBPF restricted"
+                    ;;
+                *)
+                    add_finding "Kernel" "WARN" "Unprivileged eBPF programs allowed (kernel value $bpf_val)" "Set kernel.unprivileged_bpf_disabled=1 (or 2 if you need to re-enable later without a reboot) to keep eBPF privileged-only"
+                    warn "Unprivileged eBPF allowed"
+                    ;;
+            esac
+        fi
     fi
     
     # NEW CHECK 2: Active tmpfs mounts with exec permission (runtime check)
@@ -1267,6 +1121,32 @@ section_kernel_polkit_fstab_refinements() {
                 add_finding "FSTAB" "CRIT" "$mount_point mounted with exec permission" "Remount with noexec: mount -o remount,noexec $mount_point"
             done <<< "$tmpfs_exec"
         fi
+    fi
+
+    # NEW CHECK 3: Runtime mount options for standard temp dirs.
+    # Complements the /etc/fstab check above: catches auto-mounted tmpfs and
+    # systemd-managed mounts even when there is no fstab entry.
+    if command_exists findmnt; then
+        for mp in /tmp /var/tmp /dev/shm; do
+            local mopts missing=""
+            mopts=$(findmnt -kn -o OPTIONS --target "$mp" 2>/dev/null | tail -1)
+            [ -z "$mopts" ] && continue
+            for need in nosuid nodev; do
+                echo "$mopts" | grep -qw "$need" || missing="$missing $need"
+            done
+            if [ -n "$missing" ]; then
+                rec="Add$missing to $mp mount options (fstab or systemd unit) and remount"
+                add_finding "FSTAB" "WARN" "$mp mounted without:$missing (current: $(echo "$mopts" | head -c 120))" "$rec"
+                warn "$mp options missing:$missing"
+            else
+                # noexec is desirable but can break legitimate workflows (e.g. browsers using /dev/shm)
+                if echo "$mopts" | grep -qw "noexec"; then
+                    add_finding "FSTAB" "OK" "$mp mount options hardened (noexec, nosuid, nodev present)" ""
+                else
+                    add_finding "FSTAB" "INFO" "$mp mounted with nosuid/nodev but without noexec" "Consider noexec if your workload allows (some apps execute from tmp)"
+                fi
+            fi
+        done
     fi
 }
 # Parallel execution support
@@ -1334,12 +1214,24 @@ wait_parallel_sections() {
                 warn "Parallel section '$section' encountered issues"
             fi
         fi
-        # Merge findings
+        # Merge findings (validate record shape before trusting sink contents)
         if [ -f "$findings_file" ]; then
+            local skipped_records=0
             while IFS= read -r line; do
-                # Append to global findings preserving structure
-                FINDINGS+=("$line")
+                [ -z "$line" ] && continue
+                # Records are section|severity|message|recommendation (4 fields);
+                # sanitization in add_finding strips '|' from field values, so a
+                # field count != 4 means a corrupted or forged sink entry.
+                local nf
+                nf=$(awk -F'|' 'END{print NF}' <<<"$line")
+                if [ "$nf" -eq 4 ]; then
+                    FINDINGS+=("$line")
+                else
+                    ((skipped_records++)) || true
+                    log "$LOG_WARN" "Discarded malformed parallel finding from '$section'"
+                fi
             done < "$findings_file"
+            [ "$skipped_records" -gt 0 ] && log "$LOG_WARN" "Skipped $skipped_records malformed record(s) in parallel section '$section'"
             rm -f "$findings_file" 2>/dev/null || true
         fi
         # Flush console output in order
@@ -1462,7 +1354,7 @@ cached_file_content() {
     fi
 }
 
-VERSION="0.6.3"
+VERSION="0.8.0"
 
 # Caching system configuration
 # Use secure temp directory with strict permissions
@@ -1497,6 +1389,20 @@ PRIVACY_LEVEL="standard"   # standard|high|off
 ANONYMIZE=false
 EXCLUDE_SECTIONS_RAW=""
 EXCLUDE_SEVERITY_RAW=""
+
+# Offline mode: never touch metadata caches or reach out to data sources on the
+# network (apt-get update, dnf/yum metadata refresh, lifecycle API lookups)
+OFFLINE="${BTQC_OFFLINE:-false}"
+
+# Workflow: exit-code policy. none = always 0; WARN = exit 1 on any WARN/CRIT;
+# CRIT = exit 2 on any CRIT. Used for CI/cron scheduling.
+FAIL_ON="none"
+
+# Workflow: drift detection. BASELINE_FILE is a pipe-delimited findings file
+# from a previous run (see --baseline); SAVE_FINDINGS_FILE stores today's
+# findings as the baseline for a future run (see --save-findings).
+BASELINE_FILE=""
+SAVE_FINDINGS_FILE=""
 
 # Derived privacy state
 declare -A EXCLUDE_SECTION_SET=()
@@ -1535,17 +1441,6 @@ drop_privileges() {
             fi
         fi
         PRIVILEGE_DROPPED=true
-    fi
-}
-
-# Temporarily elevate privileges for specific operations
-elevate_privileges() {
-    if [ "$EUID" -ne 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
-        # Request sudo for specific operation
-        sudo -n true 2>/dev/null || {
-            echo "Error: Sudo privileges required for this operation" >&2
-            return 1
-        }
     fi
 }
 
@@ -1718,16 +1613,10 @@ safe_exec() {
     safe_exec_enhanced "$@"
 }
 
-# Enhanced safe file reading with comprehensive validation and access control
+# Enhanced safe file reading with hardening validation
 safe_read() {
     local file="$1"
     local max_size="${2:-1048576}"  # Default 1MB limit
-    
-    # Check access control for reading system files
-    if ! check_access_control "read_system_files" "$file"; then
-        handle_section_error "Access Control" "0" "Insufficient permissions to read file: $file"
-        return 1
-    fi
     
     # Validate input length and characters
     if ! validate_input_length "$file" 1024; then
@@ -3851,6 +3740,180 @@ section_behavioral_analysis() {
 
 
 
+# ---------------------------------------------------------------------------
+# Distribution lifecycle (EOL) checks - data-driven via endoflife.date API v1
+# ---------------------------------------------------------------------------
+# Primary source: https://endoflife.date/api/v1/products/<product>/  (live)
+# Fallback: an embedded snapshot table taken on the release date of this
+# version. Snapshots rot, so the finding text always states which source was
+# used and how fresh it is. Respects --offline: no network, cached/embedded only.
+
+# How long a successful lifecycle fetch is trusted (seconds; default 30 days)
+EOL_CACHE_TTL="${BTQC_EOL_CACHE_TTL:-2592000}"
+# Snapshot date of the embedded lifecycle table (informational, shown to user)
+readonly EOL_SNAPSHOT_DATE="2026-11-08"
+# os-release ID -> endoflife.date product slug
+readonly EOL_PRODUCT_MAP="ubuntu:ubuntu debian:debian rhel:rhel rocky:rocky-linux almalinux:almalinux centos:centos fedora:fedora sles:sles opensuse-leap:opensuse amzn:amazon-linux ol:oracle-linux"
+
+eol_product_for_id() {
+    local distro_id="$1" pair
+    for pair in $EOL_PRODUCT_MAP; do
+        if [ "${pair%%:*}" = "$distro_id" ]; then
+            echo "${pair#*:}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Fetch lifecycle JSON for one product. Caches in the per-run cache dir.
+# Prints JSON on stdout; returns 1 when nothing usable is available.
+eol_fetch_product() {
+    local product="$1"
+    local cache_file="${CACHE_DIR:-}/eol-$product.json"
+
+    # Use cache when fresh, or always when offline
+    if [ -n "${CACHE_DIR:-}" ] && [ -f "$cache_file" ]; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+        if [ "$OFFLINE" = true ] || [ "$age" -lt "$EOL_CACHE_TTL" ]; then
+            cat "$cache_file" 2>/dev/null && return 0
+        fi
+    fi
+    [ "$OFFLINE" = true ] && return 1
+
+    local fetched=""
+    if command_exists curl; then
+        fetched=$(curl -fsSL --max-time 10 "https://endoflife.date/api/v1/products/$product/" 2>/dev/null)
+    elif command_exists wget; then
+        fetched=$(wget -q -T 10 -O - "https://endoflife.date/api/v1/products/$product/" 2>/dev/null)
+    fi
+    # Only trust output that looks like the documented cycle array
+    case "$fetched" in
+        \[*\])
+            if [ -n "$cache_file" ]; then
+                printf '%s' "$fetched" > "$cache_file" 2>/dev/null && chmod 600 "$cache_file"
+            fi
+            printf '%s' "$fetched"
+            return 0
+            ;;
+    esac
+    # Fetch failed - fall back to a stale cache file if one exists
+    [ -n "${CACHE_DIR:-}" ] && [ -f "$cache_file" ] && { cat "$cache_file" 2>/dev/null && return 0; }
+    return 1
+}
+
+# Extract the EOL date for one cycle from product JSON. Prints YYYY-MM-DD, or empty.
+# If not found, second argument may supply the embedded snapshot value.
+eol_cycle_eol_date() {
+    local json="$1" cycle="$2" record eol_raw
+    record=$(printf '%s' "$json" | tr '{[' '\n\n' | grep -F "\"cycle\":\"$cycle\"," | head -1)
+    [ -n "$record" ] || return 1
+    eol_raw=$(printf '%s' "$record" | grep -oE '"eol":"[0-9]{4}-[0-9]{2}-[0-9]{2}"' | head -1 | cut -d'"' -f4)
+    printf '%s' "$eol_raw"
+}
+
+# Embedded snapshot: "distro cycle:eoldate" pairs (one word per distro set)
+# Refresh this table when cutting a new release; live data is preferred.
+readonly EOL_SNAPSHOT_MAP="ubuntu=18.04:2023-05-31,20.04:2025-05-31,22.04:2027-04-30,24.04:2029-04-30,24.10:2025-07-09,25.04:2026-01-02,25.10:2026-07-09
+debian=10:2024-06-30,11:2026-08-31,12:2028-06-30,13:2030-06-30
+rhel=7:2024-06-30,8:2029-05-31,9:2032-05-31,10:2035-05-31
+rocky-linux=8:2029-05-31,9:2032-05-31,10:2035-05-31
+almalinux=8:2029-05-31,9:2032-05-31,10:2035-05-31
+centos=7:2024-06-30,8:2021-12-31
+fedora=40:2024-09-03,41:2024-12-10,42:2025-04-08,43:2025-11-11
+sles=15.5:2024-12-31,15.6:2025-12-31,15.7:2031-07-31,16.0:2027-11-30
+amazon-linux=2:2026-06-30,2023:2028-06-30
+oracle-linux=7:2024-12-31,8:2029-07-31,9:2032-06-30"
+
+# Snapshot lookup: prints EOL date or empty
+eol_snapshot_date() {
+    local product="$1" cycle="$2" row pair csv
+    local -a items=()
+    while IFS= read -r row; do
+        [ -z "$row" ] && continue
+        if [ "${row%%=*}" != "$product" ]; then
+            continue
+        fi
+        csv="${row#*=}"
+        IFS=',' read -r -a items <<< "$csv"
+        for pair in "${items[@]}"; do
+            if [ "${pair%%:*}" = "$cycle" ]; then
+                echo "${pair#*:}"
+                return 0
+            fi
+        done
+    done <<< "$EOL_SNAPSHOT_MAP"
+    return 1
+}
+
+# Classify a distro/version. Adds one finding; never fails the scan.
+check_distro_eol() {
+    local distro_id="$1" distro_version="$2"
+    local product cycle json eol_date source
+
+    product=$(eol_product_for_id "$distro_id") || {
+        add_finding "System" "INFO" "EOL status unknown: distro '$distro_id' not tracked in lifecycle data" ""
+        return 0
+    }
+
+    # Candidate cycles: exact version, then point release trimmed, then major
+    local candidates=("$distro_version")
+    if [[ "$distro_version" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then candidates+=("${BASH_REMATCH[1]}"); fi
+    if [[ "$distro_version" =~ ^([0-9]+)\. ]]; then candidates+=("${BASH_REMATCH[1]}"); fi
+
+    local c found_date="" found_cycle="" snap_date=""
+    source="live data (endoflife.date, fetched today)"
+    json=$(eol_fetch_product "$product") || {
+        json=""
+        source="embedded snapshot dated $EOL_SNAPSHOT_DATE"
+    }
+    for c in "${candidates[@]}"; do
+        [ -z "$c" ] && continue
+        found_date=""
+        if [ -n "$json" ]; then
+            found_date=$(eol_cycle_eol_date "$json" "$c")
+        fi
+        if [ -z "$found_date" ]; then
+            snap_date=$(eol_snapshot_date "$product" "$c")
+            if [ -n "$snap_date" ]; then
+                found_date="$snap_date"
+                source="embedded snapshot dated $EOL_SNAPSHOT_DATE"
+            fi
+        fi
+        if [ -n "$found_date" ]; then
+            found_cycle="$c"
+            break
+        fi
+    done
+
+    if [ -z "$found_date" ]; then
+        add_finding "System" "INFO" "No lifecycle record found for $distro_id ${distro_version:-unknown} ($source)$([ "$OFFLINE" = true ] && echo ', offline mode')" ""
+        return 0
+    fi
+
+    local eol_epoch now_epoch days_left
+    eol_epoch=$(date -d "$found_date" +%s 2>/dev/null || echo "")
+    now_epoch=$(date +%s)
+    if [ -z "$eol_epoch" ]; then
+        add_finding "System" "INFO" "Lifecycle record for $distro_id $found_cycle has unreadable EOL value ($source)" ""
+        return 0
+    fi
+    days_left=$(( (eol_epoch - now_epoch) / 86400 ))
+
+    if [ "$days_left" -lt 0 ]; then
+        add_finding "System" "CRIT" "Distro $distro_id $found_cycle is EOL (ended $found_date, per $source)" "Upgrade to a supported release of $distro_id - no more security updates"
+        crit "EOL OS detected: $distro_id $found_cycle"
+    elif [ "$days_left" -lt 90 ]; then
+        add_finding "System" "WARN" "Distro $distro_id $found_cycle reaches EOL in $days_left days ($found_date, per $source)" "Plan the upgrade within the maintenance window"
+        warn "Distro near EOL: $distro_id $found_cycle"
+    elif [ "$days_left" -lt 365 ]; then
+        add_finding "System" "INFO" "Distro $distro_id $found_cycle reaches EOL in $days_left days ($found_date, per $source)" ""
+    else
+        add_finding "System" "OK" "Distro supported: $distro_id $found_cycle (EOL $found_date, per $source)" ""
+        ok "Distro supported ($days_left days of support left)"
+    fi
+}
+
 section_system() {
 	print_section "System"
 	
@@ -3872,42 +3935,9 @@ section_system() {
 		add_finding "System" "INFO" "Distribution: $distro" ""
 		[ "$OUTPUT_FORMAT" = "console" ] && echo "Distro: $distro"
 		
-		# NEW CHECK 1: EOL OS detection
-		case "$os_id" in
-			ubuntu)
-				local major_ver=$(echo "$os_version" | cut -d. -f1)
-				if [ "$major_ver" -lt 18 ]; then
-					add_finding "System" "CRIT" "Running EOL Ubuntu $os_version (< 18.04)" "Upgrade to Ubuntu 20.04 LTS or 22.04 LTS immediately - no security updates"
-					crit "EOL OS detected: Ubuntu $os_version"
-				elif [ "$major_ver" -eq 18 ]; then
-					add_finding "System" "WARN" "Ubuntu 18.04 LTS approaching EOL (April 2028 ESM)" "Plan upgrade to Ubuntu 22.04 LTS or 24.04 LTS"
-				fi
-				;;
-			debian)
-				local major_ver=$(echo "$os_version" | cut -d. -f1)
-				if [ "$major_ver" -lt 10 ]; then
-					add_finding "System" "CRIT" "Running EOL Debian $os_version (< 10)" "Upgrade to Debian 11 or 12 immediately - no security updates"
-					crit "EOL OS detected: Debian $os_version"
-				fi
-				;;
-			centos)
-				local major_ver=$(echo "$os_version" | cut -d. -f1)
-				if [ "$major_ver" -lt 7 ]; then
-					add_finding "System" "CRIT" "Running EOL CentOS $os_version (< 7)" "Migrate to Rocky Linux, AlmaLinux, or RHEL - no security updates"
-					crit "EOL OS detected: CentOS $os_version"
-				elif [ "$major_ver" -eq 8 ]; then
-					add_finding "System" "CRIT" "CentOS 8 reached EOL (Dec 2021)" "Migrate to Rocky Linux 8, AlmaLinux 8, or RHEL 8 immediately"
-					crit "EOL OS: CentOS 8"
-				fi
-				;;
-			rhel)
-				local major_ver=$(echo "$os_version" | cut -d. -f1)
-				if [ "$major_ver" -lt 7 ]; then
-					add_finding "System" "CRIT" "Running EOL RHEL $os_version (< 7)" "Upgrade to RHEL 8 or 9 immediately - no security updates"
-					crit "EOL OS detected: RHEL $os_version"
-				fi
-				;;
-		esac
+		# EOL detection is data-driven (endoflife.date API v1, with an embedded
+		# snapshot fallback and --offline support) - see check_distro_eol above
+		check_distro_eol "$os_id" "$os_version"
 	fi
 	
 	# Uptime
@@ -3950,10 +3980,14 @@ section_updates() {
 	if ! is_root && [ "$OUTPUT_FORMAT" = "console" ]; then
 		info "Package cache may be outdated without sudo - results may not reflect latest available updates"
 	fi
+	# Note about offline mode limiting metadata freshness
+	if [ "$OFFLINE" = true ]; then
+		add_finding "Updates" "INFO" "Offline mode: package metadata was not refreshed; results reflect the local cache" "Rerun without --offline for fresh metadata"
+	fi
 	
 	case "$pm" in
 		apt)
-			if is_root; then apt-get update -qq >/dev/null 2>&1; fi
+			if is_root && [ "$OFFLINE" = false ]; then apt-get update -qq >/dev/null 2>&1 || true; fi
 			cnt=$(apt-get -s upgrade 2>/dev/null | awk '/^[0-9]+ upgraded/ {print $1}')
 			if [ -n "$cnt" ] && [ "$cnt" != 0 ]; then 
 				rec=$(get_recommendation "Run 'sudo apt upgrade' to install updates" \
@@ -3967,7 +4001,10 @@ section_updates() {
 			fi
 			;;
 		dnf)
-			cnt=$(dnf check-update 2>/dev/null | awk 'BEGIN{c=0} /^[A-Za-z0-9_.-]+\s+[A-Za-z0-9_.:-]+\s+[A-Za-z0-9_.:-]+/ {c++} END{print c}')
+			# -C uses the local metadata cache only (no repo refresh) when offline
+			local dnf_flags="-C"
+			[ "$OFFLINE" = false ] && dnf_flags=""
+			cnt=$(dnf $dnf_flags check-update 2>/dev/null | awk 'BEGIN{c=0} /^[A-Za-z0-9_.-]+\s+[A-Za-z0-9_.:-]+\s+[A-Za-z0-9_.:-]+/ {c++} END{print c}')
 			[ -z "$cnt" ] && cnt=0
 			if [ "$cnt" -gt 0 ]; then 
 				rec=$(get_recommendation "Run 'sudo dnf upgrade' to install updates" \
@@ -3981,7 +4018,10 @@ section_updates() {
 			fi
 			;;
 		yum)
-			out=$(yum check-update 2>/dev/null || true)
+			# -C uses the local metadata cache only (no repo refresh) when offline
+			local yum_flags="-C"
+			[ "$OFFLINE" = false ] && yum_flags=""
+			out=$(yum $yum_flags check-update 2>/dev/null || true)
 			cnt=$(printf "%s" "$out" | awk 'BEGIN{c=0} /^[A-Za-z0-9_.-]+\s+[A-Za-z0-9_.:-]+\s+[A-Za-z0-9_.:-]+/ {c++} END{print c}')
 			[ -z "$cnt" ] && cnt=0
 			if [ "$cnt" -gt 0 ]; then 
@@ -4340,6 +4380,68 @@ section_ssh() {
 			warn "PubkeyAuthentication disabled"
 		fi
 		
+		# NEW CHECK 4: Crypto posture - weak primitives configured explicitly
+		local kex_cfg cipher_cfg mac_cfg weak_cfg=""
+		kex_cfg=$(grep -Ei '^\s*KexAlgorithms\s+' "$sshd_cfg" | tail -n1)
+		cipher_cfg=$(grep -Ei '^\s*Ciphers\s+' "$sshd_cfg" | tail -n1)
+		mac_cfg=$(grep -Ei '^\s*MACs\s+' "$sshd_cfg" | tail -n1)
+		if echo "$kex_cfg" | grep -Eqi 'diffie-hellman-group1-sha1|sha1@ssh\.com|none\b'; then
+			weak_cfg="$kex_cfg"
+		fi
+		if [ -z "$weak_cfg" ] && echo "$mac_cfg" | grep -Eqi 'hmac-sha1([^0-9]|$)|hmac-md5|hmac-ripemd160'; then
+			weak_cfg="$mac_cfg"
+		fi
+		if [ -z "$weak_cfg" ] && echo "$cipher_cfg" | grep -Eqi '3des-cbc|aes[0-9]+-cbc|cast128-cbc|arcfour|blowfish-cbc|none\b'; then
+			weak_cfg="$cipher_cfg"
+		fi
+		if [ -n "$weak_cfg" ]; then
+			rec="Restrict $sshd_cfg KexAlgorithms/Ciphers/MACs to modern choices (curve25519-sha256, sntrup761x25519-sha512, aes-gcm, chacha20)"
+			add_finding "SSH" "CRIT" "Weak crypto primitives explicitly configured: ${weak_cfg}" "$rec"
+			crit "Weak SSH crypto primitives configured"
+		fi
+		
+		# NEW CHECK 5: OpenSSH version and post-quantum kex guidance
+		local openssh_ver=""
+		if command_exists ssh; then
+			openssh_ver=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+(\.[0-9]+)*' | cut -d_ -f2)
+		fi
+		if [ -n "$openssh_ver" ] && [[ "$openssh_ver" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+			# Is version >= 10.0 (mlkem hybrid kex default) or >= 9.0 (sntrup761 hybrid available)?
+			local at_least_10 at_least_9
+			at_least_10=$(printf '%s\n' "$openssh_ver" "10.0" | sort -V | head -n1)
+			at_least_9=$(printf '%s\n' "$openssh_ver" "9.0" | sort -V | head -n1)
+			if [ "$at_least_10" = "10.0" ]; then
+				add_finding "SSH" "OK" "OpenSSH $openssh_ver with ML-KEM (post-quantum) default kex" ""
+			elif [ "$at_least_9" = "9.0" ]; then
+				add_finding "SSH" "INFO" "OpenSSH $openssh_ver - hybrid post-quantum kex (sntrup761x25519-sha512) available" "Add sntrup761x25519-sha512@libssh.org to KexAlgorithms for hybrid PQC"
+			elif [ "$OPERATION_MODE" = "production" ]; then
+				rec="Undersized crypto: upgrade OpenSSH to 9.x/10.x for modern kex choices and post-quantum readiness"
+				add_finding "SSH" "WARN" "Legacy OpenSSH version detected: $openssh_ver" "$rec"
+				warn "OpenSSH version $openssh_ver is legacy"
+			else
+				add_finding "SSH" "INFO" "Legacy OpenSSH version detected: $openssh_ver" "Upgrade OpenSSH for modern crypto defaults"
+			fi
+		fi
+		
+		# NEW CHECK 6: Agent forwarding guardrail (CIS-aligned)
+		local agent_fwd
+		agent_fwd=$(grep -Ei '^\s*AllowAgentForwarding\s+' "$sshd_cfg" | tail -n1 | awk '{print tolower($2)}')
+		if [ "$agent_fwd" = "no" ]; then
+			add_finding "SSH" "OK" "AllowAgentForwarding disabled" ""
+			ok "AllowAgentForwarding disabled"
+		elif [ "$agent_fwd" = "yes" ]; then
+			rec=$(get_recommendation "Set 'AllowAgentForwarding no' in $sshd_cfg (only enable per-host if needed)" \
+				"SSH agent forwarding is a credential-theft path: set 'AllowAgentForwarding no'" \
+				"Set 'AllowAgentForwarding no' policy-wide; require jump hosts instead of agent forwarding")
+			add_finding "SSH" "WARN" "AllowAgentForwarding enabled" "$rec"
+			warn "AllowAgentForwarding enabled"
+		else
+			rec=$(get_recommendation "Set 'AllowAgentForwarding no' in $sshd_cfg (only enable per-host if needed)" \
+				"Consider setting 'AllowAgentForwarding no' (agent forwarding is a credential-theft path)" \
+				"Consider setting 'AllowAgentForwarding no' policy-wide")
+			add_finding "SSH" "INFO" "AllowAgentForwarding not explicitly set (default: yes)" "$rec"
+		fi
+		
 	else
 		add_finding "SSH" "WARN" "Cannot read $sshd_cfg" "Check SSH configuration file permissions"
 		warn "Cannot read $sshd_cfg"
@@ -4665,6 +4767,31 @@ section_intrusion_detection() {
 			"Deploy fail2ban with organization-specific jail configurations")
 		add_finding "Intrusion Detection" "INFO" "fail2ban not installed" "$rec"
 		[ "$OUTPUT_FORMAT" = "console" ] && info "fail2ban not installed"
+	fi
+	
+	# CrowdSec (mainstream fail2ban successor)
+	if command_exists cscli; then
+		if systemctl is-active --quiet crowdsec 2>/dev/null; then
+			add_finding "Intrusion Detection" "OK" "CrowdSec engine is active" ""
+			ok "CrowdSec engine active"
+			if is_root; then
+				local crowd_banned=0
+				crowd_banned=$(cscli decisions list 2>/dev/null | awk 'BEGIN{c=0} /^ +[0-9]+ / {c++} END{print c+0}')
+				if [ "$crowd_banned" -gt 10 ]; then
+					add_finding "Intrusion Detection" "WARN" "High number of active CrowdSec decisions: $crowd_banned" "Review 'sudo cscli decisions list' - active attack activity"
+					warn "CrowdSec active decisions: $crowd_banned"
+				elif [ "$crowd_banned" -gt 0 ]; then
+					add_finding "Intrusion Detection" "INFO" "CrowdSec active decisions: $crowd_banned" "Some ban activity is normal"
+				else
+					add_finding "Intrusion Detection" "OK" "No active CrowdSec decisions" ""
+					ok "No active CrowdSec bans"
+				fi
+			fi
+		else
+			rec="Start CrowdSec: 'sudo systemctl start crowdsec' (or review its systemd unit)"
+			add_finding "Intrusion Detection" "WARN" "CrowdSec (cscli) installed but engine not active" "$rec"
+			warn "CrowdSec installed but not active"
+		fi
 	fi
 	
 	# NOTE: Detailed failed login analysis is performed in 'Behavioral Analysis' section
@@ -5076,6 +5203,56 @@ section_network_security() {
 			add_finding "Network Security" "OK" "No commonly risky ports exposed" ""
 			ok "No risky ports exposed"
 		fi
+	fi
+	
+	# DNS resolver posture: resolv.conf sanity + systemd-resolved DNSSEC / DoT
+	if [ -r /etc/resolv.conf ]; then
+		local ns_list=""
+		ns_list=$(grep -E '^[[:space:]]*nameserver[[:space:]]' /etc/resolv.conf | awk '{print $2}' | sort -u | tr '\n' ' ')
+		echo "$ns_list" | grep -qE '[0-9a-fA-F:.]' || ns_list=""
+		if [ -z "$ns_list" ]; then
+			add_finding "Network Security" "WARN" "No nameservers configured in /etc/resolv.conf (broken or stub-only resolver)" "Verify resolver state: 'resolvectl status' and check /etc/resolv.conf"
+			warn "No nameservers configured"
+		else
+			add_finding "Network Security" "INFO" "Resolvers configured: $(echo "$ns_list" | head -c 200)" ""
+		fi
+	else
+		add_finding "Network Security" "WARN" "/etc/resolv.conf not readable (no resolver configuration)" "Verify DNS resolution works for this host"
+	fi
+	
+	if [ -r /etc/systemd/resolved.conf ]; then
+		local dnssec_val dot_val
+		dnssec_val=$(grep -E '^[[:space:]]*DNSSEC[[:space:]]*=' /etc/systemd/resolved.conf | tail -1 | awk -F= '{print $2}')
+		dot_val=$(grep -E '^[[:space:]]*DNSOverTLS[[:space:]]*=' /etc/systemd/resolved.conf | tail -1 | awk -F= '{print $2}')
+		dnssec_val=$(echo "$dnssec_val" | tr -d ' ')
+		dot_val=$(echo "$dot_val" | tr -d ' ')
+		if [ "$dnssec_val" = "no" ]; then
+			add_finding "Network Security" "WARN" "systemd-resolved DNSSEC validation disabled" "Set DNSSEC to allow-downgrade or yes in /etc/systemd/resolved.conf (also check resolved.conf.d drop-ins)"
+			warn "DNSSEC validation disabled"
+		elif [ -z "$dnssec_val" ]; then
+			add_finding "Network Security" "INFO" "DNSSEC validation not explicitly configured (resolved default is allow-downgrade on modern systemd)" "Set DNSSEC explicitly in /etc/systemd/resolved.conf to pin behavior"
+		elif [ "$dnssec_val" = "allow-downgrade" ] || [ "$dnssec_val" = "yes" ]; then
+			add_finding "Network Security" "OK" "DNSSEC validation configured ($dnssec_val)" ""
+			ok "DNSSEC active via systemd-resolved"
+		fi
+		
+		case "$dot_val" in
+			yes)
+				add_finding "Network Security" "OK" "DNS-over-TLS enforced (strict) in systemd-resolved" ""
+				ok "DNS-over-TLS enforced"
+				;;
+			opportunistic)
+				add_finding "Network Security" "INFO" "DNS-over-TLS opportunistic (falls back to plaintext)" "Set DNSOverTLS yes for strict encrypted DNS in production"
+				;;
+			no)
+				add_finding "Network Security" "INFO" "DNS-over-TLS disabled in systemd-resolved" "Consider DNSOverTLS opportunistic for encrypted resolver-to-upstream traffic"
+				;;
+			"")
+				if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+					add_finding "Network Security" "INFO" "DNS-over-TLS not explicitly configured" "Consider DNSOverTLS opportunistic in /etc/systemd/resolved.conf"
+				fi
+				;;
+		esac
 	fi
 	
 	# NOTE: Comprehensive network hardening checks (TCP SYN cookies, timestamps, etc.) 
@@ -5633,6 +5810,53 @@ section_secure_configuration() {
 			add_finding "Secure Config" "INFO" "No 2FA detected" "$rec"
 		fi
 	fi
+	
+	# systemd sandboxing exposure: overall exposure score for network-facing
+	# services. Unconfined services are the modern privilege-escalation surface;
+	# 'systemd-analyze security' gives each unit an exposure score from 0 (hardened)
+	# to 10 (unconfined). Unit discovery is runtime-driven: whatever owns a
+	# listening socket gets scored (capped for scan-time sanity), with the
+	# classic set as fallback when socket ownership cannot be resolved (non-root).
+	if command_exists systemd-analyze && command_exists systemctl && [ -d /run/systemd/system ]; then
+		local candidate_units=""
+		local analyzed_any=false score
+		if command_exists ss; then
+			# Process names that own listening TCP sockets, e.g. users:(("sshd",pid=...
+			candidate_units=$(ss -tlnp 2>/dev/null \
+				| grep -oE '\("(sshd|[^"\\]+)"' \
+				| tr -d '(" ' | sed 's/^"//' | grep -vE '^$|systemd$' \
+				| sort -u | head -12)
+		fi
+		# Map process names to candidate unit names; keep well-known webssh names too
+		candidate_units="$candidate_units sshd openssh-server nginx apache2 httpd"
+		for base in $(printf '%s' "$candidate_units" | tr ' ' '\n' | sort -u); do
+			# Resolve the installed unit name (sshd vs openssh-server naming)
+			for unit in "$base" "$base.service"; do
+				# Only consider units that exist on this host
+				[ -n "$(systemctl list-unit-files --no-legend "$unit" 2>/dev/null | head -1)" ] || continue
+				# Overall exposure line looks like:
+				#   -> Overall exposure level for unit.service: 9.6 UNSAFE..
+				score=$(systemd-analyze security "$unit" 2>/dev/null \
+					| awk '/Overall exposure level/ {for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+$/) {print $i; exit}}')
+				[ -z "$score" ] && continue
+				analyzed_any=true
+				if [ "$OPERATION_MODE" = "production" ] && awk -v s="$score" 'BEGIN{exit !(s>=8.0)}'; then
+					rec="Harden $unit with systemd sandboxing directives (see 'systemd-analyze security $unit' for the offender list)"
+					add_finding "Secure Config" "WARN" "$unit systemd exposure score is high: $score / 10" "$rec"
+					warn "$unit systemd exposure score $score (hardening recommended)"
+				elif awk -v s="$score" 'BEGIN{exit !(s<8.0)}'; then
+					add_finding "Secure Config" "OK" "$unit systemd sandboxing exposure score: $score / 10" ""
+					ok "$unit sandboxing score $score"
+				else
+					add_finding "Secure Config" "INFO" "$unit systemd exposure score $score / 10" "Consider sandboxing directives for $unit in personal machines too"
+				fi
+				break
+			done
+		done
+		if [ "$analyzed_any" = false ]; then
+			add_finding "Secure Config" "INFO" "No systemd sandboxing analysis available for known services (non-root, older systemd, or none installed)" "Run with sudo for full sandboxing analysis"
+		fi
+	fi
 }
 
 section_container_security() {
@@ -5679,17 +5903,58 @@ section_container_security() {
 			fi
 		fi
 		
-		# Production mode: More comprehensive container checks
-		if [ "$OPERATION_MODE" = "production" ]; then
-			# Check Docker daemon configuration
-			if [ -f /etc/docker/daemon.json ]; then
-				add_finding "Container Security" "OK" "Docker daemon configuration file exists" ""
-				[ "$OUTPUT_FORMAT" = "console" ] && ok "Docker daemon configuration file found"
-			else
-				rec="Create Docker daemon config: '/etc/docker/daemon.json' with security hardening"
-				add_finding "Container Security" "INFO" "No Docker daemon configuration found" "$rec"
-				[ "$OUTPUT_FORMAT" = "console" ] && info "No Docker daemon configuration found"
+		# Docker daemon configuration hardening (daemon.json)
+		if [ -f /etc/docker/daemon.json ]; then
+			local dj
+			dj=$(safe_read /etc/docker/daemon.json 2>/dev/null || echo "")
+			add_finding "Container Security" "OK" "Docker daemon configuration file exists" ""
+			[ "$OUTPUT_FORMAT" = "console" ] && ok "Docker daemon configuration file found"
+			
+			# Remote API exposure declared in the config (higher priority than the port scan above)
+			if echo "$dj" | grep -Eq '"hosts"' ; then
+				if echo "$dj" | grep -Eq 'tcp://(0\.0\.0\.0|.*:)?[0-9]+' ; then
+					rec="Remove tcp:// hosts entries; exposure over TCP gives root-equivalent access without TLS"
+					add_finding "Container Security" "CRIT" "Docker daemon configured with remote TCP API exposure (daemon.json hosts entry)" "$rec"
+					crit "Docker remote API in daemon.json"
+				else
+					add_finding "Container Security" "INFO" "daemon.json declares hosts entries - verify they are unix sockets only" ""
+				fi
 			fi
+			
+			# userns-remap: container root mapped to unprivileged host user
+			if echo "$dj" | grep -Eq '"userns-remap"'; then
+				add_finding "Container Security" "OK" "userns-remap enabled in daemon.json" ""
+				ok "Docker userns-remap enabled"
+			else
+				rec="Enable userns-remap in daemon.json so container root cannot use host root capabilities on mounted volumes"
+				add_finding "Container Security" "WARN" "userns-remap not configured" "$rec"
+				warn "Docker userns-remap not configured"
+			fi
+			
+			# live-restore: daemon restarts do not kill running containers
+			if echo "$dj" | grep -Eq '"live-restore"[[:space:]]*:[[:space:]]*true'; then
+				add_finding "Container Security" "OK" "live-restore enabled in daemon.json (restarts keep containers up)" ""
+			else
+				rec="Set live-restore true in daemon.json to keep containers running across daemon restarts"
+				add_finding "Container Security" "INFO" "live-restore not enabled" "$rec"
+			fi
+			
+			# Log rotation: default json-file log driver grows without bound
+			if echo "$dj" | grep -Eq 'max-size[[:space:]]*:[[:space:]]*"?[0-9]+[mgkMGK]'; then
+				add_finding "Container Security" "OK" "Container log max-size configured in daemon.json" ""
+			else
+				rec="Configure log-opts max-size / max-file in daemon.json (default json-file driver grows without bound)"
+				if echo "$dj" | grep -Eq '"log-driver"'; then
+					add_finding "Container Security" "INFO" "Custom log-driver configured; verify log rotation limits are set" "$rec"
+				else
+					add_finding "Container Security" "WARN" "No log rotation limits (containers can fill the disk with logs)" "$rec"
+					warn "Docker log rotation not configured"
+				fi
+			fi
+		else
+			rec="Create Docker daemon config: '/etc/docker/daemon.json' with security hardening"
+			add_finding "Container Security" "INFO" "No Docker daemon configuration found" "$rec"
+			[ "$OUTPUT_FORMAT" = "console" ] && info "No Docker daemon configuration found"
 		fi
 	fi
 	
@@ -5905,6 +6170,24 @@ section_kernel_hardening() {
 		fi
 	fi
 	
+	# Check for CPU mitigation / exploit counters disabled on the kernel cmdline.
+	# Common perf-tuning leftovers: mitigations=off, nopti, nospectre_v1/v2,
+	# nospec_store_bypass_disable, nokaslr, nosmap/nosmep, ssbd/mds/l1tf off
+	if [ -f /proc/cmdline ]; then
+		local cmdline bad_flags=""
+		cmdline=$(safe_read /proc/cmdline 2>/dev/null || echo "")
+		bad_flags=$(printf '%s' "$cmdline" | tr ' \t\n' '   ' | grep -oE 'mitigations=off|nospectre_v[12]|nospectre_v2|nopti|nospec_store_bypass_disable|nokaslr|nosmap|nosmep|ssbd=off|mds=off|l1tf=off|retbleed=off|spectre_v2=off' | sort -u | tr '\n' ' ')
+		if [ -n "$bad_flags" ]; then
+			flags_clean=$(printf '%s' "$bad_flags" | sed 's/=/ /g')
+			rec="Remove or re-enable CPU exploit mitigations (grub: drop the offending parameters from GRUB_CMDLINE_LINUX_DEFAULT and update-grub)"
+			add_finding "Kernel Hardening" "CRIT" "Kernel cmdline disables exploit mitigations: $(echo "$flags_clean" | head -c 300)" "$rec"
+			crit "Kernel cmdline disables mitigations: $flags_clean"
+		else
+			add_finding "Kernel Hardening" "OK" "No kernel cmdline flags disabling CPU exploit mitigations" ""
+			ok "No disabled mitigations on kernel cmdline"
+		fi
+	fi
+	
 	# Check for hardened kernel features
 	hardening_checks=(
 		"kernel.kptr_restrict:1:Kernel pointer restriction"
@@ -6084,6 +6367,41 @@ section_secrets_sensitive_data() {
 		fi
 	fi
 	
+	# Process environment secret scan (root only).
+	# Secrets frequently leak via service definitions exported into process
+	# environments; /proc/*/environ is readable by root.
+	if is_root; then
+		local scan_pid scan_pname scan_varnames env_hits=0 scan_reported=0
+		local secret_env_pattern='([A-Za-z_][A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|API_KEY|APIKEY|ACCESS_KEY)[A-Za-z0-9_]*=.\S)'
+		for scan_pid in /proc/[0-9]*; do
+			[ $scan_reported -ge 8 ] && break
+			[ $env_hits -ge 30 ] && break
+			[ -r "$scan_pid/environ" ] || continue
+			local nenv
+			nenv=$(tr '\0' '\n' < "$scan_pid/environ" 2>/dev/null | grep -cE "$secret_env_pattern" || true)
+			nenv=${nenv:-0}
+			if [ "$nenv" -gt 0 ]; then
+				scan_pname=$(safe_read "$scan_pid/comm" 2>/dev/null || echo "unknown")
+				scan_pname=$(echo "$scan_pname" | head -1 | tr -d '\n')
+				scan_varnames=$(tr '\0' '\n' < "$scan_pid/environ" 2>/dev/null \
+					| grep -oE '^[A-Za-z_][A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|API_KEY|APIKEY|ACCESS_KEY)[A-Za-z0-9_]*' \
+					| sort -u | head -5 | tr '\n' ',' )
+				secrets_findings_made=true
+				env_hits=$((env_hits + nenv))
+				scan_reported=$((scan_reported + 1))
+				rec="Move secrets out of process environments (use files with 0600, secret managers, or docker/systemd env files with correct perms); rotate any leaked credentials"
+				add_finding "Secrets" "WARN" "Potential secrets in environment of process $scan_pname (pid ${scan_pid##*/}): variable names $(echo "$scan_varnames" | head -c 200)" "$rec"
+				warn "Env secrets in $scan_pname"
+			fi
+		done
+		if [ "$env_hits" -gt 0 ]; then
+			add_finding "Secrets" "INFO" "Env secret scan saw $env_hits suspicious variable assignment(s) in $scan_reported process(es); only variable names are shown, values never included" ""
+		else
+			add_finding "Secrets" "OK" "No obvious secrets found in process environments" ""
+			ok "No env secrets detected"
+		fi
+	fi
+	
 	# Add baseline finding if no sensitive data findings were made
 	if [ "$secrets_findings_made" = false ]; then
 		add_finding "Secrets" "INFO" "No sensitive files or agents detected" "Common sensitive data locations checked"
@@ -6146,8 +6464,8 @@ section_edr_monitoring() {
 	print_section "Endpoint Detection & Monitoring"
 	
 	# EDR/AV process detection
-	edr_processes=("crowdstrike" "cylance" "sentinelone" "defender" "carbonblack" "cortex" "endgame")
-	av_processes=("clamd" "freshclam" "avguard" "rtkdsm" "symantec")
+	edr_processes=("crowdstrike" "falcon" "cylance" "sentinelone" "defender" "mdatp" "carbonblack" "cortex" "endgame" "velociraptor" "elastic-agent")
+	av_processes=("clamd" "freshclam" "avguard" "rtkdsm" "symantec" "savscan" "esets_daemon" "esets_ams")
 	
 	edr_detected=false
 	for process in "${edr_processes[@]}"; do
@@ -6181,7 +6499,7 @@ section_edr_monitoring() {
 	
 	# SIEM forwarding detection (production mode)
 	if [ "$OPERATION_MODE" = "production" ]; then
-		siem_agents=("splunkforwarder" "filebeat" "logstash" "fluentd" "nxlog" "rsyslog")
+		siem_agents=("splunkforwarder" "filebeat" "logstash" "fluentd" "nxlog" "rsyslog" "wazuh-agent" "osqueryd")
 		siem_detected=false
 		
 		for agent in "${siem_agents[@]}"; do
@@ -6417,9 +6735,9 @@ ENHANCED SECURITY FEATURES (v$VERSION):
 • Enhanced rootkit detection capabilities
 • Behavioral analysis for anomaly detection
 • Advanced authentication and authorization controls
-• Comprehensive audit logging and access control (opt-in)
-• Script integrity verification and digital signatures
-• Role-based access control for different operations
+• Comprehensive audit logging (opt-in)
+• Data-driven distro lifecycle checks (endoflife.date + embedded snapshot)
+• systemd sandboxing exposure scoring and modern SSH crypto checks
 
 Usage: $0 [OPTIONS]
 
@@ -6460,6 +6778,26 @@ PRIVACY CONTROLS (v$VERSION):
   --anonymize                Hash identifiers (hostnames, usernames, IPs) with per-run salt
   --exclude-sections LIST    Comma-separated list (e.g., accounts,file-integrity)
   --exclude-severity LIST    Comma-separated list (e.g., INFO,OK)
+
+OFFLINE MODE (v$VERSION):
+  --offline                  Do not refresh metadata or query network data sources
+                             (skips apt-get update, dnf/yum metadata refresh, and
+                             lifecycle API lookups; uses cached/embedded data only)
+
+WORKFLOW / AUTOMATION (v$VERSION):
+  --fail-on CRIT|WARN|none   Exit code policy for CI/cron: exit 2 when any CRIT
+                             finding exists (CRIT mode), exit 1 when any WARN or
+                             CRIT exists (WARN mode), always 0 (default, none).
+                             Summary/Drift/Privilege-Summary entries are ignored.
+  --baseline FILE            Compare this run against a findings file produced
+                             by --save-findings; reports NEW/RESOLVED CRIT/WARN
+                             issues in a dedicated Drift section
+  --save-findings FILE       Save this run's findings as a baseline file
+
+EXAMPLES (workflow):
+  sudo $0 --fail-on CRIT                     # scheduled run: exit 2 on CRIT
+  sudo $0 --baseline base.findings           # drift report vs last run
+  sudo $0 --baseline b.findings --save-findings b.findings   # rolling baseline
 
 PRIVACY:
 This script may access sensitive system files for security analysis.
@@ -6521,6 +6859,37 @@ while [ $# -gt 0 ]; do
 		--anonymize)
 			ANONYMIZE=true
 			;;
+		--offline)
+			OFFLINE=true
+			;;
+		--fail-on)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --fail-on requires an argument (none, WARN, CRIT)" >&2; exit 1; }
+			case "$1" in
+				none|NONE) FAIL_ON="none" ;;
+				warn|WARN) FAIL_ON="WARN" ;;
+				crit|CRIT) FAIL_ON="CRIT" ;;
+				*) echo "Error: invalid --fail-on value '$1'. Use: none, WARN, CRIT" >&2; exit 1 ;;
+			esac
+			;;
+		--baseline)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --baseline requires a file argument" >&2; exit 1; }
+			if ! validate_output_path "$1"; then
+				echo "Error: Invalid baseline path '$1'. Path traversal not allowed." >&2
+				exit 1
+			fi
+			BASELINE_FILE="$1"
+			;;
+		--save-findings)
+			shift
+			[ $# -eq 0 ] && { echo "Error: --save-findings requires a file argument" >&2; exit 1; }
+			if ! validate_output_path "$1"; then
+				echo "Error: Invalid --save-findings path '$1'. Path traversal not allowed." >&2
+				exit 1
+			fi
+			SAVE_FINDINGS_FILE="$1"
+			;;
 		--exclude-sections)
 			shift
 			[ $# -eq 0 ] && { echo "Error: --exclude-sections requires an argument" >&2; exit 1; }
@@ -6566,7 +6935,7 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
     echo "║                                                                            ║"
     echo "╚════════════════════════════════════════════════════════════════════════════╝"
     echo
-    echo "Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT"
+    echo "Mode: $OPERATION_MODE | Format: $OUTPUT_FORMAT$( [ "$OFFLINE" = true ] && echo ' | Offline: yes' )"
     [ -n "$OUTPUT_FILE" ] && echo "Output: $OUTPUT_FILE"
     echo
     echo "SECURITY NOTICE:"
@@ -6597,13 +6966,7 @@ fi
 
 
 
-# Initialize advanced security features
-# Verify script integrity
-if ! verify_script_integrity; then
-    echo "Warning: Script integrity verification failed. Proceeding with caution." >&2
-fi
-
-# Set permission level based on user context
+# Establish user privilege context (informational)
 set_permission_level
 
 # Enable audit logging only if explicitly requested and permissions allow
@@ -6730,126 +7093,245 @@ if [ -n "$OUTPUT_FILE" ] && [ "$OUTPUT_FORMAT" != "console" ]; then
     exec >/dev/null
 fi
 
-# Run all checks with error isolation
-if [ "$PARALLEL_MODE" = true ]; then
-    # Conservative parallelism: run core checks sequentially for stable console/JSON output
-    run_section_safely section_system "System"
-    run_section_safely section_updates "Updates"
-    run_section_safely section_listening "Listening Services"
-    run_section_safely section_firewall "Firewall"
-    run_section_safely section_ssh "SSH Hardening"
-    run_section_safely section_auditing "Auditing/Hardening"
-    run_section_safely section_accounts "Accounts and Sudo"
-    run_section_safely section_permissions "Risky Permissions"
-    run_section_safely section_package_integrity "Package Integrity"
-    run_section_safely section_file_integrity "File Integrity"
-    run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
-    run_section_safely section_intrusion_detection "Intrusion Detection"
-    run_section_safely section_time_sync "Time Synchronization"
-    run_section_safely section_logging "Logging and Monitoring"
-    run_section_safely section_network_security "Network Security"
-    run_section_safely section_process_forensics "Process & Forensics"
-    run_section_safely section_secure_configuration "Secure Configuration"
-    run_section_safely section_container_security "Container & Virtualization Security"
-    run_section_safely section_kernel_hardening "Kernel & System Hardening"
-    run_section_safely section_application_security "Application-Level Protections"
-    run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
-    
-    # Production-only sections (compliance, enterprise monitoring, centralized logging)
-    if [ "$OPERATION_MODE" = "production" ]; then
-        run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
-        run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
-        run_section_safely section_backup_resilience "Resilience & Backup"
-        run_section_safely section_compliance_checks "Compliance & Audit"
-        run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
-        run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
-    fi
-    
-    # Privilege escalation and hardening checks (both modes)
-    run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
-    run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
-    run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
-    run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
-    run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
-    run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
-    run_section_safely section_enhanced_network_security "Enhanced Network Security"
-    run_section_safely section_enhanced_process_security "Enhanced Process Security"
-    
-    # NOTE: Scheduler controls (cron/anacron/at) are covered in:
-    # - section_persistence_mechanisms (crontabs, systemd timers)
-    # - section_taskrunners_nfs (cron security analysis)
-    
-    # Advanced detection in parallel for speed without destabilizing output
-    run_section_parallel section_malware_detection "Malware Detection"
-    run_section_parallel section_rootkit_detection "Rootkit Detection"
-    run_section_parallel section_behavioral_analysis "Behavioral Analysis"
-    
-    # Monitor resources during parallel execution
-    monitor_resources
-    
-    wait_parallel_sections
-else
-    # Sequential execution (default)
-    run_section_safely section_system "System"
-    run_section_safely section_updates "Updates"
-    run_section_safely section_listening "Listening Services"
-    run_section_safely section_firewall "Firewall"
-    run_section_safely section_ssh "SSH Hardening"
-    run_section_safely section_auditing "Auditing/Hardening"
-    run_section_safely section_accounts "Accounts and Sudo"
-    run_section_safely section_permissions "Risky Permissions"
-    run_section_safely section_intrusion_detection "Intrusion Detection"
-    run_section_safely section_time_sync "Time Synchronization"
-    run_section_safely section_logging "Logging and Monitoring"
-    run_section_safely section_network_security "Network Security"
-    run_section_safely section_package_integrity "Package Integrity"
-    run_section_safely section_file_integrity "File Integrity"
-    run_section_safely section_persistence_mechanisms "Persistence Mechanisms"
-    run_section_safely section_process_forensics "Process & Forensics"
-    run_section_safely section_secure_configuration "Secure Configuration"
-    run_section_safely section_container_security "Container & Virtualization Security"
-    run_section_safely section_kernel_hardening "Kernel & System Hardening"
-    run_section_safely section_application_security "Application-Level Protections"
-    run_section_safely section_secrets_sensitive_data "Secrets & Sensitive Data"
-    
-    # Production-only sections (compliance, enterprise monitoring, centralized logging)
-    if [ "$OPERATION_MODE" = "production" ]; then
-        run_section_safely section_cloud_remote_mgmt "Cloud & Remote Management"
-        run_section_safely section_edr_monitoring "Endpoint Detection & Monitoring"
-        run_section_safely section_backup_resilience "Resilience & Backup"
-        run_section_safely section_compliance_checks "Compliance & Audit"
-        run_section_safely section_enhanced_logging_security "Enhanced Logging Security"
-        run_section_safely section_enhanced_network_access "Enhanced Network Access Controls"
-    fi
-    
-    # Privilege escalation and hardening checks (both modes)
-    run_section_safely section_privesc_surface_core "Privilege Escalation Surface (Core)"
-    run_section_safely section_taskrunners_nfs "Task Runners & NFS Risk"
-    run_section_safely section_container_ssh_secrets_hygiene "Container, SSH & Secrets Hygiene"
-    run_section_safely section_kernel_polkit_fstab_refinements "Kernel, Polkit & Filesystem Hardening"
-    run_section_safely section_privesc_surface_extended "Privilege Escalation Surface (Extended)"
-    run_section_safely section_enhanced_kernel_security "Enhanced Kernel Security"
-    run_section_safely section_enhanced_network_security "Enhanced Network Security"
-    run_section_safely section_enhanced_process_security "Enhanced Process Security"
-    
-    # NOTE: Scheduler controls (cron/anacron/at) are covered in:
-    # - section_persistence_mechanisms (crontabs, systemd timers)
-    # - section_taskrunners_nfs (cron security analysis)
-    
-    # Advanced detection (sequential)
-    run_section_safely section_malware_detection "Malware Detection"
-    run_section_safely section_rootkit_detection "Rootkit Detection"
-    run_section_safely section_behavioral_analysis "Behavioral Analysis"
-fi
-
-# Always run privilege summary and overall summary
-run_section_safely section_privilege_summary "Privilege Limitations Summary"
-run_section_safely section_summary "Summary"
-
 # Production-only: Resource Health monitoring
-if [ "$OPERATION_MODE" = "production" ]; then
-    run_section_safely section_resource_health "Resource Health"
+# (Defined before the section registry loop so the function exists when called)
+section_resource_health() {
+    print_section "Resource Health"
+    if command_exists uptime; then
+        la=$(uptime 2>/dev/null | awk -F'load average: ' '{print $2}' | tr -d ',' | awk '{printf "%s %s %s", $1,$2,$3}')
+        [ -n "$la" ] && add_finding "Resource Health" "INFO" "Load average (1/5/15m): $la" "Investigate sustained high load in production"
+    fi
+    if command_exists free; then
+        mem_used=$(free -m 2>/dev/null | awk '/^Mem:/ {print $3"/"$2" MB"}')
+        add_finding "Resource Health" "INFO" "Memory usage: $mem_used" "Ensure capacity and investigate leaks if consistently high"
+    fi
+    if command_exists df; then
+        high_usage=$(df -hP 2>/dev/null | awk 'NR>1 && $5+0>=85 {print $6" ("$5")"}' | tr '\n' ' ')
+        if [ -n "$high_usage" ]; then
+            add_finding "Resource Health" "WARN" "Low free space on: $high_usage" "Free space or expand volumes; keep usage <80% in prod"
+        else
+            add_finding "Resource Health" "OK" "Disk usage under 85%" ""
+        fi
+    fi
+}
+
+# Section registry: the single source of truth for what runs and in which order.
+# Format: "func|Display Name|flag"
+#   (empty) = always run (sequential)
+#   P       = production mode only
+#   A       = advanced detection; parallel when -p is used, otherwise sequential
+#   F       = final summary sections, always run
+readonly SECTION_REGISTRY=(
+    "section_system|System|"
+    "section_updates|Updates|"
+    "section_listening|Listening Services|"
+    "section_firewall|Firewall|"
+    "section_ssh|SSH Hardening|"
+    "section_auditing|Auditing/Hardening|"
+    "section_accounts|Accounts and Sudo|"
+    "section_permissions|Risky Permissions|"
+    "section_intrusion_detection|Intrusion Detection|"
+    "section_time_sync|Time Synchronization|"
+    "section_logging|Logging and Monitoring|"
+    "section_network_security|Network Security|"
+    "section_package_integrity|Package Integrity|"
+    "section_file_integrity|File Integrity|"
+    "section_persistence_mechanisms|Persistence Mechanisms|"
+    "section_process_forensics|Process & Forensics|"
+    "section_secure_configuration|Secure Configuration|"
+    "section_container_security|Container & Virtualization Security|"
+    "section_kernel_hardening|Kernel & System Hardening|"
+    "section_application_security|Application-Level Protections|"
+    "section_secrets_sensitive_data|Secrets & Sensitive Data|"
+    "section_cloud_remote_mgmt|Cloud & Remote Management|P"
+    "section_edr_monitoring|Endpoint Detection & Monitoring|P"
+    "section_backup_resilience|Resilience & Backup|P"
+    "section_compliance_checks|Compliance & Audit|P"
+    "section_enhanced_logging_security|Enhanced Logging Security|P"
+    "section_enhanced_network_access|Enhanced Network Access Controls|P"
+    "section_privesc_surface_core|Privilege Escalation Surface (Core)|"
+    "section_taskrunners_nfs|Task Runners & NFS Risk|"
+    "section_container_ssh_secrets_hygiene|Container, SSH & Secrets Hygiene|"
+    "section_kernel_polkit_fstab_refinements|Kernel, Polkit & Filesystem Hardening|"
+    "section_privesc_surface_extended|Privilege Escalation Surface (Extended)|"
+    "section_enhanced_kernel_security|Enhanced Kernel Security|"
+    "section_enhanced_network_security|Enhanced Network Security|"
+    "section_enhanced_process_security|Enhanced Process Security|"
+    "section_malware_detection|Malware Detection|A"
+    "section_rootkit_detection|Rootkit Detection|A"
+    "section_behavioral_analysis|Behavioral Analysis|A"
+    "section_privilege_summary|Privilege Limitations Summary|F"
+    "section_summary|Summary|F"
+    "section_resource_health|Resource Health|P"
+)
+
+# NOTE: Scheduler controls (cron/anacron/at) are covered in:
+# - section_persistence_mechanisms (crontabs, systemd timers)
+# - section_taskrunners_nfs (cron security analysis)
+
+# Helper shared by drift/exit-code logic: is this line part of internal bookkeeping?
+# Internal sections must not take part in drift comparisons or severity thresholds.
+drift_internal_section() {
+    case "$1" in
+        Summary|Drift|"Privilege Limitations Summary"|INTERNAL) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Workflow: drift detection vs a previous run's findings file (--baseline).
+# Compares WARN/CRIT records by section+message; new and resolved issues are
+# reported in a dedicated "Drift" section (which is itself excluded from
+# --fail-on evaluation so exit codes reflect the actual scan only).
+process_baseline_drift() {
+    [ -n "${BASELINE_FILE:-}" ] || return 0
+    local line _s _sev _msg
+    if [ ! -r "$BASELINE_FILE" ]; then
+        add_finding "Drift" "WARN" "Baseline file not readable: $BASELINE_FILE" "Check the --baseline path and file permissions"
+        [ "$OUTPUT_FORMAT" = "console" ] && warn "Baseline file not readable: $BASELINE_FILE"
+        return 0
+    fi
+    declare -A _prev_keys=()
+    declare -A _cur_keys=()
+    local baseline_records=0
+    while IFS= read -r line; do
+        [ "$baseline_records" -lt 5000 ] || break
+        [ -z "$line" ] && continue
+        IFS='|' read -r _s _sev _msg _rec <<< "$line"
+        if drift_internal_section "$_s"; then continue; fi
+        case "$_sev" in
+            CRIT|WARN) _prev_keys["${_s}|${_msg}"]="$_sev"; baseline_records=$((baseline_records+1)) ;;
+        esac
+    done < "$BASELINE_FILE"
+
+    for line in "${FINDINGS[@]}"; do
+        [ -z "$line" ] && continue
+        IFS='|' read -r _s _sev _msg _rec <<< "$line"
+        if drift_internal_section "$_s"; then continue; fi
+        case "$_sev" in
+            CRIT|WARN) _cur_keys["${_s}|${_msg}"]="$_sev" ;;
+        esac
+    done
+
+    local new_count=0 resolved_count=0 k base_sev
+    local new_crit=0 new_warn=0
+    local seen_new=false seen_resolved=false
+    for k in "${!_cur_keys[@]}"; do
+        if [ -z "${_prev_keys[$k]:-}" ]; then
+            base_sev="${_cur_keys[$k]}"
+            add_finding "Drift" "WARN" "New since baseline ($base_sev): $k" "Check if expected; refresh the baseline afterwards with --save-findings"
+            if [ "$OUTPUT_FORMAT" = "console" ]; then
+                if [ "$base_sev" = "CRIT" ]; then
+                    crit "[DRIFT][NEW] $k"
+                    new_crit=$((new_crit+1))
+                else
+                    warn "[DRIFT][NEW] $k"
+                    new_warn=$((new_warn+1))
+                fi
+            fi
+            new_count=$((new_count+1))
+        fi
+    done
+    for k in "${!_prev_keys[@]}"; do
+        if [ -z "${_cur_keys[$k]:-}" ]; then
+            add_finding "Drift" "INFO" "Resolved since baseline (was ${_prev_keys[$k]}): $k" ""
+            if [ "$OUTPUT_FORMAT" = "console" ]; then
+                info "[DRIFT][RESOLVED] $k"
+            fi
+            resolved_count=$((resolved_count+1))
+        fi
+    done
+
+    add_finding "Drift" "INFO" "Baseline comparison complete: $new_count new issues, $resolved_count resolved ($baseline_records baseline records, WARN and CRIT only)" ""
+    if [ "$OUTPUT_FORMAT" = "console" ]; then
+        echo
+        echo "=== Drift (vs $BASELINE_FILE) ==="
+        echo "New since baseline: $new_count ($new_crit CRIT, $new_warn WARN) | Resolved since baseline: $resolved_count"
+        [ "$OUTPUT_FORMAT" = "console" ] && echo
+    fi
+}
+
+# Workflow: persist current findings as a baseline file for a later --baseline run
+save_findings_for_baseline() {
+    [ -n "${SAVE_FINDINGS_FILE:-}" ] || return 0
+    local tmpf
+    tmpf=$(mktemp 2>/dev/null) || return 1
+    {
+        local line _s _sev _msg _rec
+        for line in "${FINDINGS[@]}"; do
+            [ -z "$line" ] && continue
+            IFS='|' read -r _s _sev _msg _rec <<< "$line"
+            if drift_internal_section "$_s"; then continue; fi
+            printf '%s\n' "$line"
+        done
+    } > "$tmpf"
+    chmod 600 "$tmpf" 2>/dev/null || true
+    if mv -f "$tmpf" "$SAVE_FINDINGS_FILE" 2>/dev/null; then
+        echo "Baseline saved: $SAVE_FINDINGS_FILE"
+    else
+        rm -f "$tmpf" 2>/dev/null || true
+        echo "Error: failed to write baseline file '$SAVE_FINDINGS_FILE'" >&2
+        return 1
+    fi
+}
+
+# Workflow: exit code policy via --fail-on (for CI/cron scheduling).
+# none -> always 0; CRIT -> 2 on any CRIT; WARN -> 2 on CRIT, else 1 on WARN.
+# Workflow: exit-code policy via --fail-on (for CI/cron scheduling).
+# none -> always 0; CRIT -> 2 on any CRIT; WARN -> 2 on CRIT, else 1 on WARN.
+compute_fail_exit_code() {
+    [ "${FAIL_ON:-none}" = "none" ] && { echo 0; return; }
+    local fs _s _sev _msg _rec
+    local has_crit=false has_warn=false
+    for fs in "${FINDINGS[@]}"; do
+        [ -z "$fs" ] && continue
+        # NOTE: read with exactly four vars - with fewer vars, the last var swallows
+        # the remaining pipe-delimited text and severity checks would never match
+        IFS='|' read -r _s _sev _msg _rec <<< "$fs"
+        if drift_internal_section "$_s"; then continue; fi
+        case "$_sev" in
+            CRIT) has_crit=true; has_warn=true ;;
+            WARN) has_warn=true ;;
+        esac
+    done
+    if [ "$has_crit" = true ]; then
+        echo 2
+    elif [ "$FAIL_ON" = "WARN" ] && [ "$has_warn" = true ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+
+# Run all checks with error isolation, driven by the registry above.
+# This replaces the two duplicated section lists that existed before (they could
+# and did drift apart); also fixes Resource Health being called before its
+# function definition existed.
+for _entry in "${SECTION_REGISTRY[@]}"; do
+    IFS='|' read -r _func _name _flag <<< "$_entry"
+    case "$_flag" in
+        P)
+            [ "$OPERATION_MODE" = "production" ] || continue
+            ;;
+        A)
+            if [ "$PARALLEL_MODE" = true ]; then
+                run_section_parallel "$_func" "$_name"
+                continue
+            fi
+            ;;
+    esac
+    run_section_safely "$_func" "$_name"
+done
+unset _entry _func _name _flag
+
+# Collect parallel section results (only relevant with -p)
+if [ "$PARALLEL_MODE" = true ]; then
+    monitor_resources
+    wait_parallel_sections
 fi
+
+# Workflow: compare against baseline (after all findings are collected)
+process_baseline_drift
 
 # Restore stdout if we had suppressed it
 if [ "$QUIET_MODE" = true ]; then
@@ -6904,27 +7386,6 @@ if [ "$EUID" -eq 0 ] && [ "$ORIGINAL_UID" -ne 0 ]; then
     drop_privileges
 fi
 
-# Production-only resource health checks (function defined near end for structure)
-section_resource_health() {
-    print_section "Resource Health"
-    if command_exists uptime; then
-        la=$(uptime 2>/dev/null | awk -F'load average: ' '{print $2}' | tr -d ',' | awk '{printf "%s %s %s", $1,$2,$3}')
-        [ -n "$la" ] && add_finding "Resource Health" "INFO" "Load average (1/5/15m): $la" "Investigate sustained high load in production"
-    fi
-    if command_exists free; then
-        mem_used=$(free -m 2>/dev/null | awk '/^Mem:/ {print $3"/"$2" MB"}')
-        add_finding "Resource Health" "INFO" "Memory usage: $mem_used" "Ensure capacity and investigate leaks if consistently high"
-    fi
-    if command_exists df; then
-        high_usage=$(df -hP 2>/dev/null | awk 'NR>1 && $5+0>=85 {print $6" ("$5")"}' | tr '\n' ' ')
-        if [ -n "$high_usage" ]; then
-            add_finding "Resource Health" "WARN" "Low free space on: $high_usage" "Free space or expand volumes; keep usage <80% in prod"
-        else
-            add_finding "Resource Health" "OK" "Disk usage under 85%" ""
-        fi
-    fi
-}
-
 # Final security notice for console output
 if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo
@@ -6936,8 +7397,8 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	echo "   • Comprehensive compliance and audit assessment"
 	echo "   • Enhanced container and process security analysis"
 	echo "   • Industry-standard security validation (CIS, NIST aligned)"
-	echo "   • Advanced authentication and authorization controls"
-	echo "   • Comprehensive audit logging and access control"
+	echo "   • Data-driven distro lifecycle checks + systemd/SSH crypto hardening"
+	echo "   • Comprehensive audit logging (opt-in)"
 	if [ "$AUDIT_ENABLED" = true ]; then
 		echo "🔍 Audit log saved: $AUDIT_LOG"
 	else
@@ -6945,6 +7406,9 @@ if [ "$OUTPUT_FORMAT" = "console" ]; then
 	fi
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
+
+# Workflow: persist findings as baseline (after all findings including drift)
+save_findings_for_baseline || true
 
 # Log script completion for audit (only if audit logging is enabled)
 if [ "$AUDIT_ENABLED" = true ]; then
@@ -6955,7 +7419,13 @@ fi
 if [ "$AUDIT_ENABLED" = true ] && [ -f "$AUDIT_LOG" ] && [ ! -s "$AUDIT_LOG" ]; then
     rm -f "$AUDIT_LOG" 2>/dev/null || true
 fi
+# Workflow: exit-code policy (--fail-on). Warnings about the exit reason go to
+# stderr so stdout stays clean for output files.
+_scan_exit_code="$(compute_fail_exit_code)"
+if [ "$_scan_exit_code" != "0" ]; then
+    echo "bt-quickcheck: exit code $_scan_exit_code (--fail-on $FAIL_ON threshold reached)" >&2
+fi
+exit "$_scan_exit_code"
 
-exit 0
 
 

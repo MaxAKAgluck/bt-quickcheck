@@ -20,38 +20,40 @@ A fast, no-hassle Linux one-liner to baseline a host from a blue team perspectiv
 - [Operation Modes](#operation-modes)
 - [Security Assessment Categories](#security-assessment-categories)
 - [Output Formats](#output-formats)
+- [Workflows & Automation](#workflows--automation)
 - [Implementation Progress](#implementation-progress)
-- [Enhanced Input Validation & Security Features](#enhanced-input-validation--security-features)
+- [Safety & Design Principles](#safety--design-principles)
 - [References](#references)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact & Support](#contact--support)
-- [Acknowledgments](#acknowledgments)
-- [Enterprise Compliance & Industry Standards](#enterprise-compliance--industry-standards)
-
-## Features
+- [Acknowledgments](#acknowledgments)## Features
 
 ### Core Features
-- **Security Hardened**: All critical security vulnerabilities patched (v0.6.3)
 - **Fully Self-Contained**: No external configuration files required - works out of the box
 - **Zero Dependencies**: Single Bash script with embedded defaults, runs anywhere
 - **Blue Team Focused**: Defensive posture checks rather than privilege escalation
-- **Read-Only by Design**: Does not change system state, safe for production
+- **Read-Only by Design**: Does not change system state, safe for production; `--offline` guarantees no state changes and no network access
+- **Strict by Construction**: `set -euo pipefail`, whitelist-based command validation, hardened path/file handling
 - **One-Liner Friendly**: Quick remote deployment like LinPEAS for blue teams
 
 ### Assessment Capabilities
-- **Comprehensive baseline**: 41 security sections with 52 new critical checks added
+- **Comprehensive baseline**: 41 security sections (34 in personal mode, 41 in production mode)
 - **Multiple output formats**: Console, JSON, HTML, and plain text (auto-detected by file extension)
 - **Personal and production modes**: Context-aware recommendations for different environments
 - **Actionable results**: Severity levels (OK/WARN/CRIT/INFO) with clear next steps
 - **CIS/NIST aligned**: Checks aligned with common security guidance frameworks
+- **Data-driven lifecycle checks**: Distro EOL detection via the [endoflife.date API](https://endoflife.date/docs/api/v1/), with an embedded snapshot fallback for offline runs
+- **Modern detection**: systemd unit sandboxing exposure scores, SSH crypto posture (legacy primitives, post-quantum kex, agent forwarding), CrowdSec and current EDR/AV products
 
 ### Performance & Reliability
 - **Parallel execution**: 30-50% faster scanning with `-p` flag
 - **Intelligent caching**: Smart caching system for expensive operations (5-min TTL)
-- **Timeout protection**: Section-level timeouts prevent hangs
 - **Graceful degradation**: Continues assessment even if individual checks fail
-- **Optimized code**: 10 duplicate checks removed, 15-20% performance improvement
+
+### Automation Workflows
+- **`--fail-on CRIT|WARN`**: exit codes for CI/cron scheduling and alerting
+- **`--baseline` / `--save-findings`**: drift comparison between runs - see NEW and RESOLVED issues since the last scan
 
 ### Advanced Detection
 - **Malware detection**: Crypto-jacking, suspicious processes, LD_PRELOAD persistence
@@ -77,7 +79,7 @@ I wanted a quick, practical way to baseline a Linux host from a defender’s poi
 
 ## How this was built
 
-This project was created primarily using the LLM IDE Cursor and the Claude 4 Sonnet thinking model, with additional external research and manual review. Expect some rough edges—suggestions and fixes are very welcome.
+The v0.2–0.6 era of this project was built in the Cursor IDE with Claude (Sonnet) plus external research and manual review. The v0.7.0 revival and reorganization was driven by [OpenCode](https://opencode.ai), alternating between GLM and other supported models for code analysis, refactoring, and check research - all combined with manual review, hands-on testing (WSL smoke tests, no full production runs), and source research (endoflife.date API docs, CIS/NIST guidance, current EDR/AV/SIEM landscape). Expect some rough edges - suggestions and fixes are very welcome.
 
 ## Project status
 
@@ -91,13 +93,7 @@ This is an early, evolving tool. The script is still raw and under development. 
 - Bash 4.0+ (included in most modern Linux distributions)
 - `sudo` access for comprehensive assessment (see [Sudo Requirements](#sudo-requirements) below)
 
-### Method 1: Direct Execution (Recommended)
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MaxAKAgluck/bt-quickcheck/main/bt-quickcheck.sh)
-```
-
-### Method 2: Download and Execute
+### Method 1: Download and Execute
 
 ```bash
 # Download the script
@@ -110,7 +106,7 @@ chmod +x bt-quickcheck.sh
 sudo ./bt-quickcheck.sh
 ```
 
-### Method 3: Git Clone
+### Method 2: Git Clone
 
 ```bash
 git clone https://github.com/MaxAKAgluck/bt-quickcheck.git
@@ -149,6 +145,12 @@ OPTIONS:
   -m, --mode MODE         Operation mode: personal, production (default: personal)
   -p, --parallel          Enable parallel execution for independent checks
   -a, --audit             Enable comprehensive audit logging (disabled by default)
+  --offline               Do not refresh metadata or query network data sources
+                          (no apt-get update / dnf-yum metadata refresh / lifecycle API calls;
+                          uses local package cache and embedded snapshot data only)
+  --fail-on CRIT|WARN|none   Exit-code policy for CI/cron (default none; see [Workflows](#workflows--automation))
+  --baseline FILE            Compare this run against a previous --save-findings file (drift mode)
+  --save-findings FILE       Save this run's findings as a baseline file
       --privacy-level L   standard (default), high, off
       --anonymize         Hash identifiers (hostnames, usernames, IPs) with per-run salt
       --exclude-sections  Comma-separated list (e.g., accounts,file-integrity)
@@ -174,6 +176,47 @@ sudo ./bt-quickcheck.sh -o results/report.txt
 ```
 
 Allowed locations include your current working directory, your home directory, and standard temporary directories (`/tmp`, `/var/tmp`). Paths are canonicalized to prevent traversal attacks.
+
+## Workflows & Automation
+
+### Exit codes for CI/cron scheduling
+
+With no flags the script always exits 0 (unless arguments are invalid). `--fail-on` turns findings into exit codes so scheduled runs can alert:
+
+| Flag | Condition | Exit code |
+|------|-----------|-----------|
+| `--fail-on CRIT` | any CRIT finding in the scan | `2` |
+| `--fail-on WARN` | any CRIT finding | `2`, else `1` when any WARN exists | 
+| `--fail-on CRIT` / `WARN` | no findings at/above threshold | `0` |
+| (default `none`) | - | always `0` |
+
+`Summary`, `Drift`, and `Privilege Limitations Summary` bookkeeping entries never affect the exit code - only real scan findings do.
+
+```bash
+# Scheduled run with alerting: cron sends mail on non-zero exit
+17 3 * * * sudo /opt/btqc/bt-quickcheck.sh --offline --fail-on WARN
+```
+
+### Drift mode (what changed since the last scan?)
+
+Baselines are the script's own pipe-delimited findings files - not the JSON/HTML reports:
+
+```bash
+# First run: capture a baseline
+sudo ./bt-quickcheck.sh --offline --save-findings /var/lib/btqc/baseline.findings
+
+# Any later run: see NEW and RESOLVED issues
+sudo ./bt-quickcheck.sh --offline --baseline /var/lib/btqc/baseline.findings
+
+# Rolling baseline: compare, then overwrite the baseline with today's results
+sudo ./bt-quickcheck.sh --offline \
+  --baseline /var/lib/btqc/baseline.findings \
+  --save-findings /var/lib/btqc/baseline.findings
+```
+
+Drift compares CRIT/WARN records by section and message. New issues appear in a dedicated **Drift** section with their original severity (a new CRIT prints as `[DRIFT][NEW]` with CRIT emphasis); resolved issues are listed as informational. The Drift section is included in JSON/HTML/TXT output automatically.
+
+Anonymization note: baselines record exactly what the run reported. If you scan with `--anonymize`, keep using it for both runs of the comparison (messages are hashed differently per salt otherwise).
 
 ## Sudo Requirements
 
@@ -293,69 +336,60 @@ sudo ./bt-quickcheck.sh -m production
 
 ## Security Assessment Categories
 
-bt-quickcheck performs comprehensive security assessments across **41 sections** (34 in personal mode, 41 in production mode):
+bt-quickcheck runs its sections from a single ordered registry in the script, so the list below always mirrors execution. **41 sections** total: **34** run in personal mode, the 7 marked *(production only)* are added with `-m production`.
 
-### Core System Security (21 sections - both modes)
-1. **System Information**: Distribution, kernel version (with EOL detection), uptime, virtualization, crash analysis
-2. **Updates & Patching**: Pending updates, automatic updates status, last update time tracking
-3. **Listening Services**: Open ports, insecure service detection (telnet, FTP, rsh), exposed databases
-4. **Firewall**: Active status checks (UFW, firewalld, iptables), SSH rate limiting detection
-5. **SSH Hardening**: PermitRootLogin, PasswordAuth, Protocol version, MaxAuthTries, PubkeyAuth
-6. **Auditing**: auditd status, log immutability, audit rules count, SELinux/AppArmor
-7. **User Accounts**: UID 0 validation, inactive accounts (>90 days), sudo timeout, passwordless accounts
-8. **Permissions**: World-writable files, SUID binaries, unowned files, sensitive file permissions
-9. **Package Integrity**: RPM/DEB verification, orphaned packages, GPG signature verification
-10. **File Integrity**: AIDE/Tripwire detection, immutable attributes (chattr +i), suspicious binary modifications
-11. **Persistence Mechanisms**: Cron jobs, systemd timers/services, rc.local, shell configs, bootloader tampering
-12. **Intrusion Detection**: fail2ban status, FIM tools (AIDE, Tripwire, OSSEC, Wazuh), ban statistics
-13. **Time Synchronization**: chrony/NTP status, time drift detection, NTP authentication
-14. **Logging**: Service status, remote logging configuration, log file health and permissions
-15. **Network Security**: Promiscuous mode detection, risky port analysis, network hardening
-16. **Process Forensics**: Process tree analysis, network connections, temp directory execution, capabilities
-17. **Secure Configuration**: Core dumps, umask settings, 2FA detection
-18. **Container Security**: Docker/Podman/LXC/Kubernetes, privileged containers, image scanners, Content Trust
-19. **Kernel Hardening**: Secure Boot, lockdown mode, module signing, sysctl hardening (dmesg_restrict, kptr_restrict)
-20. **Application Security**: Web server TLS, database binding validation, SSL/TLS enforcement
-21. **Secrets & Sensitive Data**: AWS/SSH/Kubernetes credentials, .env files, SSH/GPG agent detection
+### Core Baseline (21 sections - both modes)
+1. **System**: Distribution, kernel, uptime, virtualization, crash indicators, **data-driven distro EOL detection** (endoflife.date API with embedded-snapshot offline fallback)
+2. **Updates & Patching**: Pending updates per package manager (apt/dnf/yum/zypper), automatic-update status, last-update recency; `--offline` skips metadata refresh
+3. **Listening Services**: Open ports, insecure services (telnet, FTP, rsh, rlogin, finger, tftp), privileged-port summary
+4. **Firewall**: ufw/firewalld/nftables/iptables status, SSH rate-limiting detection
+5. **SSH Hardening**: PermitRootLogin, PasswordAuthentication, Allow/Deny lists, Port, Protocol, MaxAuthTries, PubkeyAuthentication, **weak crypto primitives (SHA-1/3DES/CBC/Arcfour), OpenSSH version & post-quantum kex guidance, AllowAgentForwarding**
+6. **Auditing/Hardening**: auditd status, audit rules count, log immutability, SELinux/AppArmor
+7. **Accounts and Sudo**: UID 0 validation, passwordless accounts, inactive accounts (>90 days), sudo timeout
+8. **Risky Permissions**: World-writable files, SUID/SGID binaries, unowned files, sensitive file permissions
+9. **Intrusion Detection**: **fail2ban and CrowdSec** (engine state, ban/decision counts), FIM tools (AIDE, Tripwire, OSSEC, Wazuh)
+10. **Time Synchronization**: chrony/NTP/systemd-timesyncd status, drift estimation
+11. **Logging and Monitoring**: service status, remote logging configuration, log file health
+12. **Network Security**: Promiscuous mode detection, risky port analysis, **DNS posture (resolv.conf sanity, systemd-resolved DNSSEC / DNS-over-TLS config)**
+13. **Package Integrity**: rpm -Va / debsums verification, orphaned packages, GPG repo validation
+14. **File Integrity**: AIDE/Tripwire, immutable attributes (chattr +i), suspicious binary modification
+15. **Persistence Mechanisms**: Cron jobs, systemd timers/services, rc.local, shell configs, bootloader tampering
+16. **Process & Forensics**: Process tree analysis, network connections, temp-directory execution, capabilities
+17. **Secure Configuration**: Core dumps, umask, 2FA detection, **systemd sandboxing exposure scores (`systemd-analyze security`) discovered dynamically from services that own listening sockets**
+18. **Container & Virtualization Security**: Docker/Podman/LXC/Kubernetes, privileged containers, image scanners, content trust, **daemon.json hardening (userns-remap, live-restore, log rotation, remote TCP API)**
+19. **Kernel & System Hardening**: Secure Boot, lockdown mode, module signing, sysctl hardening (dmesg_restrict, kptr_restrict, ...), **kernel cmdline flag scan (mitigations=off, nopti, nokaslr, nospectre, ...)**
+20. **Application-Level Protections**: Web server TLS, database binding validation, SSL/TLS enforcement
+21. **Secrets & Sensitive Data**: AWS/SSH/Kubernetes credentials, .env files, SSH/GPG agent detection, **process-environment secret scan (/proc/*/environ var names only, with sudo)**
 
-### Advanced Detection & Hardening (13 sections - both modes)
-22. **Privilege Escalation (Core)**: SUID analysis, sudo vulnerabilities (CVE-2023-22809, Baron Samedit), PolKit/PwnKit, Docker socket, dangerous capabilities
-23. **Privilege Escalation (Extended)**: LD_LOADER paths, PAM backdoors, systemd timer hijacking, Python library path hijacking
-24. **Task Runners & NFS**: Cron security, anacron/at, NFS exports, Docker socket duplicate removal
-25. **Container, SSH & Secrets Hygiene**: Home directory SSH keys, Docker credentials, known_hosts, authorized_keys
-26. **Kernel, Polkit & Filesystem**: ptrace_scope, dmesg_restrict, tmpfs exec permissions, protected hardlinks/symlinks
-27. **Enhanced Kernel Security**: Kernel version CVE checks, EOL kernel detection, lockdown mode validation
-28. **Enhanced Network Security**: IP forwarding, TCP SYN cookies, ICMP redirects, source routing
-29. **Enhanced Process Security**: Process namespaces, memory protection, ASLR, RWX memory regions
-30. **Malware Detection**: Suspicious files/processes/network, crypto-jacking (xmrig, minerd), LD_PRELOAD persistence
-31. **Rootkit Detection**: Hidden processes, kernel modules, modified binaries, /dev/tcp backdoors, ls/find discrepancies
-32. **Behavioral Analysis**: Zombie processes, time-based anomalies (off-hours activity), sudo usage spikes
-33. **Privilege Summary**: Detailed report of checks skipped without sudo
-34. **Summary**: Comprehensive findings report with severity counts
+### Privilege Escalation Surface & Refinements (8 sections - both modes)
+22. **Privilege Escalation Surface (Core)**: sudoers misconfiguration (NOPASSWD, timestamp_timeout, secure_path), **doas parity checks (nopass rules, keepenv, config presence)**, PATH hijack risks, SUID/SGID GTFOBins, ld.so.preload abuse, sudo version CVEs (CVE-2023-22809, Baron Samedit), PolKit/PwnKit, Docker socket, dangerous capabilities
+23. **Task Runners & NFS Risk**: Cron security, anacron/at, NFS exports
+24. **Container, SSH & Secrets Hygiene**: Home-directory SSH keys, Docker credentials, known_hosts, authorized_keys
+25. **Kernel, Polkit & Filesystem Hardening**: ptrace_scope, tmpfs exec permissions, protected hardlinks/symlinks, **unprivileged eBPF restriction check, runtime /tmp//dev/shm//var/tmp mount-option verification (findmnt)**
+26. **Privilege Escalation Surface (Extended)**: PAM backdoors, systemd timer hijacking, Python library path hijacking, LD_LOADER paths
+27. **Enhanced Kernel Security**: Kernel version CVE checks, EOL kernel detection, lockdown validation
+28. **Enhanced Network Security**: IP forwarding (v4/v6), TCP SYN cookies, ICMP redirects, source routing
+29. **Enhanced Process Security**: Process namespaces, ASLR, RWX memory regions
+
+### Advanced Detection (3 sections - both modes; parallelized with `-p`)
+30. **Malware Detection**: Crypto-jacking (xmrig, minerd, ...), suspicious files/processes/network, LD_PRELOAD persistence
+31. **Rootkit Detection**: Hidden processes, /dev/tcp backdoors, modified binaries, ls/find discrepancies
+32. **Behavioral Analysis**: Zombie processes, off-hours activity, sudo usage spikes
+
+### Wrap-up (2 sections - always run)
+33. **Privilege Limitations Summary**: What was checked vs. skipped without sudo
+34. **Summary**: Findings totals by severity, per-mode verdict
 
 ### Enterprise & Compliance (7 sections - production mode only)
-35. **Cloud & Remote Management**: Cloud agents (AWS, Azure, GCP), VNC/RDP/TeamViewer detection
-36. **Endpoint Detection & Monitoring**: Antivirus/EDR detection, SIEM forwarding agents, log analysis tools
-37. **Resilience & Backup**: Backup tools, snapshot capabilities (BTRFS, ZFS, LVM), disaster recovery
-38. **Compliance & Audit**: Password policy (PASS_MAX_DAYS), account lockout (pam_faillock, fail2ban), auditd rules
-39. **Enhanced Logging Security**: Service status, logrotate, remote forwarding, log tampering detection, journal persistence
-40. **Enhanced Network Access Controls**: TCP wrappers, iptables rate limiting, default firewall policies, egress filtering
-41. **Resource Health**: CPU load, memory usage, disk space monitoring
+35. **Cloud & Remote Management** *: Cloud agents (AWS, Azure, GCP), VNC/RDP/TeamViewer/AnyDesk detection
+36. **Endpoint Detection & Monitoring** *: EDR/AV detection (including Defender for Linux, CrowdStrike falcon, Velociraptor, Elastic Agent), SIEM forwarding (incl. Wazuh agent, osqueryd), log analysis tools
+37. **Resilience & Backup** *: Backup tools, snapshot capabilities (BTRFS, ZFS, LVM), disaster recovery
+38. **Compliance & Audit** *: Password policy (PASS_MAX_DAYS), lockout policy (pam_faillock), auditd rules
+39. **Enhanced Logging Security** *: logrotate, remote forwarding, log tampering, journal persistence
+40. **Enhanced Network Access Controls** *: Default firewall policies, rate limiting, egress filtering
+41. **Resource Health** *: CPU load, memory usage, disk space
 
-### Recent Enhancements (v0.6.3)
-- **52 new security checks** added across all sections
-- **10 duplicate checks removed** for better performance
-- **Crypto-jacking detection**: xmrig, minerd, cpuminer, claymore, phoenix, ethminer detection
-- **Library injection detection**: LD_PRELOAD/LD_LIBRARY_PATH persistence checks
-- **Bootloader tampering**: GRUB configuration and suspicious boot parameter detection
-- **Time drift monitoring**: Actual offset measurement with severity thresholds
-- **Network promiscuous mode**: Packet sniffing detection via PROMISC flag
-- **GPG verification**: Package repository signature validation
-- **Inactive accounts**: User accounts not logged in for >90 days
-- **Sudo timeout**: Session timeout configuration validation
-- **Command failure telemetry**: Non-zero exit codes now generate WARN findings with sanitized stderr details
-- **Audit hygiene**: Command arguments are scrubbed before logging and temporary assessment logs are removed automatically
-- **Consistent version messaging**: Help, banners, and reports now reflect the same release identifier
+\* production-only sections run after the core baseline and before the privilege-escalation group, matching the script's registry order.
 
 Each finding includes:
 - **Severity level**: OK, WARN, CRIT, INFO
@@ -372,14 +406,6 @@ sudo ./bt-quickcheck.sh
 - Color-coded severity levels
 - Real-time progress indication
 - Human-readable formatting
-
-### Parallel Execution
-```bash
-sudo ./bt-quickcheck.sh -p
-```
-- 30-50% faster execution
-- Concurrent processing of independent checks
-- Maintains data integrity and dependencies
 
 ### JSON Output
 ```bash
@@ -427,7 +453,33 @@ Recommended: store keys securely, avoid keeping plaintext after verifying the en
 
 ## Implementation Progress
 
-v0.6.3 (Latest - Security Hardened & Enhanced)
+v0.8.0 (Latest - New checks + automation workflows)
+- **Kernel cmdline mitigation scan**: flags `mitigations=off`, `nopti`, `nospectre_v1/v2`, `nospec_store_bypass_disable`, `nokaslr`, `nosmap/nosmep`, `ssbd/mds/l1tf/retbleed` disabling parameters (`/proc/cmdline`), CRIT (common perf-tuning leftovers)
+- **Unprivileged eBPF check**: `kernel.unprivileged_bpf_disabled=0` warns - unprivileged eBPF is a live escalation surface
+- **Runtime temp-dir mount options**: /tmp, /var/tmp, /dev/shm verified via `findmnt` (catches systemd auto-mounts without fstab entries); nosuid/nodev missing → WARN, noexec missing → INFO (may be intentional)
+- **doas parity**: `/etc/doas.conf` + `/etc/doas.d/*` audited like sudoers (nopass rules, nopass+keepenv, missing config)
+- **Docker daemon.json hardening**: userns-remap, live-restore, log rotation limits, and remote TCP API exposure in `hosts` (now checked in all modes, not just production)
+- **Process-environment secret scan**: with sudo, variable NAMES matching secret patterns found in `/proc/*/environ` (values never printed), capped at 8 processes
+- **Dynamic systemd sandbox scoring**: exposure scores now computed for services discovered at runtime as owning listening sockets (via `ss -tlnp`), the classic hardcoded set remains as fallback
+- **DNS posture**: resolv.conf sanity (no nameservers configured → WARN) plus systemd-resolved DNSSEC / DNS-over-TLS configuration review
+- **`--fail-on CRIT|WARN|none`**: exit-code policy for CI/cron - exit 2 on any CRIT (CRIT mode), exit 1 on any WARN/CRIT (WARN mode); bookkeeping sections are excluded
+- **`--baseline` / `--save-findings` drift mode**: compares a run against a previous run's findings file and reports NEW/RESOLVED CRIT/WARN issues in a dedicated Drift section (included in all output formats); enables "what changed since last scan" workflows
+
+v0.7.0 (Modernization & Engine Cleanup)
+- **Dead code removed**: the unused RBAC/"permission level" layer, command templates, and a no-op integrity check that hashed itself but compared against nothing (~600 lines lighter)
+- **Single section registry**: one ordered `SECTION_REGISTRY` array drives both sequential and parallel execution (the two duplicated section lists that could drift apart are gone)
+- **Bug fix**: Resource Health section (production mode) was defined *after* the code path that invoked it, so it silently never ran - now defined before the registry loop
+- **`--offline` flag**: `--offline` guarantees zero state changes and zero network access (no apt/dnf metadata refresh, no lifecycle API calls); results reflect the local package cache and embedded snapshot data only
+- **Validation hardening**: parallel findings are merged only if each record has exactly 4 fields; malformed records are discarded and counted instead of silently corrupting the report
+
+v0.7.0 - Detection modernization
+- **Data-driven distro EOL**: replaces the hardcoded 2023-era distro/version table. Queries the endoflife.date API v1 (curl or wget, cached per run, 30-day TTL via `BTQC_EOL_CACHE_TTL`), falls back to an embedded snapshot (dated) when offline or unreachable, and the finding text always reports which source was used
+- **systemd sandboxing exposure**: `systemd-analyze security` overall exposure score for common network-facing services (sshd/openssh-server, nginx, apache2/httpd); WARN in production mode when score >= 8/10
+- **SSH crypto posture**: flags explicitly configured weak primitives (SHA-1 kex/MACs, 3DES/CBC/Arcfour ciphers), guides post-quantum hybrid kex on OpenSSH 9.x (> = 10.x defaults to ML-KEM), and checks `AllowAgentForwarding`
+- **Current EDR/AV/SIEM lists**: adds Defender for Linux (mdatp), CrowdStrike falcon, Velociraptor, Elastic Agent, Wazuh agent, osqueryd, Sophos (savscan), ESET (esets)
+- **CrowdSec detection**: recognizes the mainstream fail2ban successor (engine state + active decision count via `cscli`)
+
+v0.6.3 (Security Hardened & Enhanced)
 - **Critical Security Fixes** (5 vulnerabilities patched):
   - Configuration file command injection vulnerability (CVE-worthy)
   - Temporary file race conditions with secure `mktemp` implementation
@@ -531,6 +583,8 @@ BTQC_CACHE_ENABLED=false sudo ./bt-quickcheck.sh
 | `BTQC_OPERATION_MODE` | `personal` | Operation mode: personal, production |
 | `BTQC_MAX_FINDINGS` | `1000` | Maximum findings to record |
 | `BTQC_SECTION_TIMEOUT` | `30` | Timeout per section in seconds |
+| `BTQC_OFFLINE` | `false` | Offline mode (same as `--offline` flag) |
+| `BTQC_EOL_CACHE_TTL` | `2592000` | How long (seconds) a successful lifecycle API fetch is trusted (default 30 days) |
 
 ### Optional External Configuration File
 For advanced users, you can still use an external configuration file:
@@ -549,169 +603,33 @@ sudo ./bt-quickcheck.sh
 
 **Note:** External config values are sanitized for security and override embedded defaults.
 
-## Enhanced Input Validation & Security Features
+## Safety & Design Principles
 
-### v0.6.3 Security Hardening & Enhancement (Latest)
+Historical security-hardening details (command injection fixes, temp-file race conditions, etc.) are documented per release in [Implementation Progress](#implementation-progress). The principles below describe how the tool stays safe today:
 
-#### **Critical Vulnerability Fixes**
+### Read-only by default
+- All checks are read-only; no system configuration is modified
+- With `--offline` there are zero state changes and zero network access (no package metadata refresh, no lifecycle API calls)
+- Without `--offline`, the only state touched is package-manager metadata refresh (e.g. `apt-get update`) and per-run temp/cache dirs cleaned up on exit
 
-1. **Configuration Command Injection (CRITICAL)**
-   - **Fixed**: All external configuration values are sanitized to remove dangerous shell metacharacters
-   - **Protection**: Removed backticks, command substitution `$()`, semicolons, pipes, redirections
-   - **Safe Assignment**: Uses `declare -g` instead of unsafe `export` with user-controlled values
-   - **Impact**: Prevents arbitrary code execution via malicious configuration files
+### Command execution
+- Whitelist-based validation: only well-known read-only system binaries can run, resolved to absolute paths in safe system directories
+- Dangerous commands (`rm`, `dd`, `mkfs`, shutdown/reboot, ...) and interpreters/editors are blocked
+- Argument length and character-set limits; no `eval`, no `source`, no `bash -c` with user content
 
-2. **Temporary File Race Conditions (HIGH)**
-   - **Fixed**: Replaced all predictable temp paths with secure `mktemp` calls
-   - **Protection**: Random suffixes (XXXXXXXXXX) prevent symlink attacks
-   - **Permissions**: Automatic `chmod 600` for log files, `chmod 700` for directories
-   - **Impact**: Prevents symlink attacks, information disclosure, privilege escalation
+### File & path handling
+- Output paths are canonicalized; traversal (`../`) and unsafe roots are rejected
+- `safe_read` enforces file size limits (default 1MB), rejects world-writable files, and refuses symlinks
+- Log parsing is size- and line-limited (`safe_log_grep`) to prevent resource exhaustion
 
-3. **Format String Vulnerability (MEDIUM)**
-   - **Fixed**: Replaced `printf "$message" "$result"` with safe string substitution
-   - **Protection**: Uses bash parameter expansion `${message//%s/$result}`
-   - **Impact**: Prevents DoS and potential information disclosure
+### Process & environment hygiene
+- `mktemp` everywhere with 0700/0600 permissions for temp dirs and files
+- `BASH_ENV` unset and exported functions disabled to prevent shell-injection via environment
+- Strict mode (`set -euo pipefail`) with per-section error isolation: a failing section becomes a WARN finding, never a broken scan
 
-4. **Word Splitting & Glob Expansion (MEDIUM)**
-   - **Fixed**: All variables in command execution are now properly quoted
-   - **Protection**: Replaced `eval echo "~$USER"` with safe `getent passwd` lookup
-   - **Impact**: Prevents argument injection and unintended command execution
-
-5. **Log Parsing DoS (LOW-MEDIUM)**
-   - **Fixed**: New `safe_log_grep()` function with size and line limits
-   - **Protection**: 100MB file size limit, 10,000 line output limit
-   - **Smart Handling**: Auto-uses `tail` for large files
-   - **Impact**: Prevents resource exhaustion from parsing massive log files
-
-#### **Security Check Enhancements (52 New Checks)**
-
-**Privilege Escalation Detection**:
-- Sudo version vulnerability checks (CVE-2023-22809, Baron Samedit with precise version parsing)
-- PolKit/pkexec vulnerability detection (CVE-2021-4034)
-- Docker socket exposure validation
-- Dangerous capabilities on binaries (CAP_SYS_ADMIN, CAP_DAC_OVERRIDE)
-- PAM module backdoor detection
-- Systemd timer hijacking (writable timer files)
-- Python library path hijacking (PYTHONPATH manipulation)
-
-**Kernel & Network Hardening**:
-- Additional kernel parameters (kptr_restrict, perf_event_paranoid, bpf_jit_harden)
-- Active tmpfs mounts with exec permission
-- Kernel version CVE detection (EOL kernel identification)
-- IP forwarding checks (IPv4/IPv6)
-- Network interface promiscuous mode detection
-- Risky port analysis (databases, development ports, malicious services)
-
-**Compliance & Access Control**:
-- Password policy compliance (PASS_MAX_DAYS, PASS_MIN_DAYS)
-- Account lockout policy (pam_faillock, fail2ban integration)
-- Default firewall policy validation (INPUT/OUTPUT DROP)
-- Egress filtering detection
-- UFW/firewalld active status verification
-- SSH rate limiting detection
-
-**Malware & Threat Detection**:
-- Crypto-jacking detection (xmrig, minerd, cpuminer, claymore, phoenix, ethminer)
-- LD_PRELOAD/LD_LIBRARY_PATH persistence mechanisms
-- /dev/tcp backdoor detection
-- Cross-tool hidden file detection (ls vs find discrepancies)
-- Time-based anomalies (off-hours processes/cron jobs)
-- Sudo usage spike detection
-
-**System Security**:
-- EOL operating system detection (Ubuntu, Debian, CentOS, RHEL)
-- Last reboot reason analysis (kernel panic/crash detection)
-- Unattended-upgrades status validation
-- Last update time tracking (warn if >90 days)
-- Insecure service detection (telnet, ftp, rsh, rlogin, finger, tftp)
-
-**Authentication & Authorization**:
-- SSH Protocol version enforcement (Protocol 2)
-- MaxAuthTries configuration (brute force protection)
-- PubkeyAuthentication validation
-- Audit log immutability (chattr +i/+a)
-- Inactive account detection (>90 days since last login)
-- Sudo session timeout verification
-
-**Logging & Audit Hygiene**:
-- Command stderr captured and surfaced as WARN findings when checks fail
-- Audit trail entries sanitize command arguments and automatically purge temporary assessment logs
-- Version banners, help text, and reports now stay in sync for clearer operational context
-
-**File & Process Security**:
-- Immutable file attributes (chattr +i)
-- Suspicious binary modification detection
-- ASLR (Address Space Layout Randomization) verification
-- RWX memory regions detection
-- Log tampering detection (cleared/truncated logs)
-- Systemd journal persistent storage validation
-
-**Integrity & Monitoring**:
-- Unused/orphaned packages detection
-- Package repository GPG signature verification
-- Unauthorized systemd services detection
-- Bootloader configuration tampering (GRUB)
-- Remote logging configuration validation
-- Critical log file health checks
-
-#### **Code Quality Improvements**
-
-**Duplicate Detection Removed** (10 consolidations):
-1. NOPASSWD sudo entries (consolidated in Privilege Escalation Core)
-2. Process capabilities (consolidated in Privilege Escalation Core)
-3. Docker socket checks (consolidated in Privilege Escalation Core)
-4. TCP SYN cookies (consolidated in Enhanced Network Security)
-5. Kernel hardening flags (consolidated in Kernel, Polkit & Filesystem)
-6. Auditd configuration (consolidated in Compliance & Audit)
-7. pstree analysis (removed duplicate from Enhanced Process Security)
-8. Logging service status (consolidated in Enhanced Logging Security)
-9. Firewall analysis (consolidated in Enhanced Network Access)
-10. Database exposure (consolidated in Application Security)
-
-**Cross-Referencing System**:
-- All sections now reference related comprehensive checks
-- Prevents duplicate execution while maintaining visibility
-- Improves scan performance by 15-20%
-- Maintains comprehensive coverage with better organization
-
-### Advanced command validation
-The script includes command validation to prevent execution of dangerous system commands:
-
-```bash
-# Dangerous commands are blocked:
-rm, dd, mkfs, fdisk, parted, shutdown, reboot, halt, init, telinit
-
-# Safe commands are validated:
-ls, cat, grep, awk, sed, stat, systemctl, ps, netstat, ss
-```
-
-### Path sanitization
-- Path traversal prevention for `../` and similar patterns
-- Execution limited to safe system directories
-- Absolute path restrictions
-- Symlink protection
-
-### File access
-- File size limits (default 1MB)
-- Permission checks before access
-- Location validation for risky directories
-- Safe reading with error handling
-
-### Command execution safety
-- Command existence and executability checks
-- Avoid executing from `/tmp/` or `/dev/shm/`
-- Parameter sanitization
-- Wrapped execution with error handling
-
-### Additional Security Hardening Features
-- Regex-based input validation for safe character sets
-- Hardened output path validation with canonicalization
-- Combined argument-length limit for command execution safety
-- Expanded dangerous command blocklist (interpreters, editors, archive tools), blocking `eval`, `source`, and `bash|sh -c`
-- Disabled shell function inheritance and `BASH_ENV` to prevent injection
-- Sensitive-data redaction applied to JSON/HTML/TXT outputs
-- Secure temp directories via `mktemp -d` with 0700 permissions
-- All variables use safe parameter expansion compatible with `set -u` strict mode
+### Privacy
+- Sensitive-data patterns (passwords, tokens, API keys, credit cards, emails) are detected and redacted in JSON/HTML/TXT outputs
+- `--privacy-level high` coarsens versions/IPs/paths; `--anonymize` hashes hostnames, usernames, and IPs with a per-run salt
 
 ## References
 
@@ -746,53 +664,14 @@ I welcome contributions to improve bt-quickcheck! Here's how you can help:
    - Command syntax and expected output
    - Severity justification
    - Security benchmark references (CIS, NIST, etc.)
-3. **Follow coding standards**:
-   - Read-only operations only
-   - Efficient execution (avoid deep recursive scans)
-   - Graceful error handling
-   - Clear, actionable recommendations
+3. **Follow the existing patterns**:
+   - Read-only operations only; no external network connections (`--offline` must cover any new data sources)
+   - Efficient execution (avoid deep recursive scans); regression-free under both sequential and `-p` parallel modes
+   - Both personal and production mode recommendations; mode-aware severities
+   - Clear, actionable recommendations; findings must parse through console/JSON/HTML/TXT sanitization
+   - Add the section to `SECTION_REGISTRY` (or wire into an existing one) and document it in this README
 4. **Test thoroughly** across different distributions
 5. **Submit a pull request** with detailed description
-
-### Development Guidelines
-- Maintain backward compatibility
-- Add appropriate error handling with timeout protection
-- Include both personal and production mode recommendations
-- Document new features in README
-- Follow existing code style and patterns
-- Implement enhanced input validation for all new features
-- Add comprehensive error logging and system log integration
-- Ensure all new checks follow industry security standards
-
-### Security Considerations
-- All new checks must be read-only
-- No external network connections
-- Validate all inputs and file paths
-- Include appropriate security disclaimers
-- Implement enhanced input validation for all new features
-- Add timeout protection to prevent hanging sections
-- Include comprehensive error logging and system log integration
-- Follow industry security standards (CIS, NIST) for new checks
-
-### Enhanced Error Handling & Timeout Protection
-
-#### Timeout Protection
-- **Section Timeout**: 30-second timeout for each security check section
-- **Graceful Degradation**: Fallback for systems without timeout command
-- **Hang Prevention**: Prevents sections from blocking execution indefinitely
-- **Resource Protection**: Protects against resource exhaustion
-
-#### Enhanced Error Logging
-- **Timestamped Errors**: All errors include UTC timestamps
-- **System Log Integration**: Errors logged to system logs when running as root
-- **Structured Error Tracking**: Comprehensive error categorization and reporting
-- **Audit Trail**: Complete error history for compliance and debugging
-
-#### Error Recovery
-- **Section Isolation**: Errors in one section don't affect others
-- **Graceful Degradation**: Script continues with remaining checks
-- **Error Reporting**: Clear error messages with actionable recommendations
-- **Debugging Support**: Detailed error context for troubleshooting
 
 ## License
 
@@ -809,35 +688,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - Inspired by [LinPEAS](https://github.com/carlospolop/PEASS-ng) for its ease of use
 - Built for the blue team community and defensive security practitioners
 - Thanks to all contributors and security researchers who help improve this tool
-
----
-
-## Enterprise Compliance & Industry Standards
-
-### CIS Benchmark Alignment
-Many security checks in v0.6.0 now align with CIS Linux Benchmark controls:
-
-- Kernel hardening: CIS Controls 3.1, 3.2, 3.3
-- Network security: CIS Controls 4.1, 4.2, 4.3
-- Access control: CIS Controls 5.1, 5.2, 5.3
-- Audit & logging: CIS Controls 6.1, 6.2, 6.3
-- System maintenance: CIS Controls 7.1, 7.2, 7.3
-
-### NIST Framework Support
-Guidance inspired by the NIST Cybersecurity Framework:
-
-- Identify: System and asset discovery, business environment assessment
-- Protect: Access control, awareness training, data security
-- Detect: Anomaly detection, security monitoring, detection processes
-- Respond: Response planning, communications, analysis
-- Recover: Recovery planning, improvements, communications
-
-### Compliance validation features
-- Audit daemon configuration checks
-- Log rotation and retention policy checks
-- Access control and limits configuration
-- Compliance tool detection
-- Centralized logging validation
 
 ---
 

@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repository AND the working tree.
+# Overrides any core.autocrlf=true on clone/checkout, keeping shell scripts
+# runnable on Linux/WSL without CRLF issues (/bin/bash^M: bad interpreter).
+* text=auto eol=lf
+
+# Explicit for emphasis: shell scripts must always be LF, everywhere.
+*.sh text eol=lf
